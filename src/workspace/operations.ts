@@ -1,4 +1,4 @@
-import type { RepositoryOperation } from "../types";
+import type { RepositoryOperation } from "../ipc/types";
 
 export function operationLabel(operation: RepositoryOperation): string {
   switch (operation) {

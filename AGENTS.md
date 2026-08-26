@@ -19,9 +19,10 @@
 - Keep persistent settings in `src-tauri/src/settings.rs` (via `tauri-plugin-store`); the frontend manages repositories only through `load_registered_repositories`, `register_repository`, and `unregister_repository`.
 - Spawn every child process through `src-tauri/src/worktree/command.rs`, which resolves executables on `PATH`/`PATHEXT` and applies Windows spawn flags.
 - Use `dunce::canonicalize`, never `std::fs::canonicalize`, so Windows paths stay in their compatible form.
-- Host facts the UI needs (home directory, path separator) come from `@tauri-apps/api/path` through `src/environment.tsx`; never infer them from path shapes.
-- Keep frontend IPC in `src/worktrees.ts`.
-- `src/App.tsx` owns machine/repository/worktree selection and the worktree inventory; the Changes and History views, toolbar, header, and detail pane live in `src/workspace/` and read the current selection through `useRepositoryContext()` / `useWorkingCopy()` instead of props.
+- Host facts the UI needs (home directory, path separator) come from `@tauri-apps/api/path` through `src/app/environment.tsx`; never infer them from path shapes.
+- Frontend layout: `src/app/` (shell, App, updater, window state), `src/ipc/` (every `invoke` wrapper plus `types.ts`), `src/domain/` (pure, tested logic with no React or Tauri imports), `src/workspace/` (Changes/History views, toolbar, header, detail pane), `src/dialogs/`, and `src/components/` (shared presentational pieces; `components/ui` is vendored shadcn). Tests sit next to the file they cover.
+- Keep frontend IPC in `src/ipc/worktrees.ts`; `src/domain/` must stay free of `@tauri-apps` imports.
+- `src/app/App.tsx` owns machine/repository/worktree selection and the worktree inventory; everything under `src/workspace/` reads the current selection through `useRepositoryContext()` / `useWorkingCopy()` instead of props.
 - Code-split dialogs render inside `src/workspace/LazyDialog.tsx` so a failed chunk shows a closable error instead of blanking the app.
 - Use `toMessage` from `src/lib/errors.ts` for thrown values and `toLowerCase()` (never `toLocaleLowerCase()`) when matching Git names or paths.
 - Keep domain types synchronized between Rust and TypeScript.

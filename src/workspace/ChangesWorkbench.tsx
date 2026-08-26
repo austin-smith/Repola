@@ -27,9 +27,9 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { TooltipButton } from "@/components/tooltip-button";
 import { cn } from "@/lib/utils";
 import { toMessage } from "@/lib/errors";
-import { ActionableGitError } from "../ActionableGitError";
-import { StashDialog } from "../StashDialog";
-import { emptyChangeSelection, isSelectAllChangesShortcut, isToggleSelectedChangesShortcut, selectAllChanges, singleChangeSelection, updateChangeSelection } from "../change-selection";
+import { ActionableGitError } from "../components/ActionableGitError";
+import { StashDialog } from "../dialogs/StashDialog";
+import { emptyChangeSelection, isSelectAllChangesShortcut, isToggleSelectedChangesShortcut, selectAllChanges, singleChangeSelection, updateChangeSelection } from "../domain/change-selection";
 import {
   commitSelectionFor,
   commitSelectionRequest,
@@ -40,10 +40,10 @@ import {
   setChangesIncluded,
   type CommitSelectionMap,
   type FileCommitSelection,
-} from "../commit-selection";
-import { shortSha } from "../format";
-import { SELECT_ALL_EVENT } from "../select-all";
-import { loadAppPreferences } from "../app-preferences";
+} from "../domain/commit-selection";
+import { shortSha } from "../domain/format";
+import { SELECT_ALL_EVENT } from "../domain/select-all";
+import { loadAppPreferences } from "../ipc/app-preferences";
 import {
   commitWorkingCopy,
   discardAll,
@@ -55,8 +55,8 @@ import {
   undoLatestCommit,
   unwatchWorktree,
   watchWorktree,
-} from "../worktrees";
-import type { CommitSigning, ConflictResolutionKind, DiscardScope, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../types";
+} from "../ipc/worktrees";
+import type { CommitSigning, ConflictResolutionKind, DiscardScope, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../ipc/types";
 import { parseCommitPeople, parseCommitTrailers } from "./commit-form";
 import { useWorkingCopy } from "./context";
 import { sectionHeadingClass, signingItems } from "./labels";

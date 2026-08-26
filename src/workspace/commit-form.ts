@@ -1,4 +1,4 @@
-import type { CommitPerson, CommitTrailer } from "../types";
+import type { CommitPerson, CommitTrailer } from "../ipc/types";
 
 export function parseCommitPeople(value: string, label: string): CommitPerson[] {
   return value

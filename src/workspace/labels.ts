@@ -1,4 +1,4 @@
-import type { CommitSigning, HistoryMutationKind } from "../types";
+import type { CommitSigning, HistoryMutationKind } from "../ipc/types";
 
 export const sectionHeadingClass = "text-xs font-medium tracking-widest text-muted-foreground uppercase";
 

@@ -26,11 +26,11 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { toast } from "@/components/ui/toast";
 import { TooltipButton } from "@/components/tooltip-button";
 import { toMessage } from "@/lib/errors";
-import { ActionableGitError } from "../ActionableGitError";
-import type { HistoryTarget } from "../HistoryMutationDialog";
-import { formatMeasuredBytes, shortSha } from "../format";
-import { loadBranches, mutateBranch, revealWorktree } from "../worktrees";
-import type { BranchInfo, RepositorySummary, WorkspaceView, WorktreeRecord } from "../types";
+import { ActionableGitError } from "../components/ActionableGitError";
+import type { HistoryTarget } from "../dialogs/HistoryMutationDialog";
+import { formatMeasuredBytes, shortSha } from "../domain/format";
+import { loadBranches, mutateBranch, revealWorktree } from "../ipc/worktrees";
+import type { BranchInfo, RepositorySummary, WorkspaceView, WorktreeRecord } from "../ipc/types";
 import { useRepositoryContext, useWorkingCopy } from "./context";
 import { historyMutationTitles } from "./labels";
 import { LazyDialog } from "./LazyDialog";

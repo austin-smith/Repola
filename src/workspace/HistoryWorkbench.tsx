@@ -22,10 +22,10 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { toast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
 import { toMessage } from "@/lib/errors";
-import { ActionableGitError } from "../ActionableGitError";
-import { shortSha } from "../format";
-import { loadBranches, loadCommitFiles, loadHistory } from "../worktrees";
-import type { BranchInfo, CommitChangedFile, CommitSummary } from "../types";
+import { ActionableGitError } from "../components/ActionableGitError";
+import { shortSha } from "../domain/format";
+import { loadBranches, loadCommitFiles, loadHistory } from "../ipc/worktrees";
+import type { BranchInfo, CommitChangedFile, CommitSummary } from "../ipc/types";
 import { useWorkingCopy } from "./context";
 import { ActivityFact } from "./facts";
 import { historyMutationTitles, sectionHeadingClass } from "./labels";

@@ -1,5 +1,5 @@
 import { createContext, useContext, type ReactNode } from "react";
-import type { MachineProfile, RepositorySummary, WorktreeRecord } from "../types";
+import type { MachineProfile, RepositorySummary, WorktreeRecord } from "../ipc/types";
 
 /**
  * The machine → repository → worktree selection the workbench operates on, plus the

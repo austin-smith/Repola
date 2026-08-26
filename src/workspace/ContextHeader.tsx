@@ -5,7 +5,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { TooltipButton } from "@/components/tooltip-button";
 import { cn } from "@/lib/utils";
-import type { AgentInfo, MachineProfile } from "../types";
+import type { AgentInfo, MachineProfile } from "../ipc/types";
 
 export type MachineConnectionStatus = "checking" | "online" | "offline";
 
