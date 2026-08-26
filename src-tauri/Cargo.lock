@@ -3010,7 +3010,6 @@ name = "repola"
 version = "0.1.0"
 dependencies = [
  "dunce",
- "embed-resource",
  "repola-engine",
  "serde",
  "serde_json",

@@ -3,29 +3,25 @@ use std::path::Path;
 const WINDOWS_MANIFEST: &str = "windows/app.manifest";
 
 fn main() {
-    let attributes = tauri_build::Attributes::new().windows_attributes(
-        tauri_build::WindowsAttributes::new().app_manifest(include_str!("windows/app.manifest")),
-    );
+    // The manifest is embedded below for every executable this crate links, so tauri-build must not
+    // add its own copy to the app binary as well.
+    let attributes = tauri_build::Attributes::new()
+        .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest());
     tauri_build::try_build(attributes).expect("tauri build");
 
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        embed_manifest_in_test_binaries();
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_os == "windows" && target_env == "msvc" {
+        embed_windows_manifest();
     }
 }
 
-/// tauri-build embeds the manifest into the app binaries only. Test executables link the
-/// same dependencies, so they need the same manifest or they cannot even start on Windows.
-fn embed_manifest_in_test_binaries() {
+/// Cargo can only scope linker flags to binaries, examples, benches, or integration tests,
+/// never to a library's unit-test executable. Applying the flags package-wide covers the app
+/// binary and the test executables with one manifest source.
+fn embed_windows_manifest() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join(WINDOWS_MANIFEST);
-    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
-    let resource = Path::new(&out_dir).join("tests.rc");
-    let manifest_path = manifest
-        .to_str()
-        .expect("UTF-8 manifest path")
-        .replace('\\', "\\\\");
-    std::fs::write(&resource, format!("1 24 \"{manifest_path}\"\n")).expect("write tests.rc");
     println!("cargo:rerun-if-changed={WINDOWS_MANIFEST}");
-    embed_resource::compile_for_tests(&resource, embed_resource::NONE)
-        .manifest_required()
-        .expect("embed the Windows manifest into test binaries");
+    println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+    println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
 }
