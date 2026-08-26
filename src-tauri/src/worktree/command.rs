@@ -1,0 +1,417 @@
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use thiserror::Error;
+
+use crate::operation;
+
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const MAX_COMMAND_STREAM_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Error)]
+pub enum CommandError {
+    #[error("Failed to launch {program}: {source}")]
+    Launch {
+        program: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{program} exited with status {status}: {message}")]
+    Failed {
+        program: String,
+        status: i32,
+        message: String,
+    },
+    #[error("{program} was cancelled")]
+    Cancelled { program: String },
+    #[error("{program} exceeded its {seconds}-second deadline")]
+    Timeout { program: String, seconds: u64 },
+    #[error("{program} produced more than {maximum} bytes on {stream}")]
+    OutputTooLarge {
+        program: String,
+        stream: &'static str,
+        maximum: usize,
+    },
+}
+
+/// Windows `CREATE_NO_WINDOW` process-creation flag. Without it every child
+/// process spawned from the GUI app flashes a console window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Resolved executable locations, keyed by the program name we were asked for.
+/// Only successful lookups are cached so a tool installed mid-session is found
+/// on the next call without restarting the app.
+fn resolved_programs() -> &'static Mutex<HashMap<String, PathBuf>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Locate `program` on `PATH` the way the platform shell would.
+///
+/// `std::process::Command` only consults `PATH` for bare names and, on
+/// Windows, only appends `.exe`. Tools distributed as `.cmd`/`.bat` shims
+/// (the Azure CLI, many npm-installed CLIs) are invisible to it, so every spawn
+/// goes through this resolver, which honours `PATHEXT` on Windows.
+pub(crate) fn resolve_program(program: &str) -> Result<PathBuf, CommandError> {
+    if let Some(path) = resolved_programs()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(program).cloned())
+    {
+        return Ok(path);
+    }
+    let path = which::which(program).map_err(|error| CommandError::Launch {
+        program: program.to_string(),
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, error.to_string()),
+    })?;
+    if let Ok(mut cache) = resolved_programs().lock() {
+        cache.insert(program.to_string(), path.clone());
+    }
+    Ok(path)
+}
+
+pub(crate) fn find_program(program: &str) -> Option<PathBuf> {
+    resolve_program(program).ok()
+}
+
+pub(crate) fn spawn_detached<I, S>(
+    program: &Path,
+    args: I,
+    working_directory: Option<&Path>,
+) -> Result<(), CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    #[allow(unused_mut)]
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(working_directory) = working_directory {
+        command.current_dir(working_directory);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|source| CommandError::Launch {
+            program: program.to_string_lossy().into_owned(),
+            source,
+        })
+}
+
+/// Build a `Command` for `program` with the platform-appropriate spawn flags.
+fn command(program: &str) -> Result<Command, CommandError> {
+    let path = resolve_program(program)?;
+    #[allow(unused_mut)]
+    let mut command = Command::new(path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    Ok(command)
+}
+
+fn launch(
+    program: &str,
+    command: &mut Command,
+    input: Option<&[u8]>,
+) -> Result<Output, CommandError> {
+    let token = operation::current_operation();
+    if token.is_cancelled() {
+        return Err(CommandError::Cancelled {
+            program: program.to_string(),
+        });
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        // The remote agent's stdin is the framed Repola protocol. No child is
+        // allowed to inherit and consume it while attempting an interactive
+        // prompt; authentication must go through configured Git/SSH helpers.
+        command.stdin(Stdio::null());
+    }
+    let mut child = command.spawn().map_err(|source| CommandError::Launch {
+        program: program.to_string(),
+        source,
+    })?;
+    let stdout = child.stdout.take().expect("captured stdout must exist");
+    let stderr = child.stderr.take().expect("captured stderr must exist");
+    let stdout_reader = thread::spawn(move || read_bounded(stdout));
+    let stderr_reader = thread::spawn(move || read_bounded(stderr));
+    let mut input_writer = input.map(|input| {
+        let mut stdin = child.stdin.take().expect("piped stdin must exist");
+        let input = input.to_vec();
+        thread::spawn(move || stdin.write_all(&input))
+    });
+    let mut finish_input = || -> Result<(), std::io::Error> {
+        let Some(writer) = input_writer.take() else {
+            return Ok(());
+        };
+        writer
+            .join()
+            .map_err(|_| std::io::Error::other("command input writer panicked"))?
+    };
+    let started = Instant::now();
+    let status = loop {
+        if token.is_cancelled() {
+            terminate_and_reap(&mut child);
+            let _ = finish_input();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(CommandError::Cancelled {
+                program: program.to_string(),
+            });
+        }
+        if started.elapsed() >= COMMAND_TIMEOUT {
+            terminate_and_reap(&mut child);
+            let _ = finish_input();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(CommandError::Timeout {
+                program: program.to_string(),
+                seconds: COMMAND_TIMEOUT.as_secs(),
+            });
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(source) => {
+                terminate_and_reap(&mut child);
+                let _ = finish_input();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(CommandError::Launch {
+                    program: program.to_string(),
+                    source,
+                });
+            }
+        }
+    };
+    if let Err(source) = finish_input() {
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        return Err(CommandError::Launch {
+            program: program.to_string(),
+            source,
+        });
+    }
+    let (stdout, stdout_truncated) = stdout_reader.join().unwrap_or_default();
+    let (stderr, stderr_truncated) = stderr_reader.join().unwrap_or_default();
+    if stdout_truncated {
+        return Err(CommandError::OutputTooLarge {
+            program: program.to_string(),
+            stream: "stdout",
+            maximum: MAX_COMMAND_STREAM_BYTES,
+        });
+    }
+    if stderr_truncated {
+        return Err(CommandError::OutputTooLarge {
+            program: program.to_string(),
+            stream: "stderr",
+            maximum: MAX_COMMAND_STREAM_BYTES,
+        });
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_bounded<R: Read>(mut reader: R) -> (Vec<u8>, bool) {
+    let mut captured = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let remaining = MAX_COMMAND_STREAM_BYTES.saturating_sub(captured.len());
+                captured.extend_from_slice(&buffer[..read.min(remaining)]);
+                truncated |= read > remaining;
+            }
+        }
+    }
+    (captured, truncated)
+}
+
+fn terminate_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+pub fn output<I, S>(program: &str, args: I) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = command(program)?;
+    command.args(args);
+    launch(program, &mut command, None)
+}
+
+pub(crate) fn output_with_input<I, S>(
+    program: &str,
+    args: I,
+    input: &[u8],
+) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = command(program)?;
+    command.args(args);
+    launch(program, &mut command, Some(input))
+}
+
+pub(crate) fn spawn_piped<I, S>(program: &str, args: I) -> Result<Child, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = command(program)?;
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| CommandError::Launch {
+            program: program.to_string(),
+            source,
+        })
+}
+
+pub fn output_at<I, S>(directory: &Path, program: &str, args: I) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = command(program)?;
+    command.current_dir(directory).args(args);
+    launch(program, &mut command, None)
+}
+
+pub fn git_at<I, S>(path: &Path, args: I) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = command("git")?;
+    command.arg("-C").arg(path).args(args);
+    launch("git", &mut command, None)
+}
+
+pub fn git_at_with_input<I, S>(path: &Path, args: I, input: &[u8]) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = command("git")?;
+    command.arg("-C").arg(path).args(args);
+    launch("git", &mut command, Some(input))
+}
+
+pub fn git_at_with_env<I, S, E, K, V>(
+    path: &Path,
+    args: I,
+    environment: E,
+) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+    E: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let mut command = command("git")?;
+    command.arg("-C").arg(path).args(args).envs(environment);
+    launch("git", &mut command, None)
+}
+
+pub fn git_at_with_input_and_env<I, S, E, K, V>(
+    path: &Path,
+    args: I,
+    input: &[u8],
+    environment: E,
+) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+    E: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let mut command = command("git")?;
+    command.arg("-C").arg(path).args(args).envs(environment);
+    launch("git", &mut command, Some(input))
+}
+
+pub fn successful_git_at<I, S>(path: &Path, args: I) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let result = git_at(path, args)?;
+    if result.status.success() {
+        return Ok(result);
+    }
+
+    let message = String::from_utf8_lossy(&result.stderr).trim().to_string();
+    Err(CommandError::Failed {
+        program: "git".to_string(),
+        status: result.status.code().unwrap_or(-1),
+        message,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_programs_surface_as_not_found_launch_errors() {
+        let error = output("repola-definitely-not-installed", ["--version"])
+            .expect_err("an absent program must not resolve");
+        match error {
+            CommandError::Launch { program, source } => {
+                assert_eq!(program, "repola-definitely-not-installed");
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolved_programs_are_cached_by_name() {
+        output("git", ["--version"]).expect("git is required for the test suite");
+        let cache = resolved_programs().lock().expect("cache lock");
+        assert!(cache.get("git").is_some_and(|path| path.is_absolute()));
+    }
+
+    #[test]
+    fn cancelled_operations_do_not_launch_commands() {
+        let token = crate::operation::OperationToken::new();
+        token.cancel();
+        let error = crate::operation::with_operation(token, || output("git", ["--version"]))
+            .expect_err("cancelled command");
+        assert!(matches!(error, CommandError::Cancelled { .. }));
+    }
+}
