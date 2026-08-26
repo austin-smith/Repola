@@ -140,7 +140,7 @@ fn classifies_remote_providers() {
 #[test]
 fn removal_revalidates_cleanliness_and_preserves_the_branch() {
     let temp = tempfile::tempdir().expect("temp directory");
-    let root = std::fs::canonicalize(temp.path()).expect("canonical temp path");
+    let root = dunce::canonicalize(temp.path()).expect("canonical temp path");
     let repository = root.join("repository");
     let worktree = root.join("linked");
     std::fs::create_dir(&repository).expect("repository directory");
@@ -265,7 +265,7 @@ fn fixture_remote(root: &Path, repository: &Path) {
 #[test]
 fn counts_commits_missing_from_every_remote() {
     let temp = tempfile::tempdir().expect("temp directory");
-    let root = std::fs::canonicalize(temp.path()).expect("canonical temp path");
+    let root = dunce::canonicalize(temp.path()).expect("canonical temp path");
     let repository = fixture_repository(&root);
     fixture_remote(&root, &repository);
     let worktree = root.join("linked");
@@ -319,7 +319,7 @@ fn counts_commits_missing_from_every_remote() {
 #[test]
 fn branch_deletion_requires_containment_and_release_from_worktrees() {
     let temp = tempfile::tempdir().expect("temp directory");
-    let root = std::fs::canonicalize(temp.path()).expect("canonical temp path");
+    let root = dunce::canonicalize(temp.path()).expect("canonical temp path");
     let repository = fixture_repository(&root);
     fixture_remote(&root, &repository);
     let worktree = root.join("linked");
@@ -398,7 +398,7 @@ fn branch_deletion_requires_containment_and_release_from_worktrees() {
 #[test]
 fn worktree_changes_returns_patch_and_untracked_files() {
     let temp = tempfile::tempdir().expect("temp directory");
-    let root = std::fs::canonicalize(temp.path()).expect("canonical temp path");
+    let root = dunce::canonicalize(temp.path()).expect("canonical temp path");
     let repository = fixture_repository(&root);
     let worktree = root.join("linked");
     git(

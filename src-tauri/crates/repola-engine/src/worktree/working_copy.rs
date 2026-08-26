@@ -1892,6 +1892,9 @@ mod tests {
     fn repository() -> tempfile::TempDir {
         let directory = tempfile::tempdir().expect("temp repository");
         command::successful_git_at(directory.path(), ["init"]).expect("initialize repository");
+        // Fixtures assert on exact bytes; keep the host's line-ending conversion out of them.
+        command::successful_git_at(directory.path(), ["config", "core.autocrlf", "false"])
+            .expect("configure line endings");
         command::successful_git_at(directory.path(), ["config", "user.name", "Repola Test"])
             .expect("configure name");
         command::successful_git_at(
