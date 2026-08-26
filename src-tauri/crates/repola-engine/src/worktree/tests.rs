@@ -145,6 +145,8 @@ fn removal_revalidates_cleanliness_and_preserves_the_branch() {
     let worktree = root.join("linked");
     std::fs::create_dir(&repository).expect("repository directory");
     git(&repository, &["init", "--initial-branch", "main"]);
+    // Fixtures assert on exact bytes; keep the host's line-ending conversion out of them.
+    git(&repository, &["config", "core.autocrlf", "false"]);
     git(&repository, &["config", "user.name", "Repola Tests"]);
     git(
         &repository,
@@ -231,6 +233,8 @@ fn fixture_repository(root: &Path) -> std::path::PathBuf {
     let repository = root.join("repository");
     std::fs::create_dir(&repository).expect("repository directory");
     git(&repository, &["init", "--initial-branch", "main"]);
+    // Fixtures assert on exact bytes; keep the host's line-ending conversion out of them.
+    git(&repository, &["config", "core.autocrlf", "false"]);
     git(&repository, &["config", "user.name", "Repola Tests"]);
     git(
         &repository,
