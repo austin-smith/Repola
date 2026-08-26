@@ -1,0 +1,30 @@
+[package]
+name = "repola-engine"
+description = "Git, filesystem, process, and provider engine shared by the Repola desktop app and the repola-agent"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+name = "repola_engine"
+
+[[bin]]
+name = "repola-agent"
+path = "src/bin/repola-agent.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1.11"
+thiserror = "2"
+walkdir = "2.5"
+dunce = "1"
+which = "8"
+uuid = { version = "1", features = ["v4", "v5"] }
+base64 = "0.22"
+tempfile = "3.23"
+minisign-verify = "0.2.5"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"] }
+sha2 = "0.10"
+notify = "8"

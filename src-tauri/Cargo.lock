@@ -3009,6 +3009,25 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "repola"
 version = "0.1.0"
 dependencies = [
+ "dunce",
+ "repola-engine",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tauri-plugin-process",
+ "tauri-plugin-store",
+ "tauri-plugin-updater",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "repola-engine"
+version = "0.1.0"
+dependencies = [
  "base64 0.22.1",
  "dunce",
  "minisign-verify",
@@ -3018,13 +3037,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tauri-plugin-process",
- "tauri-plugin-store",
- "tauri-plugin-updater",
  "tempfile",
  "thiserror 2.0.20",
  "uuid",

@@ -5,7 +5,7 @@ const rawPublicKey = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
 const publicKey = Buffer.from(`untrusted comment: minisign public key\n${rawPublicKey}\n`).toString("base64");
 const packageJson = { version: "0.1.0" };
 const tauriConfig = { version: "0.1.0" };
-const cargoManifest = '[package]\nname = "repola"\nversion = "0.1.0"\n';
+const cargoManifest = '[workspace]\nmembers = ["crates/repola-engine"]\n\n[workspace.package]\nversion = "0.1.0"\n\n[package]\nname = "repola"\nversion.workspace = true\n';
 
 function environment(overrides = {}) {
   return {

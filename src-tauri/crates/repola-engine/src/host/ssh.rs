@@ -6,12 +6,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::host::HostError;
+use crate::machines::MachineProfile;
 use crate::operation::OperationToken;
 use crate::protocol::{
     read_frame, write_frame, AgentCapability, AgentInfo, AgentRequest, AgentResult,
     RequestEnvelope, ResponseBody, ResponseEnvelope, PROTOCOL_VERSION,
 };
-use crate::settings::MachineProfile;
 use crate::worktree::command;
 
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
@@ -469,7 +469,7 @@ fn terminate(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{MachineKind, SshProfile};
+    use crate::machines::{MachineKind, SshProfile};
 
     fn profile() -> MachineProfile {
         MachineProfile {

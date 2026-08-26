@@ -3,11 +3,11 @@
 mod bootstrap;
 mod ssh;
 
+use crate::machines::{MachineKind, MachineProfile};
 use crate::operation::OperationToken;
 use crate::protocol::{
     self, AgentRequest, AgentResult, RequestEnvelope, ResponseBody, ResponseEnvelope,
 };
-use crate::settings::{MachineKind, MachineProfile};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {

@@ -1,10 +1,7 @@
 mod desktop;
-mod diagnostics;
-pub mod host;
-pub mod operation;
-pub mod protocol;
 pub mod settings;
-pub mod worktree;
+
+use repola_engine::{host, operation, protocol, worktree};
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;

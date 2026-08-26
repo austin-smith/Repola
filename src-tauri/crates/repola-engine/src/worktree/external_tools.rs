@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::command;
-use crate::settings::{AppPreferences, MachineKind, MachineProfile};
+use crate::machines::{MachineKind, MachineProfile};
+use crate::preferences::AppPreferences;
 
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(30);
 

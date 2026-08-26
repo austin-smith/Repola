@@ -27,10 +27,11 @@ Age filters and ordering use the latest observed activity from the worktree’s 
 - Tauri 2 provides the native shell and typed command boundary on macOS, Windows, and Linux.
 - A packaged `repola-agent` owns Git and filesystem operations on the machine containing a working copy. Local requests use the same typed envelopes in process; remote requests use length-prefixed JSON over system OpenSSH stdio.
 - SSH profiles reference OpenSSH configuration and never store keys or passphrases. Repola disables agent forwarding and exposes no generic remote-command endpoint.
+- The Rust side is a Cargo workspace: the `repola` Tauri app crate and `repola-engine` (`src-tauri/crates/repola-engine`), which owns everything Git-related and has no Tauri dependency. The `repola-agent` binary is built from the engine crate alone.
 - Persistent settings (including each machine's explicit repository list) go through `tauri-plugin-store`, owned by `src-tauri/src/settings.rs`; the frontend never reads or writes them directly.
-- Every child process (`git`, `gh`, `az`) is resolved on `PATH` the way the platform shell would (including `PATHEXT` shims on Windows) and spawned without a console window; see `src-tauri/src/worktree/command.rs`.
+- Every child process (`git`, `gh`, `az`) is resolved on `PATH` the way the platform shell would (including `PATHEXT` shims on Windows) and spawned without a console window; see `src-tauri/crates/repola-engine/src/worktree/command.rs`.
 - Rust owns discovery, Git execution, status parsing, sizing, safety classification, actions, and auditing.
-- Agent detection is defined by one backend registry in `src-tauri/src/worktree/agents.rs`; the API returns generic, self-describing origin data and the frontend contains no agent-specific names or path rules.
+- Agent detection is defined by one backend registry in `src-tauri/crates/repola-engine/src/worktree/agents.rs`; the API returns generic, self-describing origin data and the frontend contains no agent-specific names or path rules.
 - React and TypeScript provide the inventory workbench, filters, evidence inspector, and confirmation flow.
 - The `repola-cli` example exposes the same read-only scanner as JSON for diagnostics without becoming part of the app bundle.
 
@@ -51,9 +52,9 @@ pnpm lint
 pnpm test
 pnpm build
 cd src-tauri
-cargo fmt --check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --all --check
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 CI runs the same suite on Ubuntu, macOS, and Windows (`.github/workflows/ci.yml`).
@@ -68,7 +69,7 @@ Run a read-only JSON inventory from the command line:
 
 ```bash
 cd src-tauri
-cargo run --example repola-cli -- /path/to/repository
+cargo run --package repola-engine --example repola-cli -- /path/to/repository
 ```
 
 The CLI takes exact Git repository paths as arguments; with none it exits with an error rather than scanning a guessed location.

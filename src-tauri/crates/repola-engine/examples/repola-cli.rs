@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use repola_lib::worktree::{scan, ScanRequest};
+use repola_engine::worktree::{scan, ScanRequest};
 
 fn main() -> ExitCode {
     let repository_paths = std::env::args().skip(1).collect::<Vec<_>>();

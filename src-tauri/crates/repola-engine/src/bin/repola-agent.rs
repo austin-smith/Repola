@@ -7,7 +7,7 @@ fn main() -> ExitCode {
         (Some("--stdio"), None) => {
             let mut input = stdin().lock();
             let mut output = stdout();
-            if let Err(error) = repola_lib::protocol::serve(&mut input, &mut output) {
+            if let Err(error) = repola_engine::protocol::serve(&mut input, &mut output) {
                 eprintln!("Repola agent protocol failed: {error}");
                 return ExitCode::FAILURE;
             }

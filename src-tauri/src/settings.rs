@@ -5,6 +5,9 @@
 //! on macOS, `~/.config/<identifier>` on Linux) and are managed by
 //! `tauri-plugin-store`. The store holds untyped JSON; this module is the only
 //! place that knows the keys and the shapes behind them.
+//!
+//! The machine-profile and preference models, and their validation, live in
+//! `repola_engine` so the agent and the desktop share one definition.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -13,6 +16,18 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_store::{Store, StoreExt};
+
+use repola_engine::machines::{
+    move_machine as move_stored_machine, normalize_machine, reject_duplicate_connections,
+    with_local_machine,
+};
+pub use repola_engine::machines::{
+    MachineError, MachineKind, MachineProfile, MachineProfileInput, SshProfile, LOCAL_MACHINE_ID,
+};
+pub use repola_engine::preferences::AppPreferences;
+use repola_engine::preferences::{
+    migrate_app_preferences, normalize_tool_id, APP_PREFERENCES_VERSION,
+};
 
 pub const STORE_FILE: &str = "settings.json";
 const REGISTERED_REPOSITORIES_BY_MACHINE_KEY: &str = "registeredRepositoriesByMachine";
@@ -32,56 +47,6 @@ pub struct RepositoryRegistrationResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MachineProfile {
-    pub id: String,
-    pub name: String,
-    pub kind: MachineKind,
-    pub enabled: bool,
-    pub ssh: Option<SshProfile>,
-}
-
-impl MachineProfile {
-    pub fn local() -> Self {
-        Self {
-            id: "local".into(),
-            name: "This computer".into(),
-            kind: MachineKind::Local,
-            enabled: true,
-            ssh: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum MachineKind {
-    Local,
-    Ssh,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SshProfile {
-    /// An OpenSSH Host alias or hostname. Repola deliberately delegates config,
-    /// keys, ProxyJump, and known-host behavior to the system OpenSSH client.
-    pub host: String,
-    pub user: Option<String>,
-    pub port: Option<u16>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MachineProfileInput {
-    pub id: Option<String>,
-    pub name: String,
-    pub enabled: bool,
-    pub host: String,
-    pub user: Option<String>,
-    pub port: Option<u16>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct WorkspaceContext {
     pub selected_machine_id: String,
     #[serde(default)]
@@ -95,7 +60,7 @@ pub struct WorkspaceContext {
 impl Default for WorkspaceContext {
     fn default() -> Self {
         Self {
-            selected_machine_id: "local".into(),
+            selected_machine_id: LOCAL_MACHINE_ID.into(),
             locations: BTreeMap::new(),
             filters: BTreeMap::new(),
             layout: WorkspaceLayout::default(),
@@ -167,17 +132,6 @@ pub enum WorkspaceView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct AppPreferences {
-    pub version: u16,
-    #[serde(alias = "editor")]
-    pub editor_id: Option<String>,
-    #[serde(alias = "terminal")]
-    pub terminal_id: Option<String>,
-    pub default_sign_commits: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowState {
     pub version: u16,
@@ -188,17 +142,6 @@ pub struct WindowState {
     pub maximized: bool,
 }
 
-impl Default for AppPreferences {
-    fn default() -> Self {
-        Self {
-            version: 2,
-            editor_id: None,
-            terminal_id: None,
-            default_sign_commits: false,
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
     #[error("Could not open the settings store: {0}")]
@@ -207,10 +150,10 @@ pub enum SettingsError {
     RelativePath(String),
     #[error("Could not migrate Repola application data: {0}")]
     Migration(String),
-    #[error("Invalid machine profile: {0}")]
-    InvalidMachine(String),
-    #[error("Machine {0:?} was not found.")]
-    MachineNotFound(String),
+    #[error("Invalid setting: {0}")]
+    Invalid(String),
+    #[error(transparent)]
+    Machine(#[from] MachineError),
 }
 
 /// Copy known user data from the pre-Repola identifier exactly once. Existing
@@ -328,7 +271,7 @@ pub fn set_app_preferences<R: Runtime>(
     app: &AppHandle<R>,
     mut preferences: AppPreferences,
 ) -> Result<AppPreferences, SettingsError> {
-    preferences.version = 2;
+    preferences.version = APP_PREFERENCES_VERSION;
     preferences.editor_id = normalize_tool_id(preferences.editor_id);
     preferences.terminal_id = normalize_tool_id(preferences.terminal_id);
     let store = open_store(app)?;
@@ -357,7 +300,7 @@ pub fn set_window_state<R: Runtime>(
 ) -> Result<WindowState, SettingsError> {
     state.version = 1;
     if !valid_window_state(&state) {
-        return Err(SettingsError::InvalidMachine(
+        return Err(SettingsError::Invalid(
             "window geometry is outside supported bounds".into(),
         ));
     }
@@ -418,17 +361,17 @@ pub fn remove_machine<R: Runtime>(
     app: &AppHandle<R>,
     machine_id: String,
 ) -> Result<Vec<MachineProfile>, SettingsError> {
-    if machine_id == "local" {
-        return Err(SettingsError::InvalidMachine(
-            "the built-in local machine cannot be removed".into(),
-        ));
+    if machine_id == LOCAL_MACHINE_ID {
+        return Err(
+            MachineError::Invalid("the built-in local machine cannot be removed".into()).into(),
+        );
     }
     let store = open_store(app)?;
     let mut stored = read_stored_machines(&store);
     let original_length = stored.len();
     stored.retain(|machine| machine.id != machine_id);
     if stored.len() == original_length {
-        return Err(SettingsError::MachineNotFound(machine_id));
+        return Err(MachineError::NotFound(machine_id).into());
     }
     write_machines(&store, &stored)?;
     let mut repositories = registered_repositories_by_machine(&store);
@@ -451,31 +394,16 @@ pub fn move_machine<R: Runtime>(
     delta: i8,
 ) -> Result<Vec<MachineProfile>, SettingsError> {
     if !matches!(delta, -1 | 1) {
-        return Err(SettingsError::InvalidMachine(
+        return Err(MachineError::Invalid(
             "machine order can only move one position at a time".into(),
-        ));
+        )
+        .into());
     }
     let store = open_store(app)?;
     let mut stored = read_stored_machines(&store);
     move_stored_machine(&mut stored, machine_id, delta)?;
     write_machines(&store, &stored)?;
     Ok(with_local_machine(stored))
-}
-
-fn move_stored_machine(
-    machines: &mut [MachineProfile],
-    machine_id: &str,
-    delta: i8,
-) -> Result<(), SettingsError> {
-    let index = machines
-        .iter()
-        .position(|machine| machine.id == machine_id)
-        .ok_or_else(|| SettingsError::MachineNotFound(machine_id.to_string()))?;
-    let target = index as isize + delta as isize;
-    if target >= 0 && target < machines.len() as isize {
-        machines.swap(index, target as usize);
-    }
-    Ok(())
 }
 
 fn open_store<R: Runtime>(app: &AppHandle<R>) -> Result<Arc<Store<R>>, SettingsError> {
@@ -529,13 +457,13 @@ fn machine_by_id<R: Runtime>(
     store: &Store<R>,
     machine_id: &str,
 ) -> Result<MachineProfile, SettingsError> {
-    if machine_id == "local" {
+    if machine_id == LOCAL_MACHINE_ID {
         return Ok(MachineProfile::local());
     }
     read_stored_machines(store)
         .into_iter()
         .find(|machine| machine.id == machine_id)
-        .ok_or_else(|| SettingsError::MachineNotFound(machine_id.to_string()))
+        .ok_or_else(|| MachineError::NotFound(machine_id.to_string()).into())
 }
 
 fn read_machines<R: Runtime>(store: &Store<R>) -> Result<Vec<MachineProfile>, SettingsError> {
@@ -550,7 +478,7 @@ fn read_stored_machines<R: Runtime>(store: &Store<R>) -> Vec<MachineProfile> {
         .and_then(|value| serde_json::from_value::<Vec<MachineProfile>>(value).ok())
         .unwrap_or_default()
         .into_iter()
-        .filter(|machine| machine.kind == MachineKind::Ssh && machine.id != "local")
+        .filter(|machine| machine.kind == MachineKind::Ssh && machine.id != LOCAL_MACHINE_ID)
         .collect()
 }
 
@@ -569,58 +497,6 @@ fn read_app_preferences<R: Runtime>(store: &Store<R>) -> AppPreferences {
         .unwrap_or_default()
 }
 
-fn migrate_app_preferences(mut preferences: AppPreferences) -> AppPreferences {
-    match preferences.version {
-        0 | 1 => {
-            preferences.version = 2;
-            preferences.editor_id = match preferences.editor_id.as_deref() {
-                Some("visualStudioCode") => Some("vscode".into()),
-                Some("cursor") => Some("cursor".into()),
-                Some("zed") => Some("zed".into()),
-                _ => None,
-            };
-            preferences.terminal_id = match preferences.terminal_id.as_deref() {
-                Some("systemDefault") => Some(platform_default_terminal_id().into()),
-                Some("iTerm2") => Some("iterm2".into()),
-                Some("warp") => Some("warp".into()),
-                _ => None,
-            };
-            preferences
-        }
-        2 => {
-            preferences.editor_id = normalize_tool_id(preferences.editor_id);
-            preferences.terminal_id = normalize_tool_id(preferences.terminal_id);
-            preferences
-        }
-        _ => AppPreferences::default(),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn platform_default_terminal_id() -> &'static str {
-    "terminal"
-}
-
-#[cfg(target_os = "windows")]
-fn platform_default_terminal_id() -> &'static str {
-    "windows-terminal"
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn platform_default_terminal_id() -> &'static str {
-    "default-terminal"
-}
-
-fn normalize_tool_id(value: Option<String>) -> Option<String> {
-    value.map(|value| value.trim().to_string()).filter(|value| {
-        !value.is_empty()
-            && value.len() <= 80
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    })
-}
-
 fn normalize_workspace_context(
     mut context: WorkspaceContext,
     machines: &[MachineProfile],
@@ -635,7 +511,7 @@ fn normalize_workspace_context(
         .iter()
         .any(|machine| machine.id == context.selected_machine_id && machine.enabled)
     {
-        context.selected_machine_id = "local".into();
+        context.selected_machine_id = LOCAL_MACHINE_ID.into();
     }
     context
 }
@@ -644,7 +520,7 @@ fn validate_workspace_context(context: &WorkspaceContext) -> Result<(), Settings
     if !(180..=420).contains(&context.layout.inventory_sidebar_width)
         || !(280..=560).contains(&context.layout.details_width)
     {
-        return Err(SettingsError::InvalidMachine(
+        return Err(SettingsError::Invalid(
             "workspace pane sizes are outside supported bounds".into(),
         ));
     }
@@ -654,7 +530,7 @@ fn validate_workspace_context(context: &WorkspaceContext) -> Result<(), Settings
             .flatten()
         {
             if value.len() > 32 * 1024 || value.contains('\0') {
-                return Err(SettingsError::InvalidMachine(
+                return Err(SettingsError::Invalid(
                     "workspace paths must be bounded and cannot contain NUL characters".into(),
                 ));
             }
@@ -666,7 +542,7 @@ fn validate_workspace_context(context: &WorkspaceContext) -> Result<(), Settings
             || filters.repository_path.contains('\0')
             || !matches!(filters.age_days, 0 | 30 | 90 | 180 | 365)
         {
-            return Err(SettingsError::InvalidMachine(
+            return Err(SettingsError::Invalid(
                 "workspace filters are outside their supported bounds".into(),
             ));
         }
@@ -684,104 +560,6 @@ fn write_machines<R: Runtime>(
     store
         .save()
         .map_err(|error| SettingsError::Store(error.to_string()))
-}
-
-fn with_local_machine(stored: Vec<MachineProfile>) -> Vec<MachineProfile> {
-    let mut machines = Vec::with_capacity(stored.len() + 1);
-    machines.push(MachineProfile::local());
-    machines.extend(stored);
-    machines
-}
-
-fn normalize_machine(input: MachineProfileInput) -> Result<MachineProfile, SettingsError> {
-    let name = input.name.trim();
-    validate_text("name", name, 80)?;
-    let host = input.host.trim();
-    validate_ssh_atom("host", host, 255)?;
-    let user = input
-        .user
-        .map(|user| user.trim().to_string())
-        .filter(|user| !user.is_empty());
-    if let Some(user) = &user {
-        validate_ssh_atom("user", user, 255)?;
-    }
-    if input.port == Some(0) {
-        return Err(SettingsError::InvalidMachine(
-            "port must be between 1 and 65535".into(),
-        ));
-    }
-    let id = match input.id {
-        Some(id) => {
-            uuid::Uuid::parse_str(&id)
-                .map_err(|_| SettingsError::InvalidMachine("the machine ID is not valid".into()))?;
-            id
-        }
-        None => uuid::Uuid::new_v4().to_string(),
-    };
-    Ok(MachineProfile {
-        id,
-        name: name.to_string(),
-        kind: MachineKind::Ssh,
-        enabled: input.enabled,
-        ssh: Some(SshProfile {
-            host: host.to_string(),
-            user,
-            port: input.port,
-        }),
-    })
-}
-
-fn validate_text(field: &str, value: &str, maximum: usize) -> Result<(), SettingsError> {
-    if value.is_empty() {
-        return Err(SettingsError::InvalidMachine(format!(
-            "{field} cannot be empty"
-        )));
-    }
-    if value.chars().count() > maximum {
-        return Err(SettingsError::InvalidMachine(format!(
-            "{field} cannot exceed {maximum} characters"
-        )));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(SettingsError::InvalidMachine(format!(
-            "{field} cannot contain control characters"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_ssh_atom(field: &str, value: &str, maximum: usize) -> Result<(), SettingsError> {
-    validate_text(field, value, maximum)?;
-    if value.starts_with('-') {
-        return Err(SettingsError::InvalidMachine(format!(
-            "{field} cannot begin with a hyphen"
-        )));
-    }
-    if value.chars().any(char::is_whitespace) {
-        return Err(SettingsError::InvalidMachine(format!(
-            "{field} cannot contain whitespace"
-        )));
-    }
-    Ok(())
-}
-
-fn reject_duplicate_connections(machines: &[MachineProfile]) -> Result<(), SettingsError> {
-    for (index, machine) in machines.iter().enumerate() {
-        let Some(ssh) = &machine.ssh else { continue };
-        if machines[..index].iter().any(|other| {
-            other.ssh.as_ref().is_some_and(|candidate| {
-                candidate.host.eq_ignore_ascii_case(&ssh.host)
-                    && candidate.user == ssh.user
-                    && candidate.port == ssh.port
-            })
-        }) {
-            return Err(SettingsError::InvalidMachine(format!(
-                "a profile for {} already exists",
-                ssh.host
-            )));
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn normalize_local_repository_paths(
@@ -818,7 +596,7 @@ fn normalize_remote_repository_paths(
             continue;
         }
         if path.len() > 32 * 1024 || path.chars().any(char::is_control) {
-            return Err(SettingsError::InvalidMachine(
+            return Err(SettingsError::Invalid(
                 "repository paths must be bounded and cannot contain control characters".into(),
             ));
         }
@@ -842,43 +620,22 @@ fn paths_equivalent(left: &str, right: &str, is_local: bool) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn application_preferences_have_an_explicit_forward_safe_migration() {
-        let legacy = migrate_app_preferences(AppPreferences {
-            version: 0,
-            editor_id: Some("cursor".into()),
-            terminal_id: Some("warp".into()),
-            default_sign_commits: true,
-        });
-        assert_eq!(legacy.version, 2);
-        assert_eq!(legacy.editor_id.as_deref(), Some("cursor"));
-        assert_eq!(legacy.terminal_id.as_deref(), Some("warp"));
-        assert!(legacy.default_sign_commits);
-
-        let future = migrate_app_preferences(AppPreferences {
-            version: 99,
-            editor_id: Some("zed".into()),
-            terminal_id: Some("iterm2".into()),
-            default_sign_commits: true,
-        });
-        assert_eq!(future, AppPreferences::default());
-    }
-
-    #[test]
-    fn legacy_backend_names_migrate_to_stable_tool_ids() {
-        let legacy: AppPreferences = serde_json::from_value(serde_json::json!({
-            "version": 1,
-            "editor": "visualStudioCode",
-            "terminal": "systemDefault",
-            "defaultSignCommits": false
-        }))
-        .expect("legacy preferences");
-        let migrated = migrate_app_preferences(legacy);
-        assert_eq!(migrated.editor_id.as_deref(), Some("vscode"));
-        assert_eq!(
-            migrated.terminal_id.as_deref(),
-            Some(platform_default_terminal_id())
-        );
+    fn mock_store(
+        store_path: &Path,
+    ) -> (
+        tauri::App<tauri::test::MockRuntime>,
+        Arc<Store<tauri::test::MockRuntime>>,
+    ) {
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_store::Builder::default().build())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        let store = app
+            .handle()
+            .store_builder(store_path)
+            .build()
+            .expect("store at temp path");
+        (app, store)
     }
 
     #[test]
@@ -887,22 +644,13 @@ mod tests {
         let location = temp.path().join("code");
         std::fs::create_dir(&location).expect("create location");
         let store_path = temp.path().join("settings.json");
+        let (app, store) = mock_store(&store_path);
 
-        let app = tauri::test::mock_builder()
-            .plugin(tauri_plugin_store::Builder::default().build())
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .expect("mock app");
-        let store = app
-            .handle()
-            .store_builder(&store_path)
-            .build()
-            .expect("store at temp path");
-
-        assert!(read_registered_repositories(&store, "local").is_empty());
+        assert!(read_registered_repositories(&store, LOCAL_MACHINE_ID).is_empty());
 
         let saved = write_registered_repositories(
             &store,
-            "local",
+            LOCAL_MACHINE_ID,
             true,
             vec![location.to_string_lossy().into_owned()],
         )
@@ -917,29 +665,23 @@ mod tests {
             .build()
             .expect("reload store");
         reloaded.reload().expect("reload from disk");
-        assert_eq!(read_registered_repositories(&reloaded, "local"), saved);
+        assert_eq!(
+            read_registered_repositories(&reloaded, LOCAL_MACHINE_ID),
+            saved
+        );
     }
 
     #[test]
     fn workspace_context_round_trips_and_drops_removed_machines() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let store_path = temp.path().join("settings.json");
-        let app = tauri::test::mock_builder()
-            .plugin(tauri_plugin_store::Builder::default().build())
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .expect("mock app");
-        let store = app
-            .handle()
-            .store_builder(&store_path)
-            .build()
-            .expect("store");
+        let (_app, store) = mock_store(&temp.path().join("settings.json"));
         let context = WorkspaceContext {
             selected_machine_id: "gone".into(),
             filters: BTreeMap::new(),
             layout: WorkspaceLayout::default(),
             locations: BTreeMap::from([
                 (
-                    "local".into(),
+                    LOCAL_MACHINE_ID.into(),
                     WorkspaceLocation {
                         repository_path: Some("/code/project".into()),
                         worktree_path: Some("/code/project/feature".into()),
@@ -963,36 +705,12 @@ mod tests {
         store.save().expect("save");
         let normalized =
             normalize_workspace_context(read_workspace_context(&store), &[MachineProfile::local()]);
-        assert_eq!(normalized.selected_machine_id, "local");
+        assert_eq!(normalized.selected_machine_id, LOCAL_MACHINE_ID);
         assert_eq!(normalized.locations.len(), 1);
-        assert_eq!(normalized.locations["local"].view, WorkspaceView::History);
-    }
-
-    #[test]
-    fn machine_order_moves_exactly_one_position() {
-        let profile = |id: &str| MachineProfile {
-            id: id.into(),
-            name: id.into(),
-            kind: MachineKind::Ssh,
-            enabled: true,
-            ssh: Some(SshProfile {
-                host: id.into(),
-                user: None,
-                port: None,
-            }),
-        };
-        let mut machines = vec![profile("one"), profile("two"), profile("three")];
-        move_stored_machine(&mut machines, "two", -1).expect("move up");
         assert_eq!(
-            machines
-                .iter()
-                .map(|machine| machine.id.as_str())
-                .collect::<Vec<_>>(),
-            ["two", "one", "three"]
+            normalized.locations[LOCAL_MACHINE_ID].view,
+            WorkspaceView::History
         );
-        move_stored_machine(&mut machines, "two", -1).expect("top is stable");
-        assert_eq!(machines[0].id, "two");
-        assert!(move_stored_machine(&mut machines, "missing", 1).is_err());
     }
 
     #[test]
@@ -1032,16 +750,7 @@ mod tests {
     #[test]
     fn malformed_and_legacy_discovery_values_never_register_repositories() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let store_path = temp.path().join("settings.json");
-        let app = tauri::test::mock_builder()
-            .plugin(tauri_plugin_store::Builder::default().build())
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .expect("mock app");
-        let store = app
-            .handle()
-            .store_builder(&store_path)
-            .build()
-            .expect("store");
+        let (_app, store) = mock_store(&temp.path().join("settings.json"));
         store.set(
             REGISTERED_REPOSITORIES_BY_MACHINE_KEY,
             serde_json::json!("nope"),
@@ -1051,7 +760,7 @@ mod tests {
             "scanRootsByMachine",
             serde_json::json!({ "local": ["/Users/example/Developer"] }),
         );
-        assert!(read_registered_repositories(&store, "local").is_empty());
+        assert!(read_registered_repositories(&store, LOCAL_MACHINE_ID).is_empty());
     }
 
     #[test]
@@ -1079,78 +788,9 @@ mod tests {
     }
 
     #[test]
-    fn machine_profiles_are_normalized_and_receive_stable_ids() {
-        let profile = normalize_machine(MachineProfileInput {
-            id: None,
-            name: "  Build server  ".into(),
-            enabled: true,
-            host: "  buildbox  ".into(),
-            user: Some("  deploy  ".into()),
-            port: Some(2222),
-        })
-        .expect("valid profile");
-
-        assert!(uuid::Uuid::parse_str(&profile.id).is_ok());
-        assert_eq!(profile.name, "Build server");
-        assert_eq!(
-            profile.ssh,
-            Some(SshProfile {
-                host: "buildbox".into(),
-                user: Some("deploy".into()),
-                port: Some(2222),
-            })
-        );
-    }
-
-    #[test]
-    fn machine_profiles_reject_ssh_option_injection_and_duplicates() {
-        let error = normalize_machine(MachineProfileInput {
-            id: None,
-            name: "Unsafe".into(),
-            enabled: true,
-            host: "-oProxyCommand=bad".into(),
-            user: None,
-            port: None,
-        })
-        .expect_err("leading option must fail");
-        assert!(matches!(error, SettingsError::InvalidMachine(_)));
-
-        let first = normalize_machine(MachineProfileInput {
-            id: None,
-            name: "One".into(),
-            enabled: true,
-            host: "BuildBox".into(),
-            user: Some("deploy".into()),
-            port: None,
-        })
-        .expect("first");
-        let second = normalize_machine(MachineProfileInput {
-            id: None,
-            name: "Two".into(),
-            enabled: true,
-            host: "buildbox".into(),
-            user: Some("deploy".into()),
-            port: None,
-        })
-        .expect("second");
-        assert!(reject_duplicate_connections(&[first, second]).is_err());
-    }
-
-    #[test]
     fn machine_store_always_includes_the_local_machine() {
-        let store_path = tempfile::tempdir()
-            .expect("temp dir")
-            .path()
-            .join("machines.json");
-        let app = tauri::test::mock_builder()
-            .plugin(tauri_plugin_store::Builder::default().build())
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .expect("mock app");
-        let store = app
-            .handle()
-            .store_builder(&store_path)
-            .build()
-            .expect("store");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (_app, store) = mock_store(&temp.path().join("machines.json"));
 
         let machines = read_machines(&store).expect("machines");
         assert_eq!(machines, vec![MachineProfile::local()]);
@@ -1159,16 +799,7 @@ mod tests {
     #[test]
     fn remote_repositories_are_stored_per_machine_without_local_filesystem_guesses() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let store_path = temp.path().join("remote-roots.json");
-        let app = tauri::test::mock_builder()
-            .plugin(tauri_plugin_store::Builder::default().build())
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .expect("mock app");
-        let store = app
-            .handle()
-            .store_builder(&store_path)
-            .build()
-            .expect("store");
+        let (_app, store) = mock_store(&temp.path().join("remote-roots.json"));
 
         let saved = write_registered_repositories(
             &store,

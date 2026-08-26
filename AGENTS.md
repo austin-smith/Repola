@@ -14,10 +14,12 @@
 
 ## Architecture
 
-- Keep Git, filesystem, process, and provider behavior in `src-tauri/src/worktree/`.
-- Keep Tauri commands in `src-tauri/src/lib.rs` as thin adapters.
-- Keep persistent settings in `src-tauri/src/settings.rs` (via `tauri-plugin-store`); the frontend manages repositories only through `load_registered_repositories`, `register_repository`, and `unregister_repository`.
-- Spawn every child process through `src-tauri/src/worktree/command.rs`, which resolves executables on `PATH`/`PATHEXT` and applies Windows spawn flags.
+- The Rust side is a Cargo workspace rooted at `src-tauri/Cargo.toml`: the `repola` app crate (Tauri shell, IPC commands, settings store) and `src-tauri/crates/repola-engine` (Git, filesystem, process, protocol, SSH host, provider behavior, the `repola-agent` binary, and the `repola-cli` example). The engine must never depend on `tauri`; that is what lets its tests run without loading a webview and lets the agent stay small.
+- Keep Git, filesystem, process, and provider behavior in `src-tauri/crates/repola-engine/src/worktree/`.
+- Keep Tauri commands in `src-tauri/src/lib.rs` as thin adapters over `repola_engine`.
+- Machine-profile and preference models plus their validation live in `repola_engine::machines` and `repola_engine::preferences`; persistence stays in `src-tauri/src/settings.rs` (via `tauri-plugin-store`), and the frontend manages repositories only through `load_registered_repositories`, `register_repository`, and `unregister_repository`.
+- Spawn every child process through `src-tauri/crates/repola-engine/src/worktree/command.rs`, which resolves executables on `PATH`/`PATHEXT` and applies Windows spawn flags.
+- Both crates inherit `version` from `[workspace.package]`; the desktop and agent must report the same `CARGO_PKG_VERSION`.
 - Use `dunce::canonicalize`, never `std::fs::canonicalize`, so Windows paths stay in their compatible form.
 - Host facts the UI needs (home directory, path separator) come from `@tauri-apps/api/path` through `src/app/environment.tsx`; never infer them from path shapes.
 - Frontend layout: `src/app/` (shell, App, updater, window state), `src/ipc/` (every `invoke` wrapper plus `types.ts`), `src/domain/` (pure, tested logic with no React or Tauri imports), `src/workspace/` (Changes/History views, toolbar, header, detail pane), `src/dialogs/`, and `src/components/` (shared presentational pieces; `components/ui` is vendored shadcn). Tests sit next to the file they cover.
@@ -37,9 +39,9 @@ pnpm typecheck
 pnpm lint
 pnpm test
 pnpm build
-cd src-tauri && cargo fmt --check
-cd src-tauri && cargo test
-cd src-tauri && cargo clippy --all-targets --all-features -- -D warnings
+cd src-tauri && cargo fmt --all --check
+cd src-tauri && cargo test --workspace
+cd src-tauri && cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 CI (`.github/workflows/ci.yml`) runs this suite on Ubuntu, macOS, and Windows; a change is not done until it is green on all three.

@@ -100,7 +100,7 @@ jobs:
 
       - name: Build matching remote agent
         working-directory: src-tauri
-        run: cargo build --locked --release --bin repola-agent --target ${{ matrix.target }}
+        run: cargo build --locked --release --package repola-engine --bin repola-agent --target ${{ matrix.target }}
 
       - name: Stage agent artifact and checksum
         shell: bash
@@ -201,7 +201,7 @@ jobs:
 
       - name: Build matching remote agent
         working-directory: src-tauri
-        run: cargo build --locked --release --bin repola-agent --target aarch64-unknown-linux-gnu
+        run: cargo build --locked --release --package repola-engine --bin repola-agent --target aarch64-unknown-linux-gnu
 
       - name: Stage agent artifact and checksum
         shell: bash

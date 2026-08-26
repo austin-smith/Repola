@@ -14,7 +14,9 @@ export function buildReleaseConfig({ environment, packageJson, tauriConfig, carg
     return value;
   };
 
-  const cargoVersion = cargoManifest.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+  // The app and the engine crate inherit one version from [workspace.package] in src-tauri/Cargo.toml.
+  const workspacePackage = cargoManifest.match(/^\[workspace\.package\]\s*\n([\s\S]*?)(?=^\[|(?![\s\S]))/m)?.[1] ?? "";
+  const cargoVersion = workspacePackage.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
   const version = packageJson.version;
   if (!version || version !== tauriConfig.version || version !== cargoVersion) {
     throw new Error(

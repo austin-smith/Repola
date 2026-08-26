@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 
 use crate::diagnostics;
 use crate::host::HostError;
+use crate::machines::MachineProfile;
 use crate::operation::{self, OperationToken};
-use crate::settings::MachineProfile;
 use crate::worktree::command;
 
 const RELEASE_REPOSITORY: &str = "austin-smith/repola";
