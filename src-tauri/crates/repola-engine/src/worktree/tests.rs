@@ -91,6 +91,22 @@ fn parses_nul_terminated_worktree_porcelain() {
 }
 
 #[test]
+fn worktree_paths_from_git_use_native_separators() {
+    let records = parse_worktree_porcelain(b"worktree C:/code/repo\0HEAD abc123\0\0");
+    let expected = if cfg!(windows) {
+        r"C:\code\repo"
+    } else {
+        "C:/code/repo"
+    };
+    assert_eq!(records[0].path, expected);
+    assert_eq!(
+        Path::new(&records[0].path),
+        Path::new("C:/code/repo"),
+        "registration lookups compare paths, not separator styles"
+    );
+}
+
+#[test]
 fn parses_status_without_counting_rename_path_payloads() {
     let input = b" M src/app.rs\0M  Cargo.toml\0?? notes.txt\0UU conflict.rs\0R  new-name.rs\0?? looks-like-status.txt\0";
     let summary = parse_status_porcelain(input);

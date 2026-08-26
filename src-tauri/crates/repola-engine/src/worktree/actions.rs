@@ -140,7 +140,7 @@ fn load_record(
     let seeds = list_worktrees(&repository.path).map_err(ActionError::Repository)?;
     let seed = seeds
         .into_iter()
-        .find(|seed| seed.path == request.worktree_path)
+        .find(|seed| Path::new(&seed.path) == Path::new(&request.worktree_path))
         .ok_or(ActionError::NotRegistered)?;
     let record = inspect_worktree(&repository, &seed);
     Ok((repository, seed, record))

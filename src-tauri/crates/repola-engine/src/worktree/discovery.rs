@@ -255,6 +255,16 @@ pub(crate) fn list_worktrees(repository: &Path) -> Result<Vec<WorktreeSeed>, Str
     Ok(parse_worktree_porcelain(&output.stdout))
 }
 
+/// Git prints absolute paths with forward slashes on every platform. Store the native
+/// form so worktree paths compare and display like every other path Repola handles.
+pub(crate) fn native_path(path: &str) -> String {
+    if cfg!(windows) {
+        path.replace('/', "\\")
+    } else {
+        path.to_string()
+    }
+}
+
 pub(crate) fn parse_worktree_porcelain(bytes: &[u8]) -> Vec<WorktreeSeed> {
     let mut records = Vec::new();
     let mut current: Option<WorktreeSeed> = None;
@@ -273,7 +283,7 @@ pub(crate) fn parse_worktree_porcelain(bytes: &[u8]) -> Vec<WorktreeSeed> {
                 records.push(record);
             }
             current = Some(WorktreeSeed {
-                path: path.to_string(),
+                path: native_path(path),
                 head: None,
                 branch: None,
                 detached: false,

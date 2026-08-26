@@ -156,7 +156,7 @@ pub fn worktree_changes(
     let repository = super::discovery::repository_context(Path::new(repository_path))?;
     let seed = super::discovery::list_worktrees(&repository.path)?
         .into_iter()
-        .find(|seed| seed.path == worktree_path)
+        .find(|seed| Path::new(&seed.path) == Path::new(worktree_path))
         .ok_or_else(|| "The worktree is not registered in this repository.".to_string())?;
     let (Some(context), _) = resolve_git_context(&repository, &seed) else {
         return Ok(WorktreeChanges {

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Application manifest for every Windows executable built from the app crate,
+  including Cargo test binaries. tauri-plugin-dialog imports TaskDialogIndirect,
+  which only exists in Common Controls 6; without this dependency the loader binds
+  the legacy comctl32 and the process fails to start with STATUS_ENTRYPOINT_NOT_FOUND.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>
