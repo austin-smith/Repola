@@ -22,9 +22,9 @@ walkdir = "2.5"
 dunce = "1"
 which = "8"
 uuid = { version = "1", features = ["v4", "v5"] }
-base64 = "0.22"
+base64 = "0.23"
 tempfile = "3.23"
 minisign-verify = "0.2.5"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"] }
-sha2 = "0.10"
+sha2 = "0.11"
 notify = "8"
