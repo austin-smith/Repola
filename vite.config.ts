@@ -52,7 +52,7 @@ export default defineConfig(async () => ({
   plugins: [react(), tailwindcss(), startupBudget()],
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "./src"),
+      "@": path.resolve(import.meta.dirname, "./src"),
     },
   },
   test: {
