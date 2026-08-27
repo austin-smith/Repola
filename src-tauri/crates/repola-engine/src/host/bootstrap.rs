@@ -317,7 +317,10 @@ fn verify_agent(
     if fields.next().is_some() || expected_name != asset_name {
         return Err("The agent checksum did not match the requested release asset.".into());
     }
-    let actual_digest = format!("{:x}", Sha256::digest(agent));
+    let actual_digest = Sha256::digest(agent)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     if !actual_digest.eq_ignore_ascii_case(expected_digest) {
         return Err("The downloaded agent failed its SHA-256 checksum.".into());
     }
