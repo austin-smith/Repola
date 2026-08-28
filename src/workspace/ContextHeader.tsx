@@ -18,6 +18,41 @@ export interface MachineConnection {
   error: string | null;
 }
 
+/** Caption-over-value trigger used by every select in the toolbar. */
+export function ToolbarSelectTrigger({
+  id,
+  caption,
+  icon,
+  placeholder,
+  children,
+  className,
+  ...props
+}: Omit<React.ComponentProps<typeof SelectTrigger>, "children"> & {
+  caption: string;
+  icon: ReactNode;
+  placeholder?: string;
+  children?: ReactNode;
+}) {
+  return (
+    <SelectTrigger
+      id={id}
+      size="sm"
+      className={cn("h-10 min-w-0 flex-1 gap-2 border-transparent bg-transparent py-1 pr-1.5 pl-2 hover:bg-muted data-popup-open:bg-muted dark:bg-transparent dark:hover:bg-muted/50", className)}
+      {...props}
+    >
+      <span className="shrink-0 text-muted-foreground [&_svg]:size-4" aria-hidden="true">{icon}</span>
+      <span className="flex min-w-0 flex-1 flex-col text-left leading-tight">
+        <span className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">{caption}</span>
+        <SelectValue className="block truncate text-sm" placeholder={placeholder}>{children}</SelectValue>
+      </span>
+    </SelectTrigger>
+  );
+}
+
+/**
+ * The single toolbar row: machine, then the repository context controls
+ * passed as children, then the workspace status and global actions.
+ */
 export function ContextHeader({
   machines,
   selectedMachine,
@@ -26,6 +61,8 @@ export function ContextHeader({
   disabled,
   onChange,
   onRetry,
+  status,
+  actions,
   children,
 }: {
   machines: MachineProfile[];
@@ -35,78 +72,64 @@ export function ContextHeader({
   disabled: boolean;
   onChange: (machineId: string) => Promise<void>;
   onRetry: () => void;
-  children: ReactNode;
+  status?: ReactNode;
+  actions?: ReactNode;
+  children?: ReactNode;
 }) {
-  const items = Object.fromEntries(
-    machines.filter((machine) => machine.enabled).map((machine) => [machine.id, machine.name]),
-  );
+  const enabledMachines = machines.filter((machine) => machine.enabled);
+  const items = Object.fromEntries(enabledMachines.map((machine) => [machine.id, machine.name]));
+  // A single local machine is the common case; the selector only earns its
+  // width once there is something to switch to.
+  const showMachine = enabledMachines.length > 1 || selectedMachine.kind === "ssh";
   const machineTrigger = (
-    <SelectTrigger className={disabled ? "w-full" : "ml-3 w-52"} aria-label="Current machine">
-      {selectedMachine.kind === "ssh"
-        ? <ServerIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
-        : <LaptopIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />}
-      <SelectValue />
-    </SelectTrigger>
+    <ToolbarSelectTrigger id="current-machine" caption="Machine" icon={selectedMachine.kind === "ssh" ? <ServerIcon /> : <LaptopIcon />} className="w-40 flex-none" aria-label="Current machine" />
   );
   return (
-    <header className="flex h-13 shrink-0 items-center gap-3 border-b bg-card px-5">
-      <div className="grid size-6 shrink-0 content-center gap-[3px] border border-foreground bg-brand p-[5px]" aria-hidden="true">
+    <header className="flex h-14 shrink-0 items-center gap-1 border-b bg-card pr-2 pl-3">
+      <div className="mr-1 grid size-6 shrink-0 content-center gap-[3px] border border-foreground bg-brand p-[5px]" aria-label="Repola" role="img">
         <span className="block h-px bg-brand-foreground" />
         <span className="block h-px bg-brand-foreground" />
         <span className="block h-px bg-brand-foreground" />
       </div>
-      <h1 className="text-sm leading-none font-medium">Repola</h1>
-      <Select items={items} value={selectedMachineId} disabled={disabled} onValueChange={(value) => { if (value) void onChange(value); }}>
-        {disabled ? (
-          <Tooltip>
-            <TooltipTrigger render={<span className="ml-3 inline-flex w-52" tabIndex={0} />}>
-              {machineTrigger}
-            </TooltipTrigger>
-            <TooltipContent>Finish the current operation before switching machines.</TooltipContent>
-          </Tooltip>
-        ) : machineTrigger}
-        <SelectContent>
-          <SelectGroup>
-            {machines.filter((machine) => machine.enabled).map((machine) => (
-              <SelectItem key={machine.id} value={machine.id}>
-                {machine.kind === "ssh" ? <ServerIcon aria-hidden="true" /> : <LaptopIcon aria-hidden="true" />}
-                {machine.name}
-              </SelectItem>
-            ))}
-          </SelectGroup>
-        </SelectContent>
-      </Select>
-      <MachineConnectionIndicator
-        machine={selectedMachine}
-        connection={connection}
-        onRetry={onRetry}
-      />
+      {showMachine ? (
+        <Select items={items} value={selectedMachineId} disabled={disabled} onValueChange={(value) => { if (value) void onChange(value); }}>
+          {disabled ? (
+            <Tooltip>
+              <TooltipTrigger render={<span className="inline-flex" tabIndex={0} />}>
+                {machineTrigger}
+              </TooltipTrigger>
+              <TooltipContent>Finish the current operation before switching machines.</TooltipContent>
+            </Tooltip>
+          ) : machineTrigger}
+          <SelectContent>
+            <SelectGroup>
+              {enabledMachines.map((machine) => (
+                <SelectItem key={machine.id} value={machine.id}>
+                  {machine.kind === "ssh" ? <ServerIcon aria-hidden="true" /> : <LaptopIcon aria-hidden="true" />}
+                  {machine.name}
+                </SelectItem>
+              ))}
+            </SelectGroup>
+          </SelectContent>
+        </Select>
+      ) : null}
+      {selectedMachine.kind === "ssh" ? (
+        <MachineConnectionIndicator connection={connection} onRetry={onRetry} />
+      ) : null}
       {children}
+      {status ? <div className="ml-2 flex shrink-0 items-center gap-2 text-xs text-muted-foreground">{status}</div> : null}
+      {actions ? <div className="ml-1 flex shrink-0 items-center gap-0.5">{actions}</div> : null}
     </header>
   );
 }
 
 function MachineConnectionIndicator({
-  machine,
   connection,
   onRetry,
 }: {
-  machine: MachineProfile;
   connection: MachineConnection | null;
   onRetry: () => void;
 }) {
-  if (machine.kind === "local") {
-    return (
-      <Tooltip>
-        <TooltipTrigger render={<span className="flex items-center gap-1.5 text-xs text-muted-foreground" tabIndex={0} />}>
-          <span className="size-1.5 rounded-full bg-success" aria-hidden="true" />
-          Local
-        </TooltipTrigger>
-        <TooltipContent>Git operations run directly on this computer.</TooltipContent>
-      </Tooltip>
-    );
-  }
-
   const status = connection?.status ?? "checking";
   const checked = connection?.checkedAtMs
     ? new Date(connection.checkedAtMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })

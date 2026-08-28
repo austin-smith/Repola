@@ -1,5 +1,6 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import {
+  ArchiveIcon,
   DatabaseIcon,
   FileDiffIcon,
   FolderOpenIcon,
@@ -19,10 +20,10 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Field, FieldLabel } from "@/components/ui/field";
+import { StashDialog } from "../dialogs/StashDialog";
 import { Input } from "@/components/ui/input";
-import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/toast";
 import { TooltipButton } from "@/components/tooltip-button";
 import { toMessage } from "@/lib/errors";
@@ -31,29 +32,13 @@ import type { HistoryTarget } from "../dialogs/HistoryMutationDialog";
 import { formatMeasuredBytes, shortSha } from "../domain/format";
 import { loadBranches, mutateBranch, revealWorktree } from "../ipc/worktrees";
 import type { BranchInfo, RepositorySummary, WorkspaceView, WorktreeRecord } from "../ipc/types";
+import { ToolbarSelectTrigger } from "./ContextHeader";
 import { useRepositoryContext, useWorkingCopy } from "./context";
+import { SyncControls } from "./SyncControls";
+import { useOptionalWorkingCopyState } from "./working-copy-state";
 import { historyMutationTitles } from "./labels";
 import { LazyDialog } from "./LazyDialog";
 import { HistoryMutationDialog, TagsDialog } from "./lazy";
-
-function ContextToolbarField({
-  id,
-  label,
-  children,
-}: {
-  id: string;
-  label: string;
-  children: ReactNode;
-}) {
-  return (
-    <Field className="min-w-0">
-      <FieldLabel htmlFor={id}>{label}</FieldLabel>
-      <div className="flex min-w-0 items-center gap-1">
-        {children}
-      </div>
-    </Field>
-  );
-}
 
 export function RepositoryToolbar({
   repositories,
@@ -63,6 +48,7 @@ export function RepositoryToolbar({
   onWorktreeChange,
   onViewChange,
   onCreateWorktree,
+  onAddRepository,
   onRemoveRepository,
 }: {
   repositories: RepositorySummary[];
@@ -72,24 +58,32 @@ export function RepositoryToolbar({
   onWorktreeChange: (path: string) => void;
   onViewChange: (view: WorkspaceView) => void;
   onCreateWorktree: () => void;
+  onAddRepository: () => void;
   onRemoveRepository: (repositoryPath: string) => Promise<void>;
 }) {
-  const { machineKind, repository, worktree } = useRepositoryContext();
+  const { machineId, machineKind, repository, worktree } = useRepositoryContext();
+  const workingCopy = useOptionalWorkingCopyState();
   const [pendingRepositoryRemoval, setPendingRepositoryRemoval] = useState(false);
+  const [stashOpen, setStashOpen] = useState(false);
   const repositoryItems = Object.fromEntries(repositories.map((item) => [item.path, item.name]));
   const worktreeItems = Object.fromEntries(worktrees.map((item) => [
     item.path,
     item.branch ?? `Detached at ${shortSha(item.head)}`,
   ]));
+  const changedCount = workingCopy?.snapshot
+    ? workingCopy.snapshot.changes.filter((change) => !change.ignored).length
+    : worktree?.status.available ? worktree.status.total : null;
+  const views: { id: WorkspaceView; label: string; icon: typeof FileDiffIcon; badge?: number | null }[] = [
+    { id: "changes", label: "Changes", icon: FileDiffIcon, badge: changedCount },
+    { id: "history", label: "History", icon: GitCommitIcon },
+    { id: "worktrees", label: "Worktrees", icon: HardDriveIcon },
+  ];
   return (
-    <section className="flex shrink-0 items-stretch border-b bg-card" aria-label="Repository context">
-      <div className="flex min-w-0 flex-1 border-r px-4 py-3">
-        <ContextToolbarField id="current-repository" label="Repository">
+    <>
+      <div className="flex min-w-0 flex-1 items-center" role="group" aria-label="Repository context">
+        <div className="flex min-w-0 flex-1 items-center gap-0.5 border-l pl-1">
           <Select items={repositoryItems} value={repository?.path ?? null} onValueChange={(value) => { if (value) onRepositoryChange(value); }}>
-            <SelectTrigger id="current-repository" className="min-w-0 flex-1" aria-label="Current repository">
-              <DatabaseIcon aria-hidden="true" />
-              <SelectValue placeholder="Select a repository" />
-            </SelectTrigger>
+            <ToolbarSelectTrigger id="current-repository" caption="Repository" icon={<DatabaseIcon />} placeholder="Select a repository" aria-label="Current repository" />
             <SelectContent className="min-w-80" align="start" alignItemWithTrigger={false}>
               <SelectGroup>
                 {repositories.map((item) => (
@@ -106,35 +100,34 @@ export function RepositoryToolbar({
           <TooltipButton variant="ghost" size="icon-sm" onClick={onCreateWorktree} disabled={!repository || !worktree} aria-label="Create linked worktree" tooltip="Create linked worktree">
             <FolderPlusIcon aria-hidden="true" />
           </TooltipButton>
-          <Tooltip>
-            <TooltipTrigger render={<span className="inline-flex w-fit" tabIndex={repository ? undefined : 0} />}>
-              <DropdownMenu>
-                <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" disabled={!repository} aria-label="Repository actions" />}>
-                  <MoreHorizontalIcon aria-hidden="true" />
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="start" className="min-w-56">
+          <DropdownMenu>
+            <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Repository actions" />}>
+              <MoreHorizontalIcon aria-hidden="true" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="min-w-56">
+              <DropdownMenuGroup>
+                <DropdownMenuItem onClick={onAddRepository}><PlusIcon aria-hidden="true" />Add repository…</DropdownMenuItem>
+              </DropdownMenuGroup>
+              {repository ? (
+                <>
+                  <DropdownMenuSeparator />
                   <DropdownMenuGroup>
-                    <DropdownMenuLabel>{repository?.name ?? "Repository"}</DropdownMenuLabel>
-                    <DropdownMenuItem disabled={machineKind !== "local" || !repository} onClick={() => { if (repository) void revealWorktree(repository.path).catch((cause: unknown) => toast.add({ type: "error", title: "Could not reveal repository", description: toMessage(cause) })); }}><FolderOpenIcon aria-hidden="true" />Reveal in file manager</DropdownMenuItem>
+                    <DropdownMenuLabel>{repository.name}</DropdownMenuLabel>
+                    <DropdownMenuItem disabled={!workingCopy?.snapshot || workingCopy.snapshot.operation !== null} onClick={() => setStashOpen(true)}><ArchiveIcon aria-hidden="true" />Stashes…</DropdownMenuItem>
+                    <DropdownMenuItem disabled={machineKind !== "local"} onClick={() => { void revealWorktree(repository.path).catch((cause: unknown) => toast.add({ type: "error", title: "Could not reveal repository", description: toMessage(cause) })); }}><FolderOpenIcon aria-hidden="true" />Reveal in file manager</DropdownMenuItem>
                   </DropdownMenuGroup>
                   <DropdownMenuSeparator />
                   <DropdownMenuGroup>
-                    <DropdownMenuItem variant="destructive" disabled={!repository} onClick={() => setPendingRepositoryRemoval(true)}><Trash2Icon aria-hidden="true" />Remove from Repola…</DropdownMenuItem>
+                    <DropdownMenuItem variant="destructive" onClick={() => setPendingRepositoryRemoval(true)}><Trash2Icon aria-hidden="true" />Remove from Repola…</DropdownMenuItem>
                   </DropdownMenuGroup>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </TooltipTrigger>
-            <TooltipContent>Repository actions</TooltipContent>
-          </Tooltip>
-        </ContextToolbarField>
-      </div>
-      <div className="flex min-w-0 flex-1 border-r px-4 py-3">
-        <ContextToolbarField id="current-worktree" label="Worktree">
+                </>
+              ) : null}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+        <div className="flex min-w-0 flex-1 items-center border-l pl-1">
           <Select items={worktreeItems} value={worktree?.path ?? null} onValueChange={(value) => { if (value) onWorktreeChange(value); }}>
-            <SelectTrigger id="current-worktree" className="min-w-0 flex-1" aria-label="Current worktree">
-              <FolderOpenIcon aria-hidden="true" />
-              <SelectValue placeholder="Select a worktree" />
-            </SelectTrigger>
+            <ToolbarSelectTrigger id="current-worktree" caption="Worktree" icon={<FolderOpenIcon />} placeholder="Select a worktree" aria-label="Current worktree" />
             <SelectContent>
               <SelectGroup>
                 {worktrees.map((item) => (
@@ -145,29 +138,37 @@ export function RepositoryToolbar({
               </SelectGroup>
             </SelectContent>
           </Select>
-        </ContextToolbarField>
+        </div>
+        <div className="flex min-w-0 flex-1 items-center gap-0.5 border-l pl-1">
+          {repository && worktree ? (
+            <BranchControl />
+          ) : (
+            <span className="px-2 text-sm text-muted-foreground">No branch</span>
+          )}
+        </div>
+        <div className="flex shrink-0 items-center gap-1 border-l px-2">
+          <SyncControls />
+        </div>
       </div>
-      <div className="flex min-w-64 flex-1 items-center border-r px-4 py-3">
-        {repository && worktree ? (
-          <BranchControl />
-        ) : (
-          <span className="text-sm text-muted-foreground">No branch</span>
-        )}
-      </div>
-      <div className="ml-auto flex items-center gap-1 px-4">
-        <Button variant={view === "changes" ? "secondary" : "ghost"} size="sm" onClick={() => onViewChange("changes")}>
-          <FileDiffIcon data-icon="inline-start" aria-hidden="true" />
-          Changes
-        </Button>
-        <Button variant={view === "history" ? "secondary" : "ghost"} size="sm" onClick={() => onViewChange("history")}>
-          <GitCommitIcon data-icon="inline-start" aria-hidden="true" />
-          History
-        </Button>
-        <Button variant={view === "worktrees" ? "secondary" : "ghost"} size="sm" onClick={() => onViewChange("worktrees")}>
-          <HardDriveIcon data-icon="inline-start" aria-hidden="true" />
-          Worktrees
-        </Button>
-      </div>
+      <nav className="flex shrink-0 items-center gap-0.5 border-l pl-2" aria-label="Workspace views">
+        {views.map(({ id, label, icon: Icon, badge }) => (
+          <Button key={id} variant={view === id ? "secondary" : "ghost"} size="sm" aria-current={view === id ? "page" : undefined} onClick={() => onViewChange(id)}>
+            <Icon data-icon="inline-start" aria-hidden="true" />
+            {label}
+            {badge ? <Badge variant={view === id ? "default" : "secondary"} className="ml-0.5 px-1.5 font-mono">{badge}</Badge> : null}
+          </Button>
+        ))}
+      </nav>
+      {stashOpen && workingCopy?.snapshot && repository && worktree ? (
+        <StashDialog
+          machineId={machineId}
+          repository={repository}
+          worktree={worktree}
+          snapshot={workingCopy.snapshot}
+          onSnapshot={workingCopy.setSnapshot}
+          onClose={() => setStashOpen(false)}
+        />
+      ) : null}
       <Dialog open={pendingRepositoryRemoval} onOpenChange={setPendingRepositoryRemoval}>
         <DialogContent>
           <DialogHeader>
@@ -181,7 +182,7 @@ export function RepositoryToolbar({
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </section>
+    </>
   );
 }
 
@@ -275,60 +276,58 @@ function BranchControl() {
   };
 
   return (
-    <div className="min-w-0 flex-1">
-      <ContextToolbarField id="current-branch" label="Branch">
-        <Select items={items} value={current?.fullName ?? null} disabled={busy || branches === null} onValueChange={selectBranch}>
-          <SelectTrigger id="current-branch" className="min-w-0 flex-1" aria-label="Current branch">
-            {busy || branches === null
-              ? <Spinner />
-              : <GitBranchIcon aria-hidden="true" />}
-            <SelectValue placeholder="Select a branch">
-              {current?.name ?? (worktree.branch ? worktree.branch : `Detached at ${shortSha(worktree.head)}`)}
-            </SelectValue>
-          </SelectTrigger>
-          <SelectContent className="min-w-72" align="start">
+    <>
+      <Select items={items} value={current?.fullName ?? null} disabled={busy || branches === null} onValueChange={selectBranch}>
+        <ToolbarSelectTrigger id="current-branch" caption="Branch" icon={busy || branches === null ? <Spinner /> : <GitBranchIcon />} placeholder="Select a branch" aria-label="Current branch">
+          {current?.name ?? (worktree.branch ? worktree.branch : `Detached at ${shortSha(worktree.head)}`)}
+        </ToolbarSelectTrigger>
+        <SelectContent className="min-w-72" align="start" alignItemWithTrigger={false}>
+          <SelectGroup>
+            <SelectLabel>Local branches</SelectLabel>
+            {localBranches.map((branch) => {
+              const occupiedElsewhere = branch.occupiedWorktreePath !== null
+                && branch.occupiedWorktreePath !== worktree.path;
+              return (
+                <SelectItem key={branch.fullName} value={branch.fullName} disabled={occupiedElsewhere}>
+                  <span className="flex min-w-0 flex-1 items-center gap-2">
+                    <span className="truncate">{branch.name}</span>
+                    {branch.ahead > 0 ? <Badge variant="outline">↑{branch.ahead}</Badge> : null}
+                    {branch.behind > 0 ? <Badge variant="outline">↓{branch.behind}</Badge> : null}
+                    {occupiedElsewhere ? <span className="ml-auto max-w-36 truncate text-xs text-muted-foreground">in {branch.occupiedWorktreePath}</span> : null}
+                  </span>
+                </SelectItem>
+              );
+            })}
+          </SelectGroup>
+          {remoteBranches.length > 0 ? (
             <SelectGroup>
-              <SelectLabel>Local branches</SelectLabel>
-              {localBranches.map((branch) => {
-                const occupiedElsewhere = branch.occupiedWorktreePath !== null
-                  && branch.occupiedWorktreePath !== worktree.path;
-                return (
-                  <SelectItem key={branch.fullName} value={branch.fullName} disabled={occupiedElsewhere}>
-                    <span className="flex min-w-0 flex-1 items-center gap-2">
-                      <span className="truncate">{branch.name}</span>
-                      {branch.ahead > 0 ? <Badge variant="outline">↑{branch.ahead}</Badge> : null}
-                      {branch.behind > 0 ? <Badge variant="outline">↓{branch.behind}</Badge> : null}
-                      {occupiedElsewhere ? <span className="ml-auto max-w-36 truncate text-xs text-muted-foreground">in {branch.occupiedWorktreePath}</span> : null}
-                    </span>
-                  </SelectItem>
-                );
-              })}
+              <SelectLabel>Remote branches</SelectLabel>
+              {remoteBranches.map((branch) => (
+                <SelectItem key={branch.fullName} value={branch.fullName}>
+                  <span className="truncate text-muted-foreground">{branch.name}</span>
+                </SelectItem>
+              ))}
             </SelectGroup>
-            {remoteBranches.length > 0 ? (
-              <SelectGroup>
-                <SelectLabel>Remote branches</SelectLabel>
-                {remoteBranches.map((branch) => (
-                  <SelectItem key={branch.fullName} value={branch.fullName}>
-                    <span className="truncate text-muted-foreground">{branch.name}</span>
-                  </SelectItem>
-                ))}
-              </SelectGroup>
-            ) : null}
-          </SelectContent>
-        </Select>
-        <TooltipButton variant="ghost" size="icon-sm" disabled={busy || branches === null} tooltip="Create branch" aria-label="Create branch" onClick={() => openDialog("create")}>
-          <PlusIcon aria-hidden="true" />
-        </TooltipButton>
-        <TooltipButton variant="ghost" size="icon-sm" disabled={busy || current === null} tooltip="Rename current branch" aria-label="Rename current branch" onClick={() => openDialog("rename")}>
-          <PencilIcon aria-hidden="true" />
-        </TooltipButton>
-        <TooltipButton variant="ghost" size="icon-sm" disabled={busy || current === null || historyTargets.length === 0} tooltip="Merge or rebase" aria-label="Merge or rebase" onClick={() => setHistoryActionsOpen(true)}>
-          <GitMergeIcon aria-hidden="true" />
-        </TooltipButton>
-        <TooltipButton variant="ghost" size="icon-sm" disabled={busy || worktree.head === null} tooltip="Tags" aria-label="Tags" onClick={() => setTagsOpen(true)}>
-          <TagIcon aria-hidden="true" />
-        </TooltipButton>
-      </ContextToolbarField>
+          ) : null}
+        </SelectContent>
+      </Select>
+      <DropdownMenu>
+        <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" disabled={busy || branches === null} aria-label="Branch actions" />}>
+          <MoreHorizontalIcon aria-hidden="true" />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" className="min-w-56">
+          <DropdownMenuGroup>
+            <DropdownMenuLabel>{current?.name ?? "Detached HEAD"}</DropdownMenuLabel>
+            <DropdownMenuItem onClick={() => openDialog("create")}><PlusIcon aria-hidden="true" />Create branch…</DropdownMenuItem>
+            <DropdownMenuItem disabled={current === null} onClick={() => openDialog("rename")}><PencilIcon aria-hidden="true" />Rename branch…</DropdownMenuItem>
+          </DropdownMenuGroup>
+          <DropdownMenuSeparator />
+          <DropdownMenuGroup>
+            <DropdownMenuItem disabled={current === null || historyTargets.length === 0} onClick={() => setHistoryActionsOpen(true)}><GitMergeIcon aria-hidden="true" />Merge or rebase…</DropdownMenuItem>
+            <DropdownMenuItem disabled={worktree.head === null} onClick={() => setTagsOpen(true)}><TagIcon aria-hidden="true" />Tags…</DropdownMenuItem>
+          </DropdownMenuGroup>
+        </DropdownMenuContent>
+      </DropdownMenu>
       <Dialog open={dialogKind !== null} onOpenChange={(open) => { if (!open && !busy) setDialogKind(null); }}>
         <DialogContent>
           <form className="contents" onSubmit={submitDialog}>
@@ -392,6 +391,6 @@ function BranchControl() {
           <TagsDialog machineId={machineId} repository={repository} worktree={worktree} onClose={() => setTagsOpen(false)} onChanged={async () => { await onChanged(); }} />
         </LazyDialog>
       ) : null}
-    </div>
+    </>
   );
 }

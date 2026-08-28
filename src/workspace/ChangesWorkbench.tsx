@@ -1,20 +1,23 @@
-import { Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { Suspense, useDeferredValue, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   AlertTriangleIcon,
-  ArchiveIcon,
   FileDiffIcon,
   GitCommitIcon,
-  RefreshCwIcon,
+  MoreHorizontalIcon,
+  SearchIcon,
+  SearchXIcon,
   Settings2Icon,
   ShieldCheckIcon,
   Trash2Icon,
   UnlockKeyholeIcon,
+  XIcon,
 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
@@ -24,11 +27,9 @@ import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/toast";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { TooltipButton } from "@/components/tooltip-button";
 import { cn } from "@/lib/utils";
 import { toMessage } from "@/lib/errors";
 import { ActionableGitError } from "../components/ActionableGitError";
-import { StashDialog } from "../dialogs/StashDialog";
 import { arrowKeyChangeTarget, emptyChangeSelection, isSelectAllChangesShortcut, isToggleSelectedChangesShortcut, selectAllChanges, singleChangeSelection, updateChangeSelection } from "../domain/change-selection";
 import {
   commitSelectionFor,
@@ -41,6 +42,7 @@ import {
   type CommitSelectionMap,
   type FileCommitSelection,
 } from "../domain/commit-selection";
+import { filterChanges } from "../domain/change-filter";
 import { shortSha } from "../domain/format";
 import { SELECT_ALL_EVENT } from "../domain/select-all";
 import { loadAppPreferences } from "../ipc/app-preferences";
@@ -48,37 +50,28 @@ import {
   commitWorkingCopy,
   discardAll,
   discardFile,
-  fetchWorkingCopy,
   mutateRepositoryOperation,
-  onWorktreeChanged,
-  synchronizeWorkingCopy,
   undoLatestCommit,
-  unwatchWorktree,
-  watchWorktree,
 } from "../ipc/worktrees";
-import type { CommitSigning, ConflictResolutionKind, DiscardScope, FileDiff, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../ipc/types";
+import type { CommitSigning, ConflictResolutionKind, DiscardScope, RepositoryOperationAction, WorkingCopySnapshot } from "../ipc/types";
 import { parseCommitPeople, parseCommitTrailers } from "./commit-form";
 import { useWorkingCopy } from "./context";
 import { sectionHeadingClass, signingItems } from "./labels";
 import { LazyDialog } from "./LazyDialog";
 import { ConflictResolutionDialog, DiffDialog, InlineFileDiff } from "./lazy";
 import { operationGuidance, operationLabel, operationSupportsSkip } from "./operations";
+import { useMutationGuard, useWorkingCopyState } from "./working-copy-state";
 
 export function ChangesWorkbench() {
   const { machineId, repository, worktree } = useWorkingCopy();
-  // File diffs are only meaningful for the snapshot they were loaded against,
-  // so the cache is stored with the snapshot and replaced whenever it is.
-  const [workingCopy, setWorkingCopy] = useState<{ snapshot: WorkingCopySnapshot | null; diffCache: Map<string, FileDiff> }>(() => ({ snapshot: null, diffCache: new Map() }));
-  const { snapshot, diffCache } = workingCopy;
-  const setSnapshot = useCallback((next: WorkingCopySnapshot | null) => setWorkingCopy({ snapshot: next, diffCache: new Map() }), []);
-  const [changeSelection, setChangeSelection] = useState(emptyChangeSelection);
+  const { snapshot, diffCache, error, setSnapshot, setError } = useWorkingCopyState();
+  const [rawChangeSelection, setChangeSelection] = useState(emptyChangeSelection);
+  const [filter, setFilter] = useState("");
   const [commitSelections, setCommitSelections] = useState<CommitSelectionMap>(() => new Map());
   const changesListRef = useRef<HTMLDivElement>(null);
   const [busyPath, setBusyPath] = useState<string | null>(null);
   const [commitBusy, setCommitBusy] = useState(false);
-  const [syncBusy, setSyncBusy] = useState(false);
   const [operationBusy, setOperationBusy] = useState(false);
-  const [pendingForcePush, setPendingForcePush] = useState(false);
   const [pendingUndo, setPendingUndo] = useState(false);
   const [pendingDiscardAll, setPendingDiscardAll] = useState(false);
   const [summary, setSummary] = useState("");
@@ -90,9 +83,7 @@ export function ChangesWorkbench() {
   const [coAuthors, setCoAuthors] = useState("");
   const [trailers, setTrailers] = useState("");
   const [signing, setSigning] = useState<CommitSigning>("default");
-  const [error, setError] = useState<string | null>(null);
   const [diffOpen, setDiffOpen] = useState(false);
-  const [stashOpen, setStashOpen] = useState(false);
   const [pendingResolution, setPendingResolution] = useState<{
     kind: ConflictResolutionKind;
     change: WorkingCopySnapshot["changes"][number];
@@ -103,76 +94,9 @@ export function ChangesWorkbench() {
   } | null>(null);
   const [pendingOperationAction, setPendingOperationAction] = useState<RepositoryOperationAction | null>(null);
 
-  useEffect(() => {
-    const controller = new AbortController();
-    setSnapshot(null);
-    setChangeSelection(emptyChangeSelection);
-    setCommitSelections(new Map());
-    setError(null);
-    void fetchWorkingCopy(machineId, repository.path, worktree.path, controller.signal)
-      .then((next) => {
-        setSnapshot(next);
-        setChangeSelection(singleChangeSelection(next.changes.find((change) => !change.ignored)?.id ?? null));
-        setCommitSelections(createCommitSelection(next.changes));
-      })
-      .catch((cause: unknown) => {
-        if (!controller.signal.aborted) setError(toMessage(cause));
-      });
-    return () => controller.abort();
-  }, [machineId, repository.path, setSnapshot, worktree.id, worktree.path]);
-
-  // Mutations replace the snapshot with their own result, so a disk-triggered reload
-  // while one is running would only race it.
-  const mutating = busyPath !== null || commitBusy || syncBusy || operationBusy;
-  const mutatingRef = useRef(mutating);
-  useEffect(() => { mutatingRef.current = mutating; }, [mutating]);
-  const reloadController = useRef<AbortController | null>(null);
-  const reloadSnapshot = useCallback(() => {
-    if (mutatingRef.current) return;
-    reloadController.current?.abort();
-    const controller = new AbortController();
-    reloadController.current = controller;
-    void fetchWorkingCopy(machineId, repository.path, worktree.path, controller.signal)
-      .then((next) => {
-        if (controller.signal.aborted || mutatingRef.current) return;
-        setSnapshot(next);
-        setChangeSelection((current) => {
-          const ids = new Set(next.changes.map((change) => change.id));
-          return current.activeId && ids.has(current.activeId)
-            ? current
-            : singleChangeSelection(next.changes.find((change) => !change.ignored)?.id ?? null);
-        });
-      })
-      .catch((cause: unknown) => {
-        if (!controller.signal.aborted) setError(toMessage(cause));
-      })
-      .finally(() => {
-        if (reloadController.current === controller) reloadController.current = null;
-      });
-  }, [machineId, repository.path, setSnapshot, worktree.path]);
-  useEffect(() => () => reloadController.current?.abort(), []);
-
-  // Refresh when files change on disk (local machines) and whenever the window regains focus,
-  // so edits and Git commands made outside Repola show up without a manual refresh.
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | null = null;
-    void watchWorktree(machineId, worktree.path).catch(() => undefined);
-    void onWorktreeChanged((event) => {
-      if (!disposed && event.machineId === machineId) reloadSnapshot();
-    }).then((dispose) => {
-      if (disposed) dispose();
-      else unlisten = dispose;
-    });
-    const onFocus = () => reloadSnapshot();
-    window.addEventListener("focus", onFocus);
-    return () => {
-      disposed = true;
-      unlisten?.();
-      window.removeEventListener("focus", onFocus);
-      void unwatchWorktree().catch(() => undefined);
-    };
-  }, [machineId, reloadSnapshot, worktree.path]);
+  // Mutations replace the snapshot with their own result, so a disk-triggered
+  // reload while one is running would only race it.
+  useMutationGuard(busyPath !== null || commitBusy || operationBusy);
 
   useEffect(() => {
     let active = true;
@@ -182,8 +106,19 @@ export function ChangesWorkbench() {
     return () => { active = false; };
   }, [worktree.id]);
 
-  const visibleChanges = useMemo(() => snapshot?.changes.filter((change) => !change.ignored) ?? [], [snapshot]);
+  // `changes` is everything the commit form operates on; `visibleChanges` is
+  // the subset the list shows after the filter box is applied.
+  const changes = useMemo(() => snapshot?.changes.filter((change) => !change.ignored) ?? [], [snapshot]);
+  const visibleChanges = useMemo(() => filterChanges(changes, filter), [changes, filter]);
   const visibleChangeIds = useMemo(() => visibleChanges.map((change) => change.id), [visibleChanges]);
+  // When the active file disappears (snapshot refresh, filter change), fall
+  // back to the first visible file rather than showing an empty diff pane.
+  const changeSelection = useMemo(
+    () => rawChangeSelection.activeId !== null && visibleChangeIds.includes(rawChangeSelection.activeId)
+      ? rawChangeSelection
+      : singleChangeSelection(visibleChangeIds[0] ?? null),
+    [rawChangeSelection, visibleChangeIds],
+  );
   const selectedChange = visibleChanges.find((change) => change.id === changeSelection.activeId) ?? null;
   // Only the diff body is expensive to build, so it alone follows the selection
   // at transition priority. The list highlight, the header, and every action
@@ -193,23 +128,10 @@ export function ChangesWorkbench() {
   // Held as state rather than a ref so the diff pane can bind its virtualized
   // rows to the element as soon as it exists.
   const [diffScroller, setDiffScroller] = useState<HTMLDivElement | null>(null);
-  const includedCount = includedChangeCount(visibleChanges, commitSelections);
-  const gitStagedCount = visibleChanges.filter((change) => change.staged).length;
-  const allChangesIncluded = visibleChanges.length > 0 && includedCount === visibleChanges.length;
-  const syncKind: SyncKind = !snapshot?.upstream
-    ? "publish"
-    : snapshot.behind > 0
-      ? "pull"
-      : snapshot.ahead > 0
-        ? "push"
-        : "fetch";
-  const syncLabel = syncKind === "publish"
-    ? "Publish branch"
-    : syncKind === "pull"
-      ? `Pull ${snapshot?.behind ?? 0}`
-      : syncKind === "push"
-        ? `Push ${snapshot?.ahead ?? 0}`
-        : "Fetch";
+  const includedCount = includedChangeCount(changes, commitSelections);
+  const visibleIncludedCount = includedChangeCount(visibleChanges, commitSelections);
+  const gitStagedCount = changes.filter((change) => change.staged).length;
+  const allVisibleIncluded = visibleChanges.length > 0 && visibleIncludedCount === visibleChanges.length;
 
   useEffect(() => {
     const onSelectAll = (event: Event) => {
@@ -255,7 +177,7 @@ export function ChangesWorkbench() {
         repositoryPath: repository.path,
         worktreePath: worktree.path,
         expectedHead: snapshot?.head ?? null,
-        includedChanges: commitSelectionRequest(visibleChanges, commitSelections),
+        includedChanges: commitSelectionRequest(changes, commitSelections),
         summary,
         description,
         amend,
@@ -280,33 +202,6 @@ export function ChangesWorkbench() {
       setError(toMessage(cause));
     } finally {
       setCommitBusy(false);
-    }
-  };
-
-  const synchronize = async (kind: SyncKind = syncKind) => {
-    if (!snapshot) return;
-    setSyncBusy(true);
-    setError(null);
-    try {
-      const result = await synchronizeWorkingCopy(
-        machineId,
-        repository.path,
-        worktree.path,
-        kind,
-        snapshot.head,
-        snapshot.upstreamHead,
-      );
-      setSnapshot(result.snapshot);
-      if (kind === "forcePush") setPendingForcePush(false);
-      toast.add({
-        type: "success",
-        title: kind === "fetch" ? "Remote state fetched" : kind === "pull" ? "Changes pulled" : kind === "push" ? "Commits pushed" : kind === "forcePush" ? "Branch force-pushed safely" : "Branch published",
-        description: result.output || undefined,
-      });
-    } catch (cause) {
-      setError(toMessage(cause));
-    } finally {
-      setSyncBusy(false);
     }
   };
 
@@ -408,42 +303,50 @@ export function ChangesWorkbench() {
   return (
     <div className="grid min-h-0 flex-1 grid-cols-[380px_minmax(0,1fr)]">
       <aside className="flex min-h-0 flex-col border-r bg-sidebar">
-        <div className="flex h-12 shrink-0 items-center border-b px-4">
+        <div className="flex h-12 shrink-0 items-center gap-2 border-b px-3">
           <Checkbox
-            checked={allChangesIncluded}
-            indeterminate={includedCount > 0 && !allChangesIncluded}
+            checked={allVisibleIncluded}
+            indeterminate={visibleIncludedCount > 0 && !allVisibleIncluded}
             disabled={visibleChanges.length === 0 || commitBusy || busyPath !== null}
             onCheckedChange={(checked) => setCommitSelections((current) => setChangesIncluded(
               current,
               new Set(visibleChanges.filter((change) => !change.conflicted).map((change) => change.id)),
               checked === true,
             ))}
-            aria-label={allChangesIncluded ? "Exclude all changes from commit" : "Include all changes in commit"}
+            aria-label={allVisibleIncluded ? "Exclude all listed changes from commit" : "Include all listed changes in commit"}
           />
-          <strong className="ml-3 text-sm">Changes</strong>
-          <Badge variant="secondary" className="ml-2">{visibleChanges.length}</Badge>
-          <TooltipButton
-            variant="ghost"
-            size="icon-sm"
-            className="text-destructive"
-            disabled={!snapshot || visibleChanges.length === 0 || commitBusy || busyPath !== null || snapshot.operation !== null}
-            onClick={() => setPendingDiscardAll(true)}
-            aria-label="Discard all changes"
-            tooltip="Discard all changes"
-          >
-            <Trash2Icon aria-hidden="true" />
-          </TooltipButton>
-          <Button variant="outline" size="sm" className="ml-auto" disabled={!snapshot || commitBusy || busyPath !== null || snapshot.operation !== null} onClick={() => setStashOpen(true)}>
-            <ArchiveIcon data-icon="inline-start" aria-hidden="true" />
-            Stashes
-          </Button>
-          <Button variant="outline" size="sm" className="ml-2" disabled={syncBusy || !snapshot?.remote || snapshot.operation !== null} onClick={() => void synchronize()}>
-            {syncBusy ? <Spinner data-icon="inline-start" /> : <RefreshCwIcon data-icon="inline-start" aria-hidden="true" />}
-            {syncBusy ? "Working…" : syncLabel}
-          </Button>
-          {snapshot?.upstream && snapshot.ahead > 0 && snapshot.behind > 0 ? (
-            <Button variant="destructive" size="sm" className="ml-2" disabled={syncBusy || snapshot.operation !== null} onClick={() => setPendingForcePush(true)}>Force…</Button>
-          ) : null}
+          <strong className="text-sm">Changes</strong>
+          <Badge variant="secondary">{changes.length}</Badge>
+          <div className="relative ml-auto min-w-0 flex-1 max-w-52">
+            <SearchIcon className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+            <Input
+              value={filter}
+              onChange={(event) => setFilter(event.currentTarget.value)}
+              placeholder="Filter"
+              aria-label="Filter changed files"
+              className="h-7 pr-7 pl-7 text-xs"
+              spellCheck={false}
+              autoComplete="off"
+            />
+            {filter ? (
+              <button type="button" className="absolute top-1/2 right-1 grid size-5 -translate-y-1/2 place-items-center rounded-sm text-muted-foreground hover:text-foreground" onClick={() => setFilter("")} aria-label="Clear filter">
+                <XIcon className="size-3.5" aria-hidden="true" />
+              </button>
+            ) : null}
+          </div>
+          <DropdownMenu>
+            <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="More change actions" />}>
+              <MoreHorizontalIcon aria-hidden="true" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="min-w-56">
+              <DropdownMenuGroup>
+                <DropdownMenuItem disabled={changes.length === 0} onClick={() => setDiffOpen(true)}><FileDiffIcon aria-hidden="true" />Review complete diff…</DropdownMenuItem>
+              </DropdownMenuGroup>
+              <DropdownMenuGroup>
+                <DropdownMenuItem variant="destructive" disabled={!snapshot || changes.length === 0 || commitBusy || busyPath !== null || snapshot.operation !== null} onClick={() => setPendingDiscardAll(true)}><Trash2Icon aria-hidden="true" />Discard all changes…</DropdownMenuItem>
+              </DropdownMenuGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
         {snapshot?.operation ? (
           <div className="border-b bg-warning/10 px-4 py-3">
@@ -550,13 +453,24 @@ export function ChangesWorkbench() {
             </div>
           ))}
           {visibleChanges.length === 0 ? (
-            <Empty className="h-full py-12">
-              <EmptyHeader>
-                <EmptyMedia variant="icon"><ShieldCheckIcon aria-hidden="true" /></EmptyMedia>
-                <EmptyTitle>No local changes</EmptyTitle>
-                <EmptyDescription>This working copy matches its current commit.</EmptyDescription>
-              </EmptyHeader>
-            </Empty>
+            changes.length === 0 ? (
+              <Empty className="h-full py-12">
+                <EmptyHeader>
+                  <EmptyMedia variant="icon"><ShieldCheckIcon aria-hidden="true" /></EmptyMedia>
+                  <EmptyTitle>No local changes</EmptyTitle>
+                  <EmptyDescription>This working copy matches its current commit.</EmptyDescription>
+                </EmptyHeader>
+              </Empty>
+            ) : (
+              <Empty className="h-full py-12">
+                <EmptyHeader>
+                  <EmptyMedia variant="icon"><SearchXIcon aria-hidden="true" /></EmptyMedia>
+                  <EmptyTitle>No matching files</EmptyTitle>
+                  <EmptyDescription>None of the {changes.length} changed files match “{filter.trim()}”.</EmptyDescription>
+                </EmptyHeader>
+                <Button variant="outline" size="sm" onClick={() => setFilter("")}>Clear filter</Button>
+              </Empty>
+            )
           ) : null}
         </div>
         <form className="flex max-h-[58%] shrink-0 flex-col gap-2 overflow-y-auto border-t bg-card p-3" onSubmit={(event) => void submitCommit(event)}>
@@ -614,10 +528,6 @@ export function ChangesWorkbench() {
               Discard…
             </Button>
           ) : null}
-          <Button variant="outline" size="sm" className={selectedChange && !selectedChange.conflicted ? "ml-2" : "ml-auto"} disabled={visibleChanges.length === 0} onClick={() => setDiffOpen(true)}>
-            <FileDiffIcon data-icon="inline-start" aria-hidden="true" />
-            Review complete diff
-          </Button>
         </div>
         {selectedChange?.conflicted ? (
           <div className="flex shrink-0 items-center gap-2 border-b bg-destructive/8 px-4 py-2">
@@ -655,16 +565,6 @@ export function ChangesWorkbench() {
         <LazyDialog onClose={() => setDiffOpen(false)}>
           <DiffDialog machineId={machineId} worktree={worktree} onClose={() => setDiffOpen(false)} />
         </LazyDialog>
-      ) : null}
-      {stashOpen && snapshot ? (
-        <StashDialog
-          machineId={machineId}
-          repository={repository}
-          worktree={worktree}
-          snapshot={snapshot}
-          onSnapshot={setSnapshot}
-          onClose={() => setStashOpen(false)}
-        />
       ) : null}
       {pendingResolution && snapshot ? (
         <LazyDialog onClose={() => setPendingResolution(null)}>
@@ -721,13 +621,13 @@ export function ChangesWorkbench() {
         <Dialog open onOpenChange={(open) => { if (!open && !commitBusy) setPendingDiscardAll(false); }}>
           <DialogContent>
             <DialogHeader>
-              <DialogTitle>Discard all {visibleChanges.length} changed files?</DialogTitle>
+              <DialogTitle>Discard all {changes.length} changed files?</DialogTitle>
               <DialogDescription>Repola will revalidate HEAD and the complete reviewed path/status set immediately before Git changes anything.</DialogDescription>
             </DialogHeader>
             <div className="grid grid-cols-3 border bg-muted/35">
               <div className="border-r p-3 text-center"><strong className="block font-mono text-lg">{gitStagedCount}</strong><span className="text-xs text-muted-foreground">staged</span></div>
-              <div className="border-r p-3 text-center"><strong className="block font-mono text-lg">{visibleChanges.filter((change) => change.unstaged && !change.untracked).length}</strong><span className="text-xs text-muted-foreground">unstaged</span></div>
-              <div className="p-3 text-center"><strong className="block font-mono text-lg">{visibleChanges.filter((change) => change.untracked).length}</strong><span className="text-xs text-muted-foreground">untracked</span></div>
+              <div className="border-r p-3 text-center"><strong className="block font-mono text-lg">{changes.filter((change) => change.unstaged && !change.untracked).length}</strong><span className="text-xs text-muted-foreground">unstaged</span></div>
+              <div className="p-3 text-center"><strong className="block font-mono text-lg">{changes.filter((change) => change.untracked).length}</strong><span className="text-xs text-muted-foreground">untracked</span></div>
             </div>
             <Alert variant="destructive">
               <AlertTriangleIcon aria-hidden="true" />
@@ -765,24 +665,6 @@ export function ChangesWorkbench() {
               <Button variant={pendingOperationAction === "abort" ? "destructive" : "default"} disabled={operationBusy} onClick={() => void runOperationAction(pendingOperationAction)}>
                 {operationBusy ? <Spinner data-icon="inline-start" /> : null}
                 {operationBusy ? "Working…" : pendingOperationAction === "abort" ? "Abort Operation" : "Skip Step"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-      ) : null}
-      {pendingForcePush && snapshot?.branch ? (
-        <Dialog open onOpenChange={(open) => { if (!open && !syncBusy) setPendingForcePush(false); }}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Force-push {snapshot.branch}?</DialogTitle>
-              <DialogDescription>Replace the remote branch with this local history. Repola uses an exact force-with-lease, so Git will refuse if the remote changed since your last fetch.</DialogDescription>
-            </DialogHeader>
-            <Alert variant="destructive"><AlertTriangleIcon aria-hidden="true" /><AlertDescription>This rewrites published history and may disrupt anyone using the remote commits.</AlertDescription></Alert>
-            <DialogFooter>
-              <Button variant="outline" disabled={syncBusy} onClick={() => setPendingForcePush(false)}>Cancel</Button>
-              <Button variant="destructive" disabled={syncBusy || !snapshot.upstreamHead} onClick={() => void synchronize("forcePush")}>
-                {syncBusy ? <Spinner data-icon="inline-start" /> : null}
-                {syncBusy ? "Pushing…" : "Force-push with Lease"}
               </Button>
             </DialogFooter>
           </DialogContent>

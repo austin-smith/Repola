@@ -86,6 +86,7 @@ import {
 import { RepositoryProvider, type RepositoryContextValue } from "../workspace/context";
 import { ContextHeader, type MachineConnection } from "../workspace/ContextHeader";
 import { RepositoryToolbar } from "../workspace/RepositoryToolbar";
+import { WorkingCopyProvider } from "../workspace/WorkingCopyProvider";
 import { ChangesWorkbench } from "../workspace/ChangesWorkbench";
 import { HistoryWorkbench } from "../workspace/HistoryWorkbench";
 import { WorktreeDetails, type PullState } from "../workspace/WorktreeDetails";
@@ -929,9 +930,6 @@ function App() {
 
   const headerActions = (
     <>
-      <TooltipButton variant="ghost" size="icon-sm" onClick={() => setRepositoryDialogOpen(true)} aria-label="Add repository" tooltip="Add repository">
-        <FolderPlusIcon aria-hidden="true" />
-      </TooltipButton>
       <ModeToggle />
       <TooltipButton variant="ghost" size="icon-sm" onClick={() => setSettingsOpen(true)} aria-label="Settings" tooltip="Settings (⌘,)">
         <SettingsIcon aria-hidden="true" />
@@ -939,7 +937,7 @@ function App() {
     </>
   );
 
-  const contextHeader = (status?: ReactNode, extraActions?: ReactNode) => (
+  const contextHeader = (status?: ReactNode, extraActions?: ReactNode, toolbar?: ReactNode) => (
     <>
       <ContextHeader
         machines={machines}
@@ -949,10 +947,10 @@ function App() {
         disabled={actionBusy || bulkBusy}
         onChange={switchMachine}
         onRetry={() => void probeMachineConnection(selectedMachineId, true)}
+        status={status}
+        actions={<>{extraActions}{headerActions}</>}
       >
-        {status}
-        {extraActions}
-        {headerActions}
+        {toolbar}
       </ContextHeader>
       {repositoryDialog}
     </>
@@ -1051,6 +1049,7 @@ function App() {
         onWorktreeChange={setCurrentWorktreePath}
         onViewChange={setWorkspaceView}
         onCreateWorktree={() => setCreateWorktreeOpen(true)}
+        onAddRepository={() => setRepositoryDialogOpen(true)}
         onRemoveRepository={removeRepositoryFromList}
       />
       {createWorktreeOpen && currentRepository && currentWorktree ? (
@@ -1070,6 +1069,12 @@ function App() {
     </>
   );
 
+  // The working-copy snapshot backs the toolbar's sync and stash controls as
+  // well as the Changes view, so it lives above both for the selected worktree.
+  const withWorkingCopy = (children: ReactNode) => currentRepository && currentWorktree
+    ? <WorkingCopyProvider key={currentWorktree.id}>{children}</WorkingCopyProvider>
+    : children;
+
   const noWorkingCopy = (title: string, description: string) => (
     <Empty className="min-h-0 flex-1">
       <EmptyHeader>
@@ -1081,15 +1086,9 @@ function App() {
   );
 
   if (workspaceView === "changes") {
-    return shell(
+    return shell(withWorkingCopy(
       <>
-        {contextHeader(
-          <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
-            <span className="size-1.5 rounded-full bg-success" aria-hidden="true" />
-            {currentWorktree ? `${currentWorktree.status.total} changed` : "No working copy"}
-          </div>,
-        )}
-        {workspaceToolbar}
+        {contextHeader(undefined, undefined, workspaceToolbar)}
         {currentRepository && currentWorktree ? (
           <ErrorBoundary label="The changes view" resetKey={currentWorktree.id}>
             <ChangesWorkbench key={currentWorktree.id} />
@@ -1097,14 +1096,13 @@ function App() {
         ) : noWorkingCopy("No working copy selected", "Add or select a repository with an available working copy.")}
         {overlays}
       </>,
-    );
+    ));
   }
 
   if (workspaceView === "history") {
-    return shell(
+    return shell(withWorkingCopy(
       <>
-        {contextHeader()}
-        {workspaceToolbar}
+        {contextHeader(undefined, undefined, workspaceToolbar)}
         {currentRepository && currentWorktree ? (
           <ErrorBoundary label="The history view" resetKey={currentWorktree.id}>
             <HistoryWorkbench key={currentWorktree.id} />
@@ -1112,21 +1110,21 @@ function App() {
         ) : noWorkingCopy("No history available", "Select an available working copy.")}
         {overlays}
       </>,
-    );
+    ));
   }
 
-  return shell(
+  return shell(withWorkingCopy(
     <>
       {contextHeader(
-        <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
+        <>
           <span className={cn("size-1.5 rounded-full", loading ? "animate-pulse bg-brand" : "bg-success")} aria-hidden="true" />
           {loading ? "Scanning…" : `Scanned ${formatAge(scan.scannedAtMs, Date.now())}`}
-        </div>,
+        </>,
         <TooltipButton variant="ghost" size="icon-sm" disabled={!auditPath} onClick={() => void showAuditLog()} aria-label="Show audit log" tooltip="Show audit log">
           <FileClockIcon aria-hidden="true" />
         </TooltipButton>,
+        workspaceToolbar,
       )}
-      {workspaceToolbar}
 
       <section className="flex h-13 shrink-0 items-center border-b bg-surface-inverse px-5 text-surface-inverse-foreground" aria-label="Inventory summary">
         <SummaryCell icon={<DatabaseIcon aria-hidden="true" />} value={String(scan.totals.linkedCount)} label="linked worktrees" />
@@ -1372,7 +1370,7 @@ function App() {
       ) : null}
       {overlays}
     </>,
-  );
+  ));
 }
 
 function SummaryCell({ icon, value, label }: { icon: ReactNode; value: string; label: string }) {
