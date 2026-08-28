@@ -1,7 +1,9 @@
 import { Suspense, useDeferredValue, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   AlertTriangleIcon,
+  CopyIcon,
   FileDiffIcon,
+  FolderOpenIcon,
   GitCommitIcon,
   KeyRoundIcon,
   MoreHorizontalIcon,
@@ -18,6 +20,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { ContextMenu, ContextMenuContent, ContextMenuGroup, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from "@/components/ui/context-menu";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
@@ -33,6 +36,7 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 import { toMessage } from "@/lib/errors";
 import { ActionableGitError } from "../components/ActionableGitError";
+import { usePathSeparator } from "../app/environment";
 import { ChangeStatusIcon } from "./ChangeStatusIcon";
 import { arrowKeyChangeTarget, emptyChangeSelection, isSelectAllChangesShortcut, isToggleSelectedChangesShortcut, selectAllChanges, singleChangeSelection, updateChangeSelection } from "../domain/change-selection";
 import {
@@ -55,6 +59,7 @@ import {
   discardAll,
   discardFile,
   mutateRepositoryOperation,
+  revealWorktree,
   undoLatestCommit,
 } from "../ipc/worktrees";
 import type { CommitSigning, ConflictResolutionKind, DiscardScope, RepositoryOperationAction, WorkingCopySnapshot } from "../ipc/types";
@@ -75,8 +80,9 @@ const commitOptionSections: { id: CommitOptionSection; label: string; icon: type
 ];
 
 export function ChangesWorkbench() {
-  const { machineId, repository, worktree } = useWorkingCopy();
+  const { machineId, machineKind, repository, worktree } = useWorkingCopy();
   const { snapshot, diffCache, error, setSnapshot, setError } = useWorkingCopyState();
+  const separator = usePathSeparator();
   const [rawChangeSelection, setChangeSelection] = useState(emptyChangeSelection);
   const [filter, setFilter] = useState("");
   const [commitSelections, setCommitSelections] = useState<CommitSelectionMap>(() => new Map());
@@ -174,6 +180,24 @@ export function ChangesWorkbench() {
       new Set(selectedChanges.map((change) => change.id)),
       include,
     ));
+  };
+
+  type Change = WorkingCopySnapshot["changes"][number];
+  const requestDiscard = (change: Change) => {
+    if (busyPath !== null || change.conflicted) return;
+    setPendingDiscard({ change, scope: change.unstaged || change.untracked ? "unstaged" : "all" });
+  };
+  const absolutePath = (change: Change) => worktree.path + separator + change.path.display.split("/").join(separator);
+  const copyPath = async (change: Change) => {
+    try {
+      await navigator.clipboard.writeText(change.path.display);
+      toast.add({ type: "success", title: "Path copied", description: change.path.display });
+    } catch (cause) {
+      toast.add({ type: "error", title: "Could not copy the path", description: toMessage(cause) });
+    }
+  };
+  const revealChange = (change: Change) => {
+    void revealWorktree(absolutePath(change)).catch((cause: unknown) => toast.add({ type: "error", title: "Could not reveal the file", description: toMessage(cause) }));
   };
 
   const submitCommit = async (event: FormEvent) => {
@@ -393,7 +417,7 @@ export function ChangesWorkbench() {
           ref={changesListRef}
           className="min-h-0 flex-1 overflow-y-auto focus:outline-none"
           tabIndex={-1}
-          aria-keyshortcuts="Meta+A Control+A Space ArrowUp ArrowDown Home End"
+          aria-keyshortcuts="Meta+A Control+A Space ArrowUp ArrowDown Home End Delete"
           onKeyDown={(event) => {
             const arrowTarget = arrowKeyChangeTarget(visibleChangeIds, changeSelection, event);
             if (arrowTarget !== null) {
@@ -409,6 +433,12 @@ export function ChangesWorkbench() {
               setChangeSelection((current) => selectAllChanges(visibleChangeIds, current));
               return;
             }
+            if ((event.key === "Delete" || event.key === "Backspace") && !event.metaKey && !event.ctrlKey && !event.altKey) {
+              if (event.target instanceof Element && event.target.closest('input, textarea, [role="checkbox"]')) return;
+              event.preventDefault();
+              if (selectedChange) requestDiscard(selectedChange);
+              return;
+            }
             if (!isToggleSelectedChangesShortcut(event)) return;
             if (event.target instanceof Element && event.target.closest('[role="checkbox"]')) return;
             event.preventDefault();
@@ -416,7 +446,15 @@ export function ChangesWorkbench() {
           }}
         >
           {visibleChanges.map((change) => (
-            <div key={change.id} className={cn("repola-windowed-row flex min-h-8 [--windowed-row-size:32px] items-center border-b", changeSelection.selectedIds.has(change.id) && "bg-accent")}>
+            <ContextMenu key={change.id}>
+              <ContextMenuTrigger
+                render={<div className={cn("repola-windowed-row flex min-h-8 [--windowed-row-size:32px] items-center border-b", changeSelection.selectedIds.has(change.id) && "bg-accent")} />}
+                onContextMenu={() => {
+                  // Right-clicking an unselected row targets that row alone, the
+                  // same as a plain click, so the menu never acts on a hidden selection.
+                  if (!changeSelection.selectedIds.has(change.id)) setChangeSelection(singleChangeSelection(change.id));
+                }}
+              >
               <span className="grid w-11 shrink-0 place-items-center">
                 <Checkbox
                   checked={isIncludedInCommit(commitSelectionFor(commitSelections, change.id))}
@@ -460,7 +498,18 @@ export function ChangesWorkbench() {
                 ) : null}
                 <ChangeStatusIcon kind={change.kind} conflicted={change.conflicted} />
               </button>
-            </div>
+              </ContextMenuTrigger>
+              <ContextMenuContent className="min-w-56">
+                <ContextMenuGroup>
+                  <ContextMenuItem onClick={() => void copyPath(change)}><CopyIcon aria-hidden="true" />Copy path</ContextMenuItem>
+                  <ContextMenuItem disabled={machineKind !== "local" || change.kind === "deleted"} onClick={() => revealChange(change)}><FolderOpenIcon aria-hidden="true" />Reveal in file manager</ContextMenuItem>
+                </ContextMenuGroup>
+                <ContextMenuSeparator />
+                <ContextMenuGroup>
+                  <ContextMenuItem variant="destructive" disabled={busyPath !== null || change.conflicted || snapshot?.operation !== null} onClick={() => requestDiscard(change)}><Trash2Icon aria-hidden="true" />Discard changes…</ContextMenuItem>
+                </ContextMenuGroup>
+              </ContextMenuContent>
+            </ContextMenu>
           ))}
           {visibleChanges.length === 0 ? (
             changes.length === 0 ? (
@@ -567,12 +616,6 @@ export function ChangesWorkbench() {
             <strong className="block truncate text-sm">{selectedChange?.path.display ?? "Working copy"}</strong>
             {selectedChange?.previousPath ? <span className="block truncate text-xs text-muted-foreground">renamed from {selectedChange.previousPath.display}</span> : null}
           </div>
-          {selectedChange && !selectedChange.conflicted ? (
-            <Button variant="ghost" size="sm" className="ml-auto text-destructive" disabled={busyPath !== null} onClick={() => setPendingDiscard({ change: selectedChange, scope: selectedChange.unstaged || selectedChange.untracked ? "unstaged" : "all" })}>
-              <Trash2Icon data-icon="inline-start" aria-hidden="true" />
-              Discard…
-            </Button>
-          ) : null}
         </div>
         {selectedChange?.conflicted ? (
           <div className="flex shrink-0 items-center gap-2 border-b bg-destructive/8 px-4 py-2">

@@ -41,3 +41,8 @@ export function useShortPath(): (path: string) => string {
   const display = useContext(EnvironmentContext);
   return useCallback((path: string) => abbreviatePath(path, display), [display]);
 }
+
+/** The host's path separator, for building absolute paths from Git's slash-separated ones. */
+export function usePathSeparator(): string {
+  return useContext(EnvironmentContext).separator;
+}
