@@ -29,6 +29,7 @@ import type { BranchInfo, CommitChangedFile, CommitSummary } from "../ipc/types"
 import { useWorkingCopy } from "./context";
 import { ActivityFact } from "./facts";
 import { historyMutationTitles, sectionHeadingClass } from "./labels";
+import { ChangeStatusIcon } from "./ChangeStatusIcon";
 import { LazyDialog } from "./LazyDialog";
 import { CommitFileDiffView, HistoryMutationDialog, ReflogDialog, TagsDialog } from "./lazy";
 
@@ -292,8 +293,8 @@ export function HistoryWorkbench() {
             <div className="min-h-0 flex-1 overflow-y-auto">
               {(files ?? []).map((file) => (
                 <button key={file.id} type="button" className={cn("flex w-full items-center gap-2 border-b px-3 py-1 text-left", selectedFile?.id === file.id && "bg-accent")} onClick={() => setSelectedFileId(file.id)}>
-                  <span className="w-6 shrink-0 text-center font-mono text-xs font-medium text-brand">{file.status}</span>
                   <span className="min-w-0 flex-1 truncate text-sm" title={file.path.display}><span className="text-muted-foreground">{file.path.display.slice(0, file.path.display.search(/[^\\/]*$/))}</span><span className="text-foreground">{file.path.display.split(/[\\/]/).pop()}</span></span>
+                  <ChangeStatusIcon kind={file.kind} />
                 </button>
               ))}
               {files?.length === 0 ? <p className="p-4 text-sm text-muted-foreground">No first-parent file changes.</p> : null}

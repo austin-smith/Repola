@@ -3,13 +3,15 @@ import {
   AlertTriangleIcon,
   FileDiffIcon,
   GitCommitIcon,
+  KeyRoundIcon,
   MoreHorizontalIcon,
   SearchIcon,
   SearchXIcon,
-  Settings2Icon,
   ShieldCheckIcon,
   Trash2Icon,
   UnlockKeyholeIcon,
+  UserPenIcon,
+  UsersIcon,
   XIcon,
 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -26,10 +28,12 @@ import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/toast";
+import { TooltipButton } from "@/components/tooltip-button";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 import { toMessage } from "@/lib/errors";
 import { ActionableGitError } from "../components/ActionableGitError";
+import { ChangeStatusIcon } from "./ChangeStatusIcon";
 import { arrowKeyChangeTarget, emptyChangeSelection, isSelectAllChangesShortcut, isToggleSelectedChangesShortcut, selectAllChanges, singleChangeSelection, updateChangeSelection } from "../domain/change-selection";
 import {
   commitSelectionFor,
@@ -62,6 +66,14 @@ import { ConflictResolutionDialog, DiffDialog, InlineFileDiff } from "./lazy";
 import { operationGuidance, operationLabel, operationSupportsSkip } from "./operations";
 import { useMutationGuard, useWorkingCopyState } from "./working-copy-state";
 
+type CommitOptionSection = "author" | "trailers" | "signing";
+
+const commitOptionSections: { id: CommitOptionSection; label: string; icon: typeof UserPenIcon }[] = [
+  { id: "author", label: "Author override", icon: UserPenIcon },
+  { id: "trailers", label: "Co-authors and trailers", icon: UsersIcon },
+  { id: "signing", label: "Commit signing", icon: KeyRoundIcon },
+];
+
 export function ChangesWorkbench() {
   const { machineId, repository, worktree } = useWorkingCopy();
   const { snapshot, diffCache, error, setSnapshot, setError } = useWorkingCopyState();
@@ -77,7 +89,7 @@ export function ChangesWorkbench() {
   const [summary, setSummary] = useState("");
   const [description, setDescription] = useState("");
   const [amend, setAmend] = useState(false);
-  const [commitOptionsOpen, setCommitOptionsOpen] = useState(false);
+  const [commitOptions, setCommitOptions] = useState<Set<CommitOptionSection>>(() => new Set());
   const [authorName, setAuthorName] = useState("");
   const [authorEmail, setAuthorEmail] = useState("");
   const [coAuthors, setCoAuthors] = useState("");
@@ -436,9 +448,6 @@ export function ChangesWorkbench() {
                   ));
                 }}
               >
-                <span className={cn("w-5 shrink-0 text-center font-mono text-xs font-medium", change.conflicted ? "text-destructive" : "text-brand")}>
-                  {change.conflicted ? "!" : change.indexStatus !== "." ? change.indexStatus : change.worktreeStatus}
-                </span>
                 <span className="min-w-0 flex-1 truncate text-sm" title={change.path.display}><span className="text-muted-foreground">{change.path.display.slice(0, change.path.display.search(/[^\\/]*$/))}</span><span className="text-foreground">{change.path.display.split(/[\\/]/).pop()}</span></span>
                 {change.submodule ? <Badge variant="outline">submodule</Badge> : null}
                 {change.modeChange === "executableBit" ? <Badge variant="outline">executable bit</Badge> : null}
@@ -449,6 +458,7 @@ export function ChangesWorkbench() {
                     <TooltipContent>{[change.headMode, change.indexMode, change.worktreeMode].filter(Boolean).join(" → ")}</TooltipContent>
                   </Tooltip>
                 ) : null}
+                <ChangeStatusIcon kind={change.kind} conflicted={change.conflicted} />
               </button>
             </div>
           ))}
@@ -476,21 +486,60 @@ export function ChangesWorkbench() {
         <form className="flex max-h-[58%] shrink-0 flex-col gap-2 overflow-y-auto border-t bg-card p-3" onSubmit={(event) => void submitCommit(event)}>
           <Input value={summary} onChange={(event) => setSummary(event.currentTarget.value)} placeholder="Summary (required)" maxLength={998} disabled={commitBusy} />
           <Textarea value={description} onChange={(event) => setDescription(event.currentTarget.value)} placeholder="Description" className="min-h-16 resize-none" disabled={commitBusy} />
-          <Button type="button" variant="ghost" size="sm" className="justify-start" disabled={commitBusy} onClick={() => setCommitOptionsOpen((open) => !open)}>
-            <Settings2Icon data-icon="inline-start" aria-hidden="true" />
-            {commitOptionsOpen ? "Hide commit options" : "Author, co-authors, trailers, and signing…"}
-          </Button>
-          {commitOptionsOpen ? (
+          <div className="flex items-center gap-0.5" role="group" aria-label="Commit options">
+            {commitOptionSections.map(({ id, label, icon: Icon }) => {
+              const open = commitOptions.has(id);
+              const filled = id === "author"
+                ? authorName.trim() !== "" || authorEmail.trim() !== ""
+                : id === "trailers"
+                  ? coAuthors.trim() !== "" || trailers.trim() !== ""
+                  : signing !== "default";
+              return (
+                <TooltipButton
+                  key={id}
+                  type="button"
+                  variant={open ? "secondary" : "ghost"}
+                  size="icon-sm"
+                  className={cn(!open && filled && "text-brand")}
+                  aria-pressed={open}
+                  aria-label={label}
+                  tooltip={label}
+                  disabled={commitBusy}
+                  onClick={() => setCommitOptions((current) => {
+                    const next = new Set(current);
+                    if (next.has(id)) next.delete(id);
+                    else next.add(id);
+                    return next;
+                  })}
+                >
+                  <Icon aria-hidden="true" />
+                </TooltipButton>
+              );
+            })}
+            <label className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
+              <Checkbox checked={amend} disabled={commitBusy || snapshot?.head === null} onCheckedChange={(value) => setAmend(value === true)} />
+              Amend latest commit
+            </label>
+          </div>
+          {commitOptions.has("author") ? (
             <div className="flex flex-col gap-2 border bg-muted/30 p-2.5">
               <span className={sectionHeadingClass}>Author override</span>
               <div className="grid grid-cols-2 gap-2">
                 <Input value={authorName} onChange={(event) => setAuthorName(event.currentTarget.value)} placeholder="Name (use Git config)" maxLength={200} disabled={commitBusy} aria-label="Commit author name" />
                 <Input value={authorEmail} onChange={(event) => setAuthorEmail(event.currentTarget.value)} placeholder="Email (use Git config)" maxLength={320} disabled={commitBusy} aria-label="Commit author email" />
               </div>
+            </div>
+          ) : null}
+          {commitOptions.has("trailers") ? (
+            <div className="flex flex-col gap-2 border bg-muted/30 p-2.5">
               <FieldLabel htmlFor="commit-coauthors">Co-authors</FieldLabel>
               <Textarea id="commit-coauthors" value={coAuthors} onChange={(event) => setCoAuthors(event.currentTarget.value)} placeholder={"Name <email@example.com>\nOne co-author per line"} className="min-h-16 resize-y font-mono text-xs" disabled={commitBusy} />
               <FieldLabel htmlFor="commit-trailers">Additional trailers</FieldLabel>
               <Textarea id="commit-trailers" value={trailers} onChange={(event) => setTrailers(event.currentTarget.value)} placeholder={"Reviewed-by: Name\nIssue: 123"} className="min-h-16 resize-y font-mono text-xs" disabled={commitBusy} />
+            </div>
+          ) : null}
+          {commitOptions.has("signing") ? (
+            <div className="flex flex-col gap-2 border bg-muted/30 p-2.5">
               <FieldLabel htmlFor="commit-signing">Signing</FieldLabel>
               <Select items={signingItems} value={signing} disabled={commitBusy} onValueChange={(value) => { if (value) setSigning(value as CommitSigning); }}>
                 <SelectTrigger id="commit-signing" className="w-full"><UnlockKeyholeIcon className="size-3.5 text-muted-foreground" aria-hidden="true" /><SelectValue /></SelectTrigger>
@@ -503,10 +552,6 @@ export function ChangesWorkbench() {
               <p className="text-xs leading-relaxed text-muted-foreground">Signing uses the key and signing program configured on {machineId === "local" ? "this machine" : "the remote machine"}. Repola never imports or stores private keys.</p>
             </div>
           ) : null}
-          <label className="flex items-center gap-2 text-xs text-muted-foreground">
-            <Checkbox checked={amend} disabled={commitBusy || snapshot?.head === null} onCheckedChange={(value) => setAmend(value === true)} />
-            Amend latest commit
-          </label>
           {snapshot?.head && snapshot.branch && !snapshot.operation && (!snapshot.upstream || snapshot.ahead > 0) ? (
             <Button type="button" variant="ghost" size="sm" disabled={commitBusy} onClick={() => setPendingUndo(true)}>Undo latest commit…</Button>
           ) : null}
