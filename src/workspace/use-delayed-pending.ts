@@ -12,7 +12,7 @@ export interface DelayedPendingOptions {
  * indicator: fast operations never show it, and once it does appear it stays
  * for a minimum duration instead of flashing.
  */
-export function useDelayedPending(pending: boolean, { delay = 150, minimum = 300 }: DelayedPendingOptions = {}): boolean {
+export function useDelayedPending(pending: boolean, { delay = 150, minimum = 250 }: DelayedPendingOptions = {}): boolean {
   const [visible, setVisible] = useState(false);
   const shownAt = useRef<number | null>(null);
 

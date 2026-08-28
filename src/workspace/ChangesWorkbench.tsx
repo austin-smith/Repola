@@ -184,11 +184,12 @@ export function ChangesWorkbench() {
 
   const visibleChanges = useMemo(() => snapshot?.changes.filter((change) => !change.ignored) ?? [], [snapshot]);
   const visibleChangeIds = useMemo(() => visibleChanges.map((change) => change.id), [visibleChanges]);
-  // The diff pane is expensive to build, so it follows the selection at
-  // transition priority. The list highlight stays on the urgent path and paints
-  // immediately when the user clicks or arrows through rows.
+  const selectedChange = visibleChanges.find((change) => change.id === changeSelection.activeId) ?? null;
+  // Only the diff body is expensive to build, so it alone follows the selection
+  // at transition priority. The list highlight, the header, and every action
+  // target stay on the urgent path so they always agree with the selection.
   const deferredActiveId = useDeferredValue(changeSelection.activeId);
-  const selectedChange = visibleChanges.find((change) => change.id === deferredActiveId) ?? null;
+  const diffChange = visibleChanges.find((change) => change.id === deferredActiveId) ?? null;
   // Held as state rather than a ref so the diff pane can bind its virtualized
   // rows to the element as soon as it exists.
   const [diffScroller, setDiffScroller] = useState<HTMLDivElement | null>(null);
@@ -500,7 +501,7 @@ export function ChangesWorkbench() {
           }}
         >
           {visibleChanges.map((change) => (
-            <div key={change.id} className={cn("repola-windowed-row flex min-h-8 [contain-intrinsic-block-size:32px] items-center border-b", changeSelection.selectedIds.has(change.id) && "bg-accent")}>
+            <div key={change.id} className={cn("repola-windowed-row flex min-h-8 [--windowed-row-size:32px] items-center border-b", changeSelection.selectedIds.has(change.id) && "bg-accent")}>
               <span className="grid w-11 shrink-0 place-items-center">
                 <Checkbox
                   checked={isIncludedInCommit(commitSelectionFor(commitSelections, change.id))}
@@ -630,19 +631,19 @@ export function ChangesWorkbench() {
           </div>
         ) : null}
         <div ref={setDiffScroller} className="min-h-0 flex-1 overflow-auto">
-          {selectedChange ? (
+          {diffChange ? (
             <Suspense fallback={<div className="grid h-full place-items-center"><Spinner className="size-6" /></div>}>
               <InlineFileDiff
                 machineId={machineId}
                 repositoryPath={repository.path}
                 worktreePath={worktree.path}
-                change={selectedChange}
+                change={diffChange}
                 cache={diffCache}
                 scrollElement={diffScroller}
-                selection={commitSelectionFor(commitSelections, selectedChange.id)}
+                selection={commitSelectionFor(commitSelections, diffChange.id)}
                 onSelectionChange={(selection: FileCommitSelection) => setCommitSelections((current) => {
                   const next = new Map(current);
-                  next.set(selectedChange.id, selection);
+                  next.set(diffChange.id, selection);
                   return next;
                 })}
               />

@@ -42,9 +42,14 @@ export function InlineFileDiff({
 }) {
   const cacheKey = change.path.token;
   const cached = cache.get(cacheKey) ?? null;
-  const [loaded, setLoaded] = useState<{ key: string; diff: FileDiff | null; error: string | null } | null>(null);
-  const diff = cached ?? (loaded?.key === cacheKey ? loaded.diff : null);
-  const error = cached === null && loaded?.key === cacheKey ? loaded.error : null;
+  // A load result is only meaningful for the cache (and therefore the
+  // snapshot) it was requested under: when the snapshot is refreshed with the
+  // same file selected, the previous result must not be shown while the new
+  // request is in flight.
+  const [loaded, setLoaded] = useState<{ cache: Map<string, FileDiff>; key: string; diff: FileDiff | null; error: string | null } | null>(null);
+  const current = loaded?.cache === cache && loaded.key === cacheKey ? loaded : null;
+  const diff = cached ?? current?.diff ?? null;
+  const error = cached === null ? current?.error ?? null : null;
   const showSkeleton = useDelayedPending(diff === null && error === null);
   const { resolvedTheme } = useTheme();
 
@@ -60,11 +65,11 @@ export function InlineFileDiff({
     )
       .then((next) => {
         cache.set(cacheKey, next);
-        setLoaded({ key: cacheKey, diff: next, error: null });
+        setLoaded({ cache, key: cacheKey, diff: next, error: null });
       })
       .catch((cause: unknown) => {
         if (!controller.signal.aborted) {
-          setLoaded({ key: cacheKey, diff: null, error: cause instanceof Error ? cause.message : String(cause) });
+          setLoaded({ cache, key: cacheKey, diff: null, error: cause instanceof Error ? cause.message : String(cause) });
         }
       });
     return () => controller.abort();
@@ -91,9 +96,11 @@ export function InlineFileDiff({
       </Alert>
     );
   }
-  if (!diff) {
+  if (!diff || showSkeleton) {
     // Most diffs arrive in a few tens of milliseconds; showing nothing for
-    // that window reads as a plain content swap rather than a flash.
+    // that window reads as a plain content swap rather than a flash. Once the
+    // skeleton has appeared it stays up for its minimum duration even if the
+    // diff lands in the meantime, so it never blinks.
     if (!showSkeleton) return null;
     return (
       <div className="flex flex-col gap-2 p-4" role="status" aria-label="Loading diff">

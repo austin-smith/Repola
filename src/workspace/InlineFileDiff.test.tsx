@@ -91,7 +91,7 @@ function ScrollHost({ children }: { children: (scrollElement: HTMLDivElement | n
 
 function renderDiff(selection: FileCommitSelection, overrides: Partial<FileChange> = {}, cache = new Map<string, FileDiff>()) {
   const onSelectionChange = vi.fn();
-  render(
+  const tree = (diffCache: Map<string, FileDiff>) => (
     <ThemeProvider storageKey="test-theme">
       <ScrollHost>
         {(scrollElement) => (
@@ -100,16 +100,17 @@ function renderDiff(selection: FileCommitSelection, overrides: Partial<FileChang
             repositoryPath="/tmp/repola"
             worktreePath="/tmp/repola"
             change={{ ...change, ...overrides }}
-            cache={cache}
+            cache={diffCache}
             scrollElement={scrollElement}
             selection={selection}
             onSelectionChange={onSelectionChange}
           />
         )}
       </ScrollHost>
-    </ThemeProvider>,
+    </ThemeProvider>
   );
-  return { onSelectionChange };
+  const { rerender } = render(tree(cache));
+  return { onSelectionChange, rerenderWithCache: (next: Map<string, FileDiff>) => rerender(tree(next)) };
 }
 
 const hunkCheckboxes = () => screen.getAllByRole("checkbox", { name: /hunk from commit/ });
@@ -245,6 +246,46 @@ describe("InlineFileDiff", () => {
     renderDiff(includeAllChanges, {}, empty);
     await screen.findAllByRole("group", { name: "Select changed lines" });
     expect(empty.get(change.path.token)).toBe(diff);
+  });
+
+  it("drops a loaded diff as soon as the snapshot cache it belongs to is replaced", async () => {
+    const { rerenderWithCache } = renderDiff(includeAllChanges);
+    await screen.findAllByRole("group", { name: "Select changed lines" });
+
+    // A working-copy refresh with the same file selected hands the component a
+    // fresh cache; the previous snapshot's hunks must not stay interactive.
+    ipc.fetchFileDiff.mockReturnValue(new Promise(() => undefined));
+    rerenderWithCache(new Map());
+    expect(screen.queryByRole("group", { name: "Select changed lines" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(ipc.fetchFileDiff).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a shown skeleton up for its minimum duration even when the diff lands sooner", async () => {
+    vi.useFakeTimers();
+    try {
+      let resolve: (value: FileDiff) => void = () => undefined;
+      ipc.fetchFileDiff.mockReturnValue(new Promise<FileDiff>((next) => { resolve = next; }));
+      renderDiff(includeAllChanges);
+      await act(async () => { await vi.advanceTimersByTimeAsync(150); });
+      expect(screen.getByRole("status", { name: "Loading diff" })).toBeInTheDocument();
+
+      // The diff lands 50ms after the skeleton appeared. The minimum display
+      // time counts from when the skeleton was shown, so it stays for the
+      // remaining 200ms of the 250ms minimum, then the diff takes over.
+      await act(async () => { await vi.advanceTimersByTimeAsync(50); });
+      await act(async () => { resolve(diff); });
+      expect(screen.getByRole("status", { name: "Loading diff" })).toBeInTheDocument();
+      expect(screen.queryByRole("group", { name: "Select changed lines" })).not.toBeInTheDocument();
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(199); });
+      expect(screen.getByRole("status", { name: "Loading diff" })).toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(screen.queryByRole("status", { name: "Loading diff" })).not.toBeInTheDocument();
+      expect(screen.getAllByRole("group", { name: "Select changed lines" })).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("only shows the loading skeleton when a diff is slow to arrive", async () => {
