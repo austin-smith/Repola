@@ -143,6 +143,12 @@ fn launch_worktree_tool(
 }
 
 #[tauri::command]
+fn reveal_working_copy_file(worktree_path: String, path: worktree::GitPath) -> Result<(), String> {
+    let target = worktree::working_copy_file_path(&worktree_path, &path)?;
+    tauri_plugin_opener::reveal_item_in_dir(target).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn resolve_dropped_repository(path: String) -> Result<String, String> {
     let path = std::path::PathBuf::from(path);
     let directory = if path.is_dir() {
@@ -1303,6 +1309,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             cancel_operation,
+            reveal_working_copy_file,
             apply_patch_hunk,
             clone_repository,
             commit_working_copy,

@@ -36,7 +36,6 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 import { toMessage } from "@/lib/errors";
 import { ActionableGitError } from "../components/ActionableGitError";
-import { usePathSeparator } from "../app/environment";
 import { ChangeStatusIcon } from "./ChangeStatusIcon";
 import { arrowKeyChangeTarget, emptyChangeSelection, isSelectAllChangesShortcut, isToggleSelectedChangesShortcut, selectAllChanges, singleChangeSelection, updateChangeSelection } from "../domain/change-selection";
 import {
@@ -59,7 +58,7 @@ import {
   discardAll,
   discardFile,
   mutateRepositoryOperation,
-  revealWorktree,
+  revealWorkingCopyFile,
   undoLatestCommit,
 } from "../ipc/worktrees";
 import type { CommitSigning, ConflictResolutionKind, DiscardScope, RepositoryOperationAction, WorkingCopySnapshot } from "../ipc/types";
@@ -70,6 +69,7 @@ import { LazyDialog } from "./LazyDialog";
 import { ConflictResolutionDialog, DiffDialog, InlineFileDiff } from "./lazy";
 import { operationGuidance, operationLabel, operationSupportsSkip } from "./operations";
 import { useMutationGuard, useWorkingCopyState } from "./working-copy-state";
+import { WorkspaceTabs } from "./WorkspaceTabs";
 
 type CommitOptionSection = "author" | "trailers" | "signing";
 
@@ -82,7 +82,6 @@ const commitOptionSections: { id: CommitOptionSection; label: string; icon: type
 export function ChangesWorkbench() {
   const { machineId, machineKind, repository, worktree } = useWorkingCopy();
   const { snapshot, diffCache, error, setSnapshot, setError } = useWorkingCopyState();
-  const separator = usePathSeparator();
   const [rawChangeSelection, setChangeSelection] = useState(emptyChangeSelection);
   const [filter, setFilter] = useState("");
   const [commitSelections, setCommitSelections] = useState<CommitSelectionMap>(() => new Map());
@@ -187,7 +186,6 @@ export function ChangesWorkbench() {
     if (busyPath !== null || change.conflicted) return;
     setPendingDiscard({ change, scope: change.unstaged || change.untracked ? "unstaged" : "all" });
   };
-  const absolutePath = (change: Change) => worktree.path + separator + change.path.display.split("/").join(separator);
   const copyPath = async (change: Change) => {
     try {
       await navigator.clipboard.writeText(change.path.display);
@@ -197,7 +195,7 @@ export function ChangesWorkbench() {
     }
   };
   const revealChange = (change: Change) => {
-    void revealWorktree(absolutePath(change)).catch((cause: unknown) => toast.add({ type: "error", title: "Could not reveal the file", description: toMessage(cause) }));
+    void revealWorkingCopyFile(worktree.path, change.path).catch((cause: unknown) => toast.add({ type: "error", title: "Could not reveal the file", description: toMessage(cause) }));
   };
 
   const submitCommit = async (event: FormEvent) => {
@@ -339,6 +337,7 @@ export function ChangesWorkbench() {
   return (
     <div className="grid min-h-0 flex-1 grid-cols-[380px_minmax(0,1fr)]">
       <aside className="flex min-h-0 flex-col border-r bg-sidebar">
+        <WorkspaceTabs />
         <div className="flex h-12 shrink-0 items-center gap-2 border-b px-3">
           <Checkbox
             checked={allVisibleIncluded}
@@ -391,12 +390,12 @@ export function ChangesWorkbench() {
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <strong className="text-sm">{operationLabel(snapshot.operation)} in progress</strong>
-                  {visibleChanges.some((change) => change.conflicted) ? <Badge variant="destructive">Conflicts remain</Badge> : <Badge variant="success">Ready</Badge>}
+                  {changes.some((change) => change.conflicted) ? <Badge variant="destructive">Conflicts remain</Badge> : <Badge variant="success">Ready</Badge>}
                 </div>
-                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{operationGuidance(snapshot.operation, visibleChanges.some((change) => change.conflicted))}</p>
+                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{operationGuidance(snapshot.operation, changes.some((change) => change.conflicted))}</p>
                 <div className="mt-3 flex flex-wrap gap-2">
                   {snapshot.operation !== "bisect" && snapshot.operation !== "sequencer" ? (
-                    <Button size="sm" disabled={operationBusy || visibleChanges.some((change) => change.conflicted)} onClick={() => void runOperationAction("continue")}>
+                    <Button size="sm" disabled={operationBusy || changes.some((change) => change.conflicted)} onClick={() => void runOperationAction("continue")}>
                       {operationBusy ? <Spinner data-icon="inline-start" /> : null}
                       Continue
                     </Button>

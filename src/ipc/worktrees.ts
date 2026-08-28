@@ -529,6 +529,11 @@ export function mutateStash(
   return invokeOperation<StashMutationResult>("mutate_stash", { machineId, request });
 }
 
+/** Reveals a changed file using the exact path bytes Git reported, not the display string. */
+export function revealWorkingCopyFile(worktreePath: string, path: GitPath): Promise<void> {
+  return invoke("reveal_working_copy_file", { worktreePath, path });
+}
+
 export function revealWorktree(path: string): Promise<void> {
   return revealItemInDir(path);
 }

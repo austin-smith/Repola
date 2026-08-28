@@ -1540,6 +1540,24 @@ fn combined_output(stdout: &[u8], stderr: &[u8]) -> String {
         .join("\n")
 }
 
+/// Resolves a changed file to its exact on-disk path from the path token Git
+/// reported, so filenames that are not valid UTF-8 round-trip unchanged.
+pub fn working_copy_file_path(worktree_path: &str, path: &GitPath) -> Result<PathBuf, String> {
+    let worktree = canonical_directory(worktree_path, "worktree")?;
+    if path.token.is_empty() {
+        return Err("The selected path is empty.".into());
+    }
+    let relative = PathBuf::from(path_from_token(&path.token)?);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("The selected path must stay inside the worktree.".into());
+    }
+    Ok(worktree.join(relative))
+}
+
 pub(super) fn path_from_token(token: &str) -> Result<OsString, String> {
     let bytes = decode_hex(token)?;
     #[cfg(unix)]
@@ -2739,5 +2757,43 @@ mod tests {
         let author =
             git_text(repository.path(), ["log", "-1", "--format=%an <%ae>"]).expect("author");
         assert_eq!(author, "Alternate Author <alternate@example.invalid>");
+    }
+
+    fn hex_token(value: &str) -> String {
+        value.bytes().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn working_copy_file_path_joins_the_exact_token_inside_the_worktree() {
+        let worktree = tempfile::tempdir().expect("temp dir");
+        let path = GitPath {
+            display: "src/lossy.txt".into(),
+            token: hex_token("src/exact.txt"),
+        };
+        let resolved =
+            working_copy_file_path(worktree.path().to_str().unwrap(), &path).expect("resolves");
+        assert_eq!(
+            resolved,
+            dunce::canonicalize(worktree.path())
+                .unwrap()
+                .join("src")
+                .join("exact.txt")
+        );
+    }
+
+    #[test]
+    fn working_copy_file_path_rejects_paths_that_escape_the_worktree() {
+        let worktree = tempfile::tempdir().expect("temp dir");
+        for token in [
+            hex_token("../outside"),
+            hex_token("/etc/passwd"),
+            String::new(),
+        ] {
+            let path = GitPath {
+                display: String::new(),
+                token,
+            };
+            assert!(working_copy_file_path(worktree.path().to_str().unwrap(), &path).is_err());
+        }
     }
 }

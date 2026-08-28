@@ -35,7 +35,7 @@ pub use models::{
     CloneRepositoryRequest, CommitChangedFile, CommitFileDiffRequest, CommitFilesRequest,
     CommitRequest, CommitResult, ConflictFile, ConflictFileRequest, CreateRepositoryRequest,
     CreateWorktreeRequest, CreateWorktreeResult, DiscardAllRequest, DiscardFileRequest,
-    DiscardScope, FileDiff, FileDiffRequest, HistoryMutationKind, HistoryMutationRequest,
+    DiscardScope, FileDiff, FileDiffRequest, GitPath, HistoryMutationKind, HistoryMutationRequest,
     HistoryMutationResult, HistoryPage, HistoryRequest, PatchHunk, PatchHunkAction,
     PullRequestEvidence, PullRequestMutationKind, PullRequestMutationRequest,
     PullRequestMutationResult, ReflogEntry, ReflogRequest, RepositoryOperationAction,
@@ -55,7 +55,7 @@ pub use tags::{mutate_tag, tags};
 pub use watch::{WorktreeChangeEvent, WorktreeWatcher};
 pub use working_copy::{
     apply_patch_hunk, commit, conflict_file, discard_all, discard_file, file_diff,
-    resolve_conflict, set_file_staging, undo_commit, working_copy_snapshot,
+    resolve_conflict, set_file_staging, undo_commit, working_copy_file_path, working_copy_snapshot,
 };
 
 pub(crate) fn git_version() -> Result<String, String> {
