@@ -1,5 +1,6 @@
 import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { useVirtualizer, type VirtualItem } from "@tanstack/react-virtual";
+import { CheckIcon } from "lucide-react";
 import { Checkbox } from "@/components/ui/checkbox";
 import type { PatchHunk } from "../ipc/types";
 import type { FileCommitSelection } from "../domain/commit-selection";
@@ -25,10 +26,10 @@ type Row =
   | { kind: "header"; hunk: HunkRows }
   | { kind: "line"; hunk: HunkRows; line: SelectableLine; checked: boolean };
 
-const HEADER_ROW_ESTIMATE = 41;
-const LINE_ROW_ESTIMATE = 25;
+const HEADER_ROW_ESTIMATE = 32;
+const LINE_ROW_ESTIMATE = 20;
 /** Combined width of the checkbox, old-line, and new-line gutter columns. */
-const GUTTER_WIDTH_PX = 36 + 44 + 44;
+const GUTTER_WIDTH_PX = 28 + 44 + 44;
 
 interface SelectableHunkListProps {
   hunks: readonly PatchHunk[];
@@ -101,7 +102,7 @@ export function SelectableHunkList({ hunks, selection, scrollElement, onHunkSele
   const groups = groupByHunk(virtualizer.getVirtualItems(), rows);
 
   return (
-    <div ref={listRef} className="overflow-x-auto rounded-md border bg-card">
+    <div ref={listRef} className="overflow-x-auto">
       <div
         className="relative w-full"
         style={{ height: virtualizer.getTotalSize(), minWidth: `calc(${GUTTER_WIDTH_PX}px + ${longestLine + 2}ch)` }}
@@ -142,7 +143,7 @@ const HunkHeaderRow = memo(function HunkHeaderRow({ index, measure, hunk, select
 }) {
   const allSelected = selectedCount === selectableCount;
   return (
-    <div ref={measure} data-index={index} className="flex items-center gap-3 border-y bg-muted/50 px-3 py-2 first:border-t-0">
+    <div ref={measure} data-index={index} className="flex h-8 items-center gap-2.5 border-t bg-muted/40 pr-3 pl-1.5 first:border-t-0">
       <Checkbox
         checked={allSelected}
         indeterminate={selectedCount > 0 && !allSelected}
@@ -160,19 +161,40 @@ const HunkLineRow = memo(function HunkLineRow({ index, measure, hunkIndex, line,
   checked: boolean;
   onToggle: (hunkIndex: number, lineIndex: number) => void;
 }) {
-  const tone = line.prefix === "+" ? "bg-success/10" : line.prefix === "-" ? "bg-destructive/10" : "";
+  const excluded = line.selectable && !checked;
+  const tone = excluded
+    ? "bg-transparent text-muted-foreground"
+    : line.prefix === "+"
+      ? "bg-success/15 dark:bg-success/20"
+      : line.prefix === "-"
+        ? "bg-destructive/15 dark:bg-destructive/20"
+        : "";
+  const prefixTone = excluded ? "text-muted-foreground/60" : line.prefix === "+" ? "text-success" : line.prefix === "-" ? "text-destructive" : "text-muted-foreground";
   return (
     <label
       ref={measure}
       data-index={index}
-      className={`grid grid-cols-[36px_44px_44px_1fr] border-b font-mono text-xs ${tone} ${line.selectable ? "cursor-pointer hover:bg-accent" : ""}`}
+      className={`group/line grid h-5 grid-cols-[28px_44px_44px_1fr] font-mono text-xs leading-5 ${tone} ${line.selectable ? "cursor-pointer hover:bg-accent/60" : ""}`}
     >
-      <span className="grid place-items-center border-r bg-muted/40">
-        {line.selectable ? <Checkbox checked={checked} onCheckedChange={() => onToggle(hunkIndex, line.index)} aria-label={`Select ${line.prefix === "+" ? "added" : "deleted"} line ${line.newLine ?? line.oldLine}`} /> : null}
+      <span className="grid place-items-center">
+        {line.selectable ? (
+          <>
+            <input
+              type="checkbox"
+              className="sr-only"
+              checked={checked}
+              onChange={() => onToggle(hunkIndex, line.index)}
+              aria-label={`Select ${line.prefix === "+" ? "added" : "deleted"} line ${line.newLine ?? line.oldLine}`}
+            />
+            {checked
+              ? <CheckIcon className="size-3 text-muted-foreground/60 group-hover/line:text-foreground" strokeWidth={2.5} aria-hidden="true" />
+              : <span className="size-2.5 rounded-[2px] border border-muted-foreground/60" aria-hidden="true" />}
+          </>
+        ) : null}
       </span>
-      <span className="border-r px-2 py-1 text-right text-muted-foreground select-none">{line.oldLine}</span>
-      <span className="border-r px-2 py-1 text-right text-muted-foreground select-none">{line.newLine}</span>
-      <code className="px-2 py-1 whitespace-pre"><span className={line.prefix === "+" ? "text-success" : line.prefix === "-" ? "text-destructive" : "text-muted-foreground"}>{line.prefix}</span>{line.content}</code>
+      <span className="pr-2 text-right text-muted-foreground/70 tabular-nums select-none">{line.oldLine}</span>
+      <span className="pr-2 text-right text-muted-foreground/70 tabular-nums select-none">{line.newLine}</span>
+      <code className="whitespace-pre pl-1"><span className={`inline-block w-3 ${prefixTone}`}>{line.prefix}</span>{line.content}</code>
     </label>
   );
 });

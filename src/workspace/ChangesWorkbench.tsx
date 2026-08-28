@@ -3,8 +3,13 @@ import {
   AlertTriangleIcon,
   ArchiveIcon,
   FileDiffIcon,
+  FileMinusIcon,
+  FilePenLineIcon,
+  FilePlusIcon,
+  FileSymlinkIcon,
   GitCommitIcon,
   RefreshCwIcon,
+  SearchIcon,
   Settings2Icon,
   ShieldCheckIcon,
   Trash2Icon,
@@ -18,6 +23,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
@@ -56,13 +62,22 @@ import {
   unwatchWorktree,
   watchWorktree,
 } from "../ipc/worktrees";
-import type { CommitSigning, ConflictResolutionKind, DiscardScope, FileDiff, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../ipc/types";
+import type { CommitSigning, ConflictResolutionKind, DiscardScope, FileChange, FileDiff, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../ipc/types";
 import { parseCommitPeople, parseCommitTrailers } from "./commit-form";
 import { useWorkingCopy } from "./context";
 import { sectionHeadingClass, signingItems } from "./labels";
 import { LazyDialog } from "./LazyDialog";
 import { ConflictResolutionDialog, DiffDialog, InlineFileDiff } from "./lazy";
 import { operationGuidance, operationLabel, operationSupportsSkip } from "./operations";
+
+function changeStatusIcon(change: FileChange) {
+  const code = change.indexStatus !== "." ? change.indexStatus : change.worktreeStatus;
+  if (change.conflicted) return <AlertTriangleIcon className="size-3.5 shrink-0 text-destructive" role="img" aria-label="Conflicted" />;
+  if (change.untracked || code === "A" || code === "?") return <FilePlusIcon className="size-3.5 shrink-0 text-success" role="img" aria-label="Added" />;
+  if (code === "D") return <FileMinusIcon className="size-3.5 shrink-0 text-destructive" role="img" aria-label="Deleted" />;
+  if (code === "R" || code === "C") return <FileSymlinkIcon className="size-3.5 shrink-0 text-brand" role="img" aria-label="Renamed" />;
+  return <FilePenLineIcon className="size-3.5 shrink-0 text-warning" role="img" aria-label="Modified" />;
+}
 
 export function ChangesWorkbench() {
   const { machineId, repository, worktree } = useWorkingCopy();
@@ -93,6 +108,7 @@ export function ChangesWorkbench() {
   const [error, setError] = useState<string | null>(null);
   const [diffOpen, setDiffOpen] = useState(false);
   const [stashOpen, setStashOpen] = useState(false);
+  const [changeFilter, setChangeFilter] = useState("");
   const [pendingResolution, setPendingResolution] = useState<{
     kind: ConflictResolutionKind;
     change: WorkingCopySnapshot["changes"][number];
@@ -183,7 +199,11 @@ export function ChangesWorkbench() {
   }, [worktree.id]);
 
   const visibleChanges = useMemo(() => snapshot?.changes.filter((change) => !change.ignored) ?? [], [snapshot]);
-  const visibleChangeIds = useMemo(() => visibleChanges.map((change) => change.id), [visibleChanges]);
+  const normalizedFilter = changeFilter.trim().toLowerCase();
+  const listedChanges = useMemo(() => (
+    normalizedFilter === "" ? visibleChanges : visibleChanges.filter((change) => change.path.display.toLowerCase().includes(normalizedFilter))
+  ), [visibleChanges, normalizedFilter]);
+  const listedChangeIds = useMemo(() => listedChanges.map((change) => change.id), [listedChanges]);
   const selectedChange = visibleChanges.find((change) => change.id === changeSelection.activeId) ?? null;
   // Only the diff body is expensive to build, so it alone follows the selection
   // at transition priority. The list highlight, the header, and every action
@@ -215,11 +235,11 @@ export function ChangesWorkbench() {
     const onSelectAll = (event: Event) => {
       event.preventDefault();
       changesListRef.current?.focus({ preventScroll: true });
-      setChangeSelection((current) => selectAllChanges(visibleChangeIds, current));
+      setChangeSelection((current) => selectAllChanges(listedChangeIds, current));
     };
     document.addEventListener(SELECT_ALL_EVENT, onSelectAll);
     return () => document.removeEventListener(SELECT_ALL_EVENT, onSelectAll);
-  }, [visibleChangeIds]);
+  }, [listedChangeIds]);
 
   useEffect(() => {
     if (!snapshot) return;
@@ -445,6 +465,18 @@ export function ChangesWorkbench() {
             <Button variant="destructive" size="sm" className="ml-2" disabled={syncBusy || snapshot.operation !== null} onClick={() => setPendingForcePush(true)}>Force…</Button>
           ) : null}
         </div>
+        <div className="shrink-0 border-b px-3 py-2">
+          <InputGroup className="h-7">
+            <InputGroupAddon><SearchIcon aria-hidden="true" /></InputGroupAddon>
+            <InputGroupInput
+              value={changeFilter}
+              onChange={(event) => setChangeFilter(event.currentTarget.value)}
+              placeholder="Filter changed files"
+              aria-label="Filter changed files"
+              className="text-[0.8rem]"
+            />
+          </InputGroup>
+        </div>
         {snapshot?.operation ? (
           <div className="border-b bg-warning/10 px-4 py-3">
             <div className="flex items-start gap-3">
@@ -480,10 +512,10 @@ export function ChangesWorkbench() {
           tabIndex={-1}
           aria-keyshortcuts="Meta+A Control+A Space ArrowUp ArrowDown Home End"
           onKeyDown={(event) => {
-            const arrowTarget = arrowKeyChangeTarget(visibleChangeIds, changeSelection, event);
+            const arrowTarget = arrowKeyChangeTarget(listedChangeIds, changeSelection, event);
             if (arrowTarget !== null) {
               event.preventDefault();
-              setChangeSelection((current) => updateChangeSelection(visibleChangeIds, current, arrowTarget, { additive: false, range: event.shiftKey }));
+              setChangeSelection((current) => updateChangeSelection(listedChangeIds, current, arrowTarget, { additive: false, range: event.shiftKey }));
               const row = event.currentTarget.querySelector<HTMLElement>(`[data-change-id="${CSS.escape(arrowTarget)}"]`);
               row?.focus({ preventScroll: true });
               row?.scrollIntoView({ block: "nearest" });
@@ -491,7 +523,7 @@ export function ChangesWorkbench() {
             }
             if (isSelectAllChangesShortcut(event)) {
               event.preventDefault();
-              setChangeSelection((current) => selectAllChanges(visibleChangeIds, current));
+              setChangeSelection((current) => selectAllChanges(listedChangeIds, current));
               return;
             }
             if (!isToggleSelectedChangesShortcut(event)) return;
@@ -500,9 +532,9 @@ export function ChangesWorkbench() {
             toggleSelectedCommitInclusion();
           }}
         >
-          {visibleChanges.map((change) => (
-            <div key={change.id} className={cn("repola-windowed-row flex min-h-8 [--windowed-row-size:32px] items-center border-b", changeSelection.selectedIds.has(change.id) && "bg-accent")}>
-              <span className="grid w-11 shrink-0 place-items-center">
+          {listedChanges.map((change) => (
+            <div key={change.id} className={cn("repola-windowed-row group/change flex min-h-7 [--windowed-row-size:28px] items-center hover:bg-accent/50", changeSelection.selectedIds.has(change.id) && "bg-accent hover:bg-accent")}>
+              <span className="grid w-9 shrink-0 place-items-center">
                 <Checkbox
                   checked={isIncludedInCommit(commitSelectionFor(commitSelections, change.id))}
                   indeterminate={commitSelectionFor(commitSelections, change.id).kind === "partial"}
@@ -517,7 +549,7 @@ export function ChangesWorkbench() {
               </span>
               <button
                 type="button"
-                className="flex min-w-0 flex-1 items-center gap-2 self-stretch pr-3 text-left"
+                className="flex min-w-0 flex-1 items-center gap-2 self-stretch pr-2.5 text-left"
                 data-change-id={change.id}
                 aria-pressed={changeSelection.selectedIds.has(change.id)}
                 onClick={(event) => {
@@ -526,17 +558,17 @@ export function ChangesWorkbench() {
                   // command target so Edit > Select All and Cmd+A reach this list.
                   event.currentTarget.focus({ preventScroll: true });
                   setChangeSelection((current) => updateChangeSelection(
-                    visibleChangeIds,
+                    listedChangeIds,
                     current,
                     change.id,
                     { additive: event.metaKey || event.ctrlKey, range: event.shiftKey },
                   ));
                 }}
               >
-                <span className={cn("w-5 shrink-0 text-center font-mono text-xs font-medium", change.conflicted ? "text-destructive" : "text-brand")}>
-                  {change.conflicted ? "!" : change.indexStatus !== "." ? change.indexStatus : change.worktreeStatus}
+                <span className="flex min-w-0 flex-1 items-baseline text-[0.8rem]" title={change.path.display}>
+                  <span className="min-w-0 shrink truncate text-muted-foreground">{change.path.display.slice(0, change.path.display.search(/[^\\/]*$/))}</span>
+                  <span className="shrink-0 whitespace-nowrap text-foreground">{change.path.display.split(/[\\/]/).pop()}</span>
                 </span>
-                <span className="min-w-0 flex-1 truncate text-sm" title={change.path.display}><span className="text-muted-foreground">{change.path.display.slice(0, change.path.display.search(/[^\\/]*$/))}</span><span className="text-foreground">{change.path.display.split(/[\\/]/).pop()}</span></span>
                 {change.submodule ? <Badge variant="outline">submodule</Badge> : null}
                 {change.modeChange === "executableBit" ? <Badge variant="outline">executable bit</Badge> : null}
                 {change.modeChange === "symlink" ? <Badge variant="outline">symlink</Badge> : null}
@@ -546,9 +578,13 @@ export function ChangesWorkbench() {
                     <TooltipContent>{[change.headMode, change.indexMode, change.worktreeMode].filter(Boolean).join(" → ")}</TooltipContent>
                   </Tooltip>
                 ) : null}
+                {changeStatusIcon(change)}
               </button>
             </div>
           ))}
+          {visibleChanges.length > 0 && listedChanges.length === 0 ? (
+            <p className="px-4 py-6 text-center text-sm text-muted-foreground">No changed files match “{changeFilter.trim()}”.</p>
+          ) : null}
           {visibleChanges.length === 0 ? (
             <Empty className="h-full py-12">
               <EmptyHeader>
