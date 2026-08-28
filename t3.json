@@ -1,0 +1,33 @@
+{
+  "$schema": "https://t3.codes/schema/t3.json",
+  "iconPath": "src-tauri/icons/app-icon.png",
+  "defaultThreadEnvMode": "worktree",
+  "scripts": [
+    {
+      "name": "Setup Worktree",
+      "command": "pnpm install --frozen-lockfile",
+      "icon": "configure",
+      "runOnWorktreeCreate": true
+    },
+    {
+      "name": "Run Repola",
+      "command": "pnpm tauri dev",
+      "icon": "debug"
+    },
+    {
+      "name": "Check Frontend",
+      "command": "pnpm typecheck && pnpm lint && pnpm test && pnpm build",
+      "icon": "test"
+    },
+    {
+      "name": "Test Rust Workspace",
+      "command": "cargo test --manifest-path src-tauri/Cargo.toml --workspace",
+      "icon": "test"
+    },
+    {
+      "name": "Build Native App",
+      "command": "pnpm tauri build",
+      "icon": "build"
+    }
+  ]
+}
