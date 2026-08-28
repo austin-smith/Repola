@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  arrowKeyChangeTarget,
   isSelectAllChangesShortcut,
   isToggleSelectedChangesShortcut,
   selectAllChanges,
@@ -73,5 +74,22 @@ describe("changed-file selection", () => {
     expect([...selection.selectedIds]).toEqual(["b", "c", "d"]);
     expect(selection.activeId).toBe("d");
     expect(selection.anchorId).toBe("b");
+  });
+
+  it("moves the active row with arrow keys and clamps at the list edges", () => {
+    const key = (k: string, extra: Partial<{ metaKey: boolean; shiftKey: boolean; altKey: boolean; ctrlKey: boolean }> = {}) =>
+      ({ key: k, metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...extra });
+    expect(arrowKeyChangeTarget(ids, singleChangeSelection(null), key("ArrowDown"))).toBe("a");
+    expect(arrowKeyChangeTarget(ids, singleChangeSelection(null), key("ArrowUp"))).toBe("a");
+    expect(arrowKeyChangeTarget(ids, singleChangeSelection("b"), key("ArrowDown"))).toBe("c");
+    expect(arrowKeyChangeTarget(ids, singleChangeSelection("b"), key("ArrowUp"))).toBe("a");
+    expect(arrowKeyChangeTarget(ids, singleChangeSelection("d"), key("ArrowDown"))).toBe("d");
+    expect(arrowKeyChangeTarget(ids, singleChangeSelection("a"), key("ArrowUp"))).toBe("a");
+    expect(arrowKeyChangeTarget(ids, singleChangeSelection("b"), key("ArrowDown", { metaKey: true }))).toBe("d");
+    expect(arrowKeyChangeTarget(ids, singleChangeSelection("c"), key("Home"))).toBe("a");
+    expect(arrowKeyChangeTarget(ids, singleChangeSelection("a"), key("End"))).toBe("d");
+    expect(arrowKeyChangeTarget(ids, singleChangeSelection("b"), key("ArrowDown", { altKey: true }))).toBeNull();
+    expect(arrowKeyChangeTarget(ids, singleChangeSelection("b"), key("Enter"))).toBeNull();
+    expect(arrowKeyChangeTarget([], singleChangeSelection(null), key("ArrowDown"))).toBeNull();
   });
 });

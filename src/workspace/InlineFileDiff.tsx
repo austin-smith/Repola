@@ -2,24 +2,26 @@ import { useEffect, useState } from "react";
 import { AlertTriangleIcon } from "lucide-react";
 import { PatchDiff } from "@pierre/diffs/react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useTheme } from "@/components/theme-provider";
 import type { FileChange, FileDiff, PatchHunk } from "../ipc/types";
 import type { FileCommitSelection } from "../domain/commit-selection";
 import {
   normalizePartialCommitSelection,
-  selectableLineIndices,
   selectedLinesForHunk,
 } from "../domain/commit-selection";
 import { fetchFileDiff } from "../ipc/worktrees";
 import { FileDiffFallback } from "./FileDiffFallback";
+import { SelectableHunkList } from "./SelectableHunkList";
+import { useDelayedPending } from "./use-delayed-pending";
 
 export function InlineFileDiff({
   machineId,
   repositoryPath,
   worktreePath,
   change,
+  cache,
+  scrollElement,
   selection,
   onSelectionChange,
 }: {
@@ -27,17 +29,33 @@ export function InlineFileDiff({
   repositoryPath: string;
   worktreePath: string;
   change: FileChange;
+  /**
+   * Diffs already loaded for the current working-copy snapshot, keyed by path
+   * token. The owner replaces the map whenever the snapshot changes, so an
+   * entry is never older than the file list it was loaded for.
+   */
+  cache: Map<string, FileDiff>;
+  /** The ancestor that scrolls this diff; large diffs window their rows against it. */
+  scrollElement: HTMLElement | null;
   selection: FileCommitSelection;
   onSelectionChange: (selection: FileCommitSelection) => void;
 }) {
-  const [diff, setDiff] = useState<FileDiff | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const cacheKey = change.path.token;
+  const cached = cache.get(cacheKey) ?? null;
+  // A load result is only meaningful for the cache (and therefore the
+  // snapshot) it was requested under: when the snapshot is refreshed with the
+  // same file selected, the previous result must not be shown while the new
+  // request is in flight.
+  const [loaded, setLoaded] = useState<{ cache: Map<string, FileDiff>; key: string; diff: FileDiff | null; error: string | null } | null>(null);
+  const current = loaded?.cache === cache && loaded.key === cacheKey ? loaded : null;
+  const diff = cached ?? current?.diff ?? null;
+  const error = cached === null ? current?.error ?? null : null;
+  const showSkeleton = useDelayedPending(diff === null && error === null);
   const { resolvedTheme } = useTheme();
 
   useEffect(() => {
+    if (cache.has(cacheKey)) return;
     const controller = new AbortController();
-    setDiff(null);
-    setError(null);
     void fetchFileDiff(
       machineId,
       repositoryPath,
@@ -45,14 +63,17 @@ export function InlineFileDiff({
       change.path,
       controller.signal,
     )
-      .then(setDiff)
+      .then((next) => {
+        cache.set(cacheKey, next);
+        setLoaded({ cache, key: cacheKey, diff: next, error: null });
+      })
       .catch((cause: unknown) => {
         if (!controller.signal.aborted) {
-          setError(cause instanceof Error ? cause.message : String(cause));
+          setLoaded({ cache, key: cacheKey, diff: null, error: cause instanceof Error ? cause.message : String(cause) });
         }
       });
     return () => controller.abort();
-  }, [change.path, change.path.token, machineId, repositoryPath, worktreePath]);
+  }, [cache, cacheKey, change.path, machineId, repositoryPath, worktreePath]);
 
   const updateHunkSelection = (target: PatchHunk, lineIndices: readonly number[]) => {
     if (!diff) return;
@@ -75,9 +96,14 @@ export function InlineFileDiff({
       </Alert>
     );
   }
-  if (!diff) {
+  if (!diff || showSkeleton) {
+    // Most diffs arrive in a few tens of milliseconds; showing nothing for
+    // that window reads as a plain content swap rather than a flash. Once the
+    // skeleton has appeared it stays up for its minimum duration even if the
+    // diff lands in the meantime, so it never blinks.
+    if (!showSkeleton) return null;
     return (
-      <div className="flex flex-col gap-2 p-4">
+      <div className="flex flex-col gap-2 p-4" role="status" aria-label="Loading diff">
         <Skeleton className="h-5 w-1/3" />
         <Skeleton className="h-24 w-full" />
         <Skeleton className="h-36 w-full" />
@@ -108,36 +134,12 @@ export function InlineFileDiff({
         </Alert>
       ) : null}
       {canSelectLines ? (
-        <section className="flex flex-col gap-3" aria-label="Changes included in commit">
-          {diff.hunks.map((hunk) => {
-            const selected = selectedLinesForHunk(selection, hunk);
-            const selectable = selectableLineIndices(hunk.patch);
-            const allSelected = selected.length === selectable.length;
-            return (
-              <div key={hunk.index} className="overflow-hidden rounded-md border">
-                <div className="flex items-center gap-3 border-b bg-muted/50 px-3 py-2">
-                  <Checkbox
-                    checked={allSelected}
-                    indeterminate={selected.length > 0 && !allSelected}
-                    onCheckedChange={(checked) => updateHunkSelection(hunk, checked ? selectable : [])}
-                    aria-label={`${allSelected ? "Exclude" : "Include"} hunk from commit`}
-                  />
-                  <code className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{hunk.header}</code>
-                </div>
-                <SelectableHunk
-                  patch={hunk.patch}
-                  selected={[...selected]}
-                  onToggle={(index) => {
-                    const next = new Set(selected);
-                    if (next.has(index)) next.delete(index);
-                    else next.add(index);
-                    updateHunkSelection(hunk, [...next].sort((left, right) => left - right));
-                  }}
-                />
-              </div>
-            );
-          })}
-        </section>
+        <SelectableHunkList
+          hunks={diff.hunks}
+          selection={selection}
+          scrollElement={scrollElement}
+          onHunkSelectionChange={updateHunkSelection}
+        />
       ) : (
         <PatchDiff
           patch={diff.patch}
@@ -147,55 +149,4 @@ export function InlineFileDiff({
       )}
     </div>
   );
-}
-
-interface SelectableLine {
-  index: number;
-  oldLine: number | null;
-  newLine: number | null;
-  prefix: string;
-  content: string;
-  selectable: boolean;
-}
-
-function SelectableHunk({ patch, selected, onToggle }: { patch: string; selected: number[]; onToggle: (index: number) => void }) {
-  const lines = parseSelectableLines(patch);
-  const selectedSet = new Set(selected);
-  return (
-    <div className="overflow-x-auto bg-card font-mono text-xs" role="group" aria-label="Select changed lines">
-      {lines.map((line) => (
-        <label key={line.index} className={`grid min-w-max grid-cols-[36px_44px_44px_minmax(420px,1fr)] border-b last:border-b-0 ${line.prefix === "+" ? "bg-success/10" : line.prefix === "-" ? "bg-destructive/10" : ""} ${line.selectable ? "cursor-pointer hover:bg-accent" : ""}`}>
-          <span className="grid place-items-center border-r bg-muted/40">{line.selectable ? <Checkbox checked={selectedSet.has(line.index)} onCheckedChange={() => onToggle(line.index)} aria-label={`Select ${line.prefix === "+" ? "added" : "deleted"} line ${line.newLine ?? line.oldLine}`} /> : null}</span>
-          <span className="border-r px-2 py-1 text-right text-muted-foreground select-none">{line.oldLine}</span>
-          <span className="border-r px-2 py-1 text-right text-muted-foreground select-none">{line.newLine}</span>
-          <code className="px-2 py-1 whitespace-pre"><span className={line.prefix === "+" ? "text-success" : line.prefix === "-" ? "text-destructive" : "text-muted-foreground"}>{line.prefix}</span>{line.content}</code>
-        </label>
-      ))}
-    </div>
-  );
-}
-
-function parseSelectableLines(patch: string): SelectableLine[] {
-  const hunkOffset = patch.indexOf("@@ ");
-  if (hunkOffset < 0) return [];
-  const hunk = patch.slice(hunkOffset);
-  const headerEnd = hunk.indexOf("\n");
-  const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(hunk.slice(0, headerEnd));
-  if (!match) return [];
-  let oldLine = Number(match[1]);
-  let newLine = Number(match[2]);
-  return hunk.slice(headerEnd + 1).split("\n").filter((line, index, values) => index < values.length - 1 || line !== "").map((line, index) => {
-    const prefix = line.slice(0, 1);
-    const result: SelectableLine = {
-      index,
-      oldLine: prefix === "+" ? null : oldLine,
-      newLine: prefix === "-" ? null : newLine,
-      prefix,
-      content: line.slice(1),
-      selectable: prefix === "+" || prefix === "-",
-    };
-    if (prefix !== "+") oldLine += 1;
-    if (prefix !== "-") newLine += 1;
-    return result;
-  });
 }

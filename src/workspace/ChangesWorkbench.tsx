@@ -1,4 +1,4 @@
-import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   AlertTriangleIcon,
   ArchiveIcon,
@@ -29,7 +29,7 @@ import { cn } from "@/lib/utils";
 import { toMessage } from "@/lib/errors";
 import { ActionableGitError } from "../components/ActionableGitError";
 import { StashDialog } from "../dialogs/StashDialog";
-import { emptyChangeSelection, isSelectAllChangesShortcut, isToggleSelectedChangesShortcut, selectAllChanges, singleChangeSelection, updateChangeSelection } from "../domain/change-selection";
+import { arrowKeyChangeTarget, emptyChangeSelection, isSelectAllChangesShortcut, isToggleSelectedChangesShortcut, selectAllChanges, singleChangeSelection, updateChangeSelection } from "../domain/change-selection";
 import {
   commitSelectionFor,
   commitSelectionRequest,
@@ -56,7 +56,7 @@ import {
   unwatchWorktree,
   watchWorktree,
 } from "../ipc/worktrees";
-import type { CommitSigning, ConflictResolutionKind, DiscardScope, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../ipc/types";
+import type { CommitSigning, ConflictResolutionKind, DiscardScope, FileDiff, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../ipc/types";
 import { parseCommitPeople, parseCommitTrailers } from "./commit-form";
 import { useWorkingCopy } from "./context";
 import { sectionHeadingClass, signingItems } from "./labels";
@@ -66,7 +66,11 @@ import { operationGuidance, operationLabel, operationSupportsSkip } from "./oper
 
 export function ChangesWorkbench() {
   const { machineId, repository, worktree } = useWorkingCopy();
-  const [snapshot, setSnapshot] = useState<WorkingCopySnapshot | null>(null);
+  // File diffs are only meaningful for the snapshot they were loaded against,
+  // so the cache is stored with the snapshot and replaced whenever it is.
+  const [workingCopy, setWorkingCopy] = useState<{ snapshot: WorkingCopySnapshot | null; diffCache: Map<string, FileDiff> }>(() => ({ snapshot: null, diffCache: new Map() }));
+  const { snapshot, diffCache } = workingCopy;
+  const setSnapshot = useCallback((next: WorkingCopySnapshot | null) => setWorkingCopy({ snapshot: next, diffCache: new Map() }), []);
   const [changeSelection, setChangeSelection] = useState(emptyChangeSelection);
   const [commitSelections, setCommitSelections] = useState<CommitSelectionMap>(() => new Map());
   const changesListRef = useRef<HTMLDivElement>(null);
@@ -115,7 +119,7 @@ export function ChangesWorkbench() {
         if (!controller.signal.aborted) setError(toMessage(cause));
       });
     return () => controller.abort();
-  }, [machineId, repository.path, worktree.id, worktree.path]);
+  }, [machineId, repository.path, setSnapshot, worktree.id, worktree.path]);
 
   // Mutations replace the snapshot with their own result, so a disk-triggered reload
   // while one is running would only race it.
@@ -145,7 +149,7 @@ export function ChangesWorkbench() {
       .finally(() => {
         if (reloadController.current === controller) reloadController.current = null;
       });
-  }, [machineId, repository.path, worktree.path]);
+  }, [machineId, repository.path, setSnapshot, worktree.path]);
   useEffect(() => () => reloadController.current?.abort(), []);
 
   // Refresh when files change on disk (local machines) and whenever the window regains focus,
@@ -181,6 +185,14 @@ export function ChangesWorkbench() {
   const visibleChanges = useMemo(() => snapshot?.changes.filter((change) => !change.ignored) ?? [], [snapshot]);
   const visibleChangeIds = useMemo(() => visibleChanges.map((change) => change.id), [visibleChanges]);
   const selectedChange = visibleChanges.find((change) => change.id === changeSelection.activeId) ?? null;
+  // Only the diff body is expensive to build, so it alone follows the selection
+  // at transition priority. The list highlight, the header, and every action
+  // target stay on the urgent path so they always agree with the selection.
+  const deferredActiveId = useDeferredValue(changeSelection.activeId);
+  const diffChange = visibleChanges.find((change) => change.id === deferredActiveId) ?? null;
+  // Held as state rather than a ref so the diff pane can bind its virtualized
+  // rows to the element as soon as it exists.
+  const [diffScroller, setDiffScroller] = useState<HTMLDivElement | null>(null);
   const includedCount = includedChangeCount(visibleChanges, commitSelections);
   const gitStagedCount = visibleChanges.filter((change) => change.staged).length;
   const allChangesIncluded = visibleChanges.length > 0 && includedCount === visibleChanges.length;
@@ -466,8 +478,17 @@ export function ChangesWorkbench() {
           ref={changesListRef}
           className="min-h-0 flex-1 overflow-y-auto focus:outline-none"
           tabIndex={-1}
-          aria-keyshortcuts="Meta+A Control+A Space"
+          aria-keyshortcuts="Meta+A Control+A Space ArrowUp ArrowDown Home End"
           onKeyDown={(event) => {
+            const arrowTarget = arrowKeyChangeTarget(visibleChangeIds, changeSelection, event);
+            if (arrowTarget !== null) {
+              event.preventDefault();
+              setChangeSelection((current) => updateChangeSelection(visibleChangeIds, current, arrowTarget, { additive: false, range: event.shiftKey }));
+              const row = event.currentTarget.querySelector<HTMLElement>(`[data-change-id="${CSS.escape(arrowTarget)}"]`);
+              row?.focus({ preventScroll: true });
+              row?.scrollIntoView({ block: "nearest" });
+              return;
+            }
             if (isSelectAllChangesShortcut(event)) {
               event.preventDefault();
               setChangeSelection((current) => selectAllChanges(visibleChangeIds, current));
@@ -480,7 +501,7 @@ export function ChangesWorkbench() {
           }}
         >
           {visibleChanges.map((change) => (
-            <div key={change.id} className={cn("repola-windowed-row flex min-h-11 items-center border-b", changeSelection.selectedIds.has(change.id) && "bg-accent")}>
+            <div key={change.id} className={cn("repola-windowed-row flex min-h-8 [--windowed-row-size:32px] items-center border-b", changeSelection.selectedIds.has(change.id) && "bg-accent")}>
               <span className="grid w-11 shrink-0 place-items-center">
                 <Checkbox
                   checked={isIncludedInCommit(commitSelectionFor(commitSelections, change.id))}
@@ -497,6 +518,7 @@ export function ChangesWorkbench() {
               <button
                 type="button"
                 className="flex min-w-0 flex-1 items-center gap-2 self-stretch pr-3 text-left"
+                data-change-id={change.id}
                 aria-pressed={changeSelection.selectedIds.has(change.id)}
                 onClick={(event) => {
                   // WebKit on macOS does not consistently move keyboard focus to a
@@ -514,10 +536,7 @@ export function ChangesWorkbench() {
                 <span className={cn("w-5 shrink-0 text-center font-mono text-xs font-medium", change.conflicted ? "text-destructive" : "text-brand")}>
                   {change.conflicted ? "!" : change.indexStatus !== "." ? change.indexStatus : change.worktreeStatus}
                 </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm">{change.path.display.split(/[\\/]/).pop()}</span>
-                  <span className="block truncate font-mono text-xs text-muted-foreground">{change.path.display}</span>
-                </span>
+                <span className="min-w-0 flex-1 truncate text-sm" title={change.path.display}><span className="text-muted-foreground">{change.path.display.slice(0, change.path.display.search(/[^\\/]*$/))}</span><span className="text-foreground">{change.path.display.split(/[\\/]/).pop()}</span></span>
                 {change.submodule ? <Badge variant="outline">submodule</Badge> : null}
                 {change.modeChange === "executableBit" ? <Badge variant="outline">executable bit</Badge> : null}
                 {change.modeChange === "symlink" ? <Badge variant="outline">symlink</Badge> : null}
@@ -611,18 +630,20 @@ export function ChangesWorkbench() {
             <Button variant="destructive" size="xs" disabled={busyPath !== null} onClick={() => setPendingResolution({ kind: "remove", change: selectedChange })}>Remove…</Button>
           </div>
         ) : null}
-        <div className="min-h-0 flex-1 overflow-auto">
-          {selectedChange ? (
+        <div ref={setDiffScroller} className="min-h-0 flex-1 overflow-auto">
+          {diffChange ? (
             <Suspense fallback={<div className="grid h-full place-items-center"><Spinner className="size-6" /></div>}>
               <InlineFileDiff
                 machineId={machineId}
                 repositoryPath={repository.path}
                 worktreePath={worktree.path}
-                change={selectedChange}
-                selection={commitSelectionFor(commitSelections, selectedChange.id)}
+                change={diffChange}
+                cache={diffCache}
+                scrollElement={diffScroller}
+                selection={commitSelectionFor(commitSelections, diffChange.id)}
                 onSelectionChange={(selection: FileCommitSelection) => setCommitSelections((current) => {
                   const next = new Map(current);
-                  next.set(selectedChange.id, selection);
+                  next.set(diffChange.id, selection);
                   return next;
                 })}
               />

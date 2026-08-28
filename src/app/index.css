@@ -165,10 +165,12 @@
 }
 
 /* Large repository lists keep semantic DOM and keyboard behavior while the
-   browser skips layout/paint for rows outside the scrollport. */
+   browser skips layout/paint for rows outside the scrollport. Lists whose rows
+   are not 64px tall set --windowed-row-size so skipped rows reserve the right
+   space and the scrollbar does not jump as rows are laid out. */
 .repola-windowed-row {
   content-visibility: auto;
-  contain-intrinsic-block-size: 64px;
+  contain-intrinsic-block-size: var(--windowed-row-size, 64px);
 }
 
 @media (prefers-reduced-motion: reduce) {
