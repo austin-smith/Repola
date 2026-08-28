@@ -18,6 +18,18 @@ export interface MachineConnection {
   error: string | null;
 }
 
+export const toolbarSegmentClass = "flex h-10 min-w-0 items-center gap-2 rounded-lg border border-transparent py-1 pr-2 pl-2 text-left transition-colors outline-none select-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50 dark:hover:bg-muted/50";
+
+/** The caption-over-value body shared by every toolbar segment. */
+export function ToolbarSegmentBody({ caption, children }: { caption: string; children: ReactNode }) {
+  return (
+    <span className="flex min-w-0 flex-1 flex-col leading-tight">
+      <span className="text-[11px] text-muted-foreground">{caption}</span>
+      <span className="block truncate text-sm">{children}</span>
+    </span>
+  );
+}
+
 /** Caption-over-value trigger used by every select in the toolbar. */
 export function ToolbarSelectTrigger({
   id,
@@ -37,16 +49,49 @@ export function ToolbarSelectTrigger({
     <SelectTrigger
       id={id}
       size="sm"
-      className={cn("h-10 min-w-0 flex-1 gap-2 border-transparent bg-transparent py-1 pr-1.5 pl-2 hover:bg-muted data-popup-open:bg-muted dark:bg-transparent dark:hover:bg-muted/50", className)}
+      className={cn(toolbarSegmentClass, "bg-transparent data-popup-open:bg-muted dark:bg-transparent", className)}
       {...props}
     >
       <span className="shrink-0 text-muted-foreground [&_svg]:size-4" aria-hidden="true">{icon}</span>
-      <span className="flex min-w-0 flex-1 flex-col text-left leading-tight">
-        <span className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">{caption}</span>
+      <span className="flex min-w-0 flex-1 flex-col leading-tight">
+        <span className="text-[11px] text-muted-foreground">{caption}</span>
         <SelectValue className="block truncate text-sm" placeholder={placeholder}>{children}</SelectValue>
       </span>
     </SelectTrigger>
   );
+}
+
+/** A captioned toolbar button with the same anatomy as the selects. */
+export function ToolbarButton({
+  caption,
+  icon,
+  active = false,
+  trailing,
+  className,
+  children,
+  ...props
+}: React.ComponentProps<"button"> & {
+  caption: string;
+  icon: ReactNode;
+  active?: boolean;
+  trailing?: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      className={cn(toolbarSegmentClass, active && "bg-muted dark:bg-muted/50", className)}
+      aria-current={active ? "page" : undefined}
+      {...props}
+    >
+      <span className="shrink-0 text-muted-foreground [&_svg]:size-4" aria-hidden="true">{icon}</span>
+      <ToolbarSegmentBody caption={caption}>{children}</ToolbarSegmentBody>
+      {trailing}
+    </button>
+  );
+}
+
+export function ToolbarDivider() {
+  return <span className="mx-1 h-7 w-px shrink-0 bg-border/70" aria-hidden="true" />;
 }
 
 /**
@@ -82,11 +127,11 @@ export function ContextHeader({
   // width once there is something to switch to.
   const showMachine = enabledMachines.length > 1 || selectedMachine.kind === "ssh";
   const machineTrigger = (
-    <ToolbarSelectTrigger id="current-machine" caption="Machine" icon={selectedMachine.kind === "ssh" ? <ServerIcon /> : <LaptopIcon />} className="w-40 flex-none" aria-label="Current machine" />
+    <ToolbarSelectTrigger id="current-machine" caption="Machine" icon={selectedMachine.kind === "ssh" ? <ServerIcon /> : <LaptopIcon />} className="w-44 flex-none" aria-label="Current machine" />
   );
   return (
     <header className="flex h-14 shrink-0 items-center gap-1 border-b bg-card pr-2 pl-3">
-      <div className="mr-1 grid size-6 shrink-0 content-center gap-[3px] border border-foreground bg-brand p-[5px]" aria-label="Repola" role="img">
+      <div className="mr-2 grid size-6 shrink-0 content-center gap-[3px] border border-foreground bg-brand p-[5px]" aria-label="Repola" role="img">
         <span className="block h-px bg-brand-foreground" />
         <span className="block h-px bg-brand-foreground" />
         <span className="block h-px bg-brand-foreground" />
@@ -116,7 +161,9 @@ export function ContextHeader({
       {selectedMachine.kind === "ssh" ? (
         <MachineConnectionIndicator connection={connection} onRetry={onRetry} />
       ) : null}
+      {showMachine ? <ToolbarDivider /> : null}
       {children}
+      <span className="min-w-0 flex-1" aria-hidden="true" />
       {status ? <div className="ml-2 flex shrink-0 items-center gap-2 text-xs text-muted-foreground">{status}</div> : null}
       {actions ? <div className="ml-1 flex shrink-0 items-center gap-0.5">{actions}</div> : null}
     </header>

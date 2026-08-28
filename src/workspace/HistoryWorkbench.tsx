@@ -31,6 +31,7 @@ import { ActivityFact } from "./facts";
 import { historyMutationTitles, sectionHeadingClass } from "./labels";
 import { ChangeStatusIcon } from "./ChangeStatusIcon";
 import { LazyDialog } from "./LazyDialog";
+import { WorkspaceTabs } from "./WorkspaceTabs";
 import { CommitFileDiffView, HistoryMutationDialog, ReflogDialog, TagsDialog } from "./lazy";
 
 export function HistoryWorkbench() {
@@ -145,6 +146,7 @@ export function HistoryWorkbench() {
   return (
     <div className="grid min-h-0 flex-1 grid-cols-[minmax(280px,0.8fr)_minmax(240px,0.7fr)_minmax(360px,1.5fr)]">
       <section className="flex min-h-0 flex-col border-r" aria-label="Commit history">
+        <WorkspaceTabs />
         <div className="flex shrink-0 flex-col gap-2 border-b bg-card p-3">
           <div className="flex items-center">
             <strong className="text-sm">{comparisonLabel ? "Branch comparison" : "History"}</strong>

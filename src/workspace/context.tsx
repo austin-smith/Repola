@@ -1,5 +1,5 @@
 import { createContext, useContext, type ReactNode } from "react";
-import type { MachineProfile, RepositorySummary, WorktreeRecord } from "../ipc/types";
+import type { MachineProfile, RepositorySummary, WorkspaceView, WorktreeRecord } from "../ipc/types";
 
 /**
  * The machine → repository → worktree selection the workbench operates on, plus the
@@ -13,6 +13,9 @@ export interface RepositoryContextValue {
   worktree: WorktreeRecord | null;
   refreshWorkspace: () => Promise<void>;
   showChanges: () => void;
+  /** Which workspace view is showing, and how to switch it. */
+  view: WorkspaceView;
+  showView: (view: WorkspaceView) => void;
 }
 
 /** The context narrowed to a selected repository and worktree. */

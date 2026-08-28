@@ -413,7 +413,9 @@ function App() {
     worktree: currentWorktree,
     refreshWorkspace,
     showChanges,
-  }), [currentRepository, currentWorktree, refreshWorkspace, selectedMachine?.kind, selectedMachineId, showChanges]);
+    view: workspaceView,
+    showView: setWorkspaceView,
+  }), [currentRepository, currentWorktree, refreshWorkspace, selectedMachine?.kind, selectedMachineId, showChanges, workspaceView]);
 
   useEffect(() => {
     if (!workspaceContextHydrated) return;
@@ -1041,13 +1043,11 @@ function App() {
       <RepositoryToolbar
         repositories={scan.repositories}
         worktrees={repositoryWorktrees}
-        view={workspaceView}
         onRepositoryChange={(path) => {
           setCurrentRepositoryPath(path);
           setCurrentWorktreePath(null);
         }}
         onWorktreeChange={setCurrentWorktreePath}
-        onViewChange={setWorkspaceView}
         onCreateWorktree={() => setCreateWorktreeOpen(true)}
         onAddRepository={() => setRepositoryDialogOpen(true)}
         onRemoveRepository={removeRepositoryFromList}
