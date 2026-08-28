@@ -1,4 +1,5 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { useState } from "react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/components/theme-provider";
 import { InlineFileDiff } from "./InlineFileDiff";
@@ -67,18 +68,45 @@ const change: FileChange = {
   modeChange: null,
 };
 
-function renderDiff(selection: FileCommitSelection, overrides: Partial<FileChange> = {}) {
+// jsdom performs no layout, so the scroll container that windows the diff
+// rows would report a zero-height viewport (the virtualizer reads
+// offsetWidth/offsetHeight). Give it a viewport tall enough to hold every row
+// so the tests exercise the full list.
+const VIEWPORT = { offsetWidth: 800, offsetHeight: 100_000 };
+
+function ScrollHost({ children }: { children: (scrollElement: HTMLDivElement | null) => React.ReactNode }) {
+  const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null);
+  return (
+    <div
+      ref={(element) => {
+        if (element) Object.defineProperties(element, { offsetWidth: { value: VIEWPORT.offsetWidth }, offsetHeight: { value: VIEWPORT.offsetHeight } });
+        setScrollElement(element);
+      }}
+      style={{ overflow: "auto" }}
+    >
+      {children(scrollElement)}
+    </div>
+  );
+}
+
+function renderDiff(selection: FileCommitSelection, overrides: Partial<FileChange> = {}, cache = new Map<string, FileDiff>()) {
   const onSelectionChange = vi.fn();
   render(
     <ThemeProvider storageKey="test-theme">
-      <InlineFileDiff
-        machineId="local"
-        repositoryPath="/tmp/repola"
-        worktreePath="/tmp/repola"
-        change={{ ...change, ...overrides }}
-        selection={selection}
-        onSelectionChange={onSelectionChange}
-      />
+      <ScrollHost>
+        {(scrollElement) => (
+          <InlineFileDiff
+            machineId="local"
+            repositoryPath="/tmp/repola"
+            worktreePath="/tmp/repola"
+            change={{ ...change, ...overrides }}
+            cache={cache}
+            scrollElement={scrollElement}
+            selection={selection}
+            onSelectionChange={onSelectionChange}
+          />
+        )}
+      </ScrollHost>
     </ThemeProvider>,
   );
   return { onSelectionChange };
@@ -204,6 +232,34 @@ describe("InlineFileDiff", () => {
     const body = patch.slice(patch.indexOf("@@ ")).split("\n").slice(1);
     expect(expected.every((index) => /^[+-]/.test(body[index]))).toBe(true);
     expect(body.filter((line) => /^[+-]/.test(line))).toHaveLength(expected.length);
+  });
+
+  it("serves a cached diff synchronously and stores fresh loads in the cache", async () => {
+    const cache = new Map<string, FileDiff>([[change.path.token, diff]]);
+    renderDiff(includeAllChanges, {}, cache);
+    expect(await screen.findAllByRole("group", { name: "Select changed lines" })).toHaveLength(2);
+    expect(ipc.fetchFileDiff).not.toHaveBeenCalled();
+    cleanup();
+
+    const empty = new Map<string, FileDiff>();
+    renderDiff(includeAllChanges, {}, empty);
+    await screen.findAllByRole("group", { name: "Select changed lines" });
+    expect(empty.get(change.path.token)).toBe(diff);
+  });
+
+  it("only shows the loading skeleton when a diff is slow to arrive", async () => {
+    vi.useFakeTimers();
+    try {
+      ipc.fetchFileDiff.mockReturnValue(new Promise(() => undefined));
+      renderDiff(includeAllChanges);
+      expect(screen.queryByRole("status", { name: "Loading diff" })).not.toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(149); });
+      expect(screen.queryByRole("status", { name: "Loading diff" })).not.toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(screen.getByRole("status", { name: "Loading diff" })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("falls back to a read-only diff for renames and truncated patches, and surfaces load errors", async () => {

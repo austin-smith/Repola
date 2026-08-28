@@ -291,9 +291,9 @@ export function HistoryWorkbench() {
             <div className="flex h-11 shrink-0 items-center border-b px-4"><strong className="text-sm">Changed files</strong>{files ? <Badge variant="secondary" className="ml-2">{files.length}</Badge> : <Spinner className="ml-auto size-4" />}</div>
             <div className="min-h-0 flex-1 overflow-y-auto">
               {(files ?? []).map((file) => (
-                <button key={file.id} type="button" className={cn("flex w-full items-center gap-2 border-b px-3 py-2.5 text-left", selectedFile?.id === file.id && "bg-accent")} onClick={() => setSelectedFileId(file.id)}>
+                <button key={file.id} type="button" className={cn("flex w-full items-center gap-2 border-b px-3 py-1 text-left", selectedFile?.id === file.id && "bg-accent")} onClick={() => setSelectedFileId(file.id)}>
                   <span className="w-6 shrink-0 text-center font-mono text-xs font-medium text-brand">{file.status}</span>
-                  <span className="min-w-0 flex-1"><span className="block truncate text-sm">{file.path.display.split(/[\\/]/).pop()}</span><span className="block truncate font-mono text-xs text-muted-foreground">{file.path.display}</span></span>
+                  <span className="min-w-0 flex-1 truncate text-sm" title={file.path.display}><span className="text-muted-foreground">{file.path.display.slice(0, file.path.display.search(/[^\\/]*$/))}</span><span className="text-foreground">{file.path.display.split(/[\\/]/).pop()}</span></span>
                 </button>
               ))}
               {files?.length === 0 ? <p className="p-4 text-sm text-muted-foreground">No first-parent file changes.</p> : null}

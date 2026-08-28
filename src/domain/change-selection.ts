@@ -97,3 +97,29 @@ export function updateChangeSelection(
 
   return singleChangeSelection(targetId);
 }
+
+/**
+ * Resolves the row an arrow-key press should move the active selection to,
+ * or null when the key is not a navigation key or the list is empty.
+ */
+export function arrowKeyChangeTarget(
+  ids: readonly string[],
+  current: ChangeSelection,
+  event: SelectAllShortcutEvent,
+): string | null {
+  if (ids.length === 0 || event.altKey || event.ctrlKey) return null;
+  const activeIndex = current.activeId === null ? -1 : ids.indexOf(current.activeId);
+  const last = ids.length - 1;
+  switch (event.key) {
+    case "ArrowDown":
+      return event.metaKey ? ids[last] : ids[Math.min(activeIndex + 1, last)];
+    case "ArrowUp":
+      return event.metaKey ? ids[0] : ids[activeIndex < 0 ? 0 : Math.max(activeIndex - 1, 0)];
+    case "Home":
+      return ids[0];
+    case "End":
+      return ids[last];
+    default:
+      return null;
+  }
+}
