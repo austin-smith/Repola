@@ -143,6 +143,42 @@ fn launch_worktree_tool(
 }
 
 #[tauri::command]
+fn open_file_in_editor(
+    app: tauri::AppHandle,
+    machine_id: String,
+    worktree_path: String,
+    path_token: String,
+    remote_os: Option<String>,
+) -> Result<String, String> {
+    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+    let preferences = settings::app_preferences(&app).map_err(|error| error.to_string())?;
+    worktree::open_file_in_editor(
+        &machine,
+        &preferences,
+        &worktree_path,
+        &path_token,
+        remote_os.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn show_file_in_file_manager(
+    app: tauri::AppHandle,
+    machine_id: String,
+    worktree_path: String,
+    path_token: String,
+) -> Result<(), String> {
+    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+    if machine.kind != MachineKind::Local {
+        return Err(
+            "Files on a remote machine cannot be shown in this computer's file manager.".into(),
+        );
+    }
+    let path = worktree::working_copy_entry_path(&worktree_path, &path_token)?;
+    tauri_plugin_opener::reveal_item_in_dir(&path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn resolve_dropped_repository(path: String) -> Result<String, String> {
     let path = std::path::PathBuf::from(path);
     let directory = if path.is_dir() {
@@ -1315,6 +1351,8 @@ pub fn run() {
             file_diff,
             fetch_pull_requests,
             launch_worktree_tool,
+            open_file_in_editor,
+            show_file_in_file_manager,
             load_app_preferences,
             load_external_tools,
             load_machines,

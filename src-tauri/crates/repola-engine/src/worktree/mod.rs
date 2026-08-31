@@ -24,7 +24,8 @@ pub use branches::{branches, mutate_branch};
 pub use create_worktree::create_worktree;
 pub use discovery::{resolve_repository, scan, scan_streaming, ScanError};
 pub use external_tools::{
-    available_external_tools, launch_worktree_tool, ExternalToolAvailability, WorktreeTool,
+    available_external_tools, launch_worktree_tool, open_file_in_editor, working_copy_entry_path,
+    ExternalToolAvailability, WorktreeTool,
 };
 pub use history::{commit_file_diff, commit_files, history, reflog};
 pub use history_mutations::mutate_history;

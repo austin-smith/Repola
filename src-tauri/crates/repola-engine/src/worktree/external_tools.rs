@@ -1,13 +1,12 @@
-use std::ffi::OsString;
-#[cfg(not(target_os = "macos"))]
-use std::path::Path;
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use super::command;
+use super::working_copy::{decode_path_token_bytes, os_string_from_path_bytes, path_from_token};
 use crate::machines::{MachineKind, MachineProfile};
 use crate::preferences::AppPreferences;
 
@@ -635,7 +634,7 @@ pub fn launch_worktree_tool(
     match (machine.kind, tool) {
         (MachineKind::Local, WorktreeTool::Editor) => {
             let editor = choose_editor(preferences.editor_id.as_deref(), false)?;
-            launch_local_editor(&editor, path)?;
+            launch_local_editor(&editor, OsStr::new(path))?;
             Ok(format!("Opened {path} in {}.", editor.definition.label))
         }
         (MachineKind::Local, WorktreeTool::Terminal) => {
@@ -645,7 +644,7 @@ pub fn launch_worktree_tool(
         }
         (MachineKind::Ssh, WorktreeTool::Editor) => {
             let editor = choose_editor(preferences.editor_id.as_deref(), true)?;
-            launch_remote_editor(machine, &editor, path)?;
+            launch_remote_editor(machine, &editor, OsStr::new(path))?;
             Ok(format!(
                 "Opened {path} in {} through its SSH workspace support.",
                 editor.definition.label
@@ -655,6 +654,147 @@ pub fn launch_worktree_tool(
             "Repola does not open an interactive remote shell. Use your terminal's SSH workflow; repository commands continue to run through the bounded Repola agent protocol.".into(),
         ),
     }
+}
+
+/// Open one changed file from a working copy in the preferred editor. The file
+/// is addressed by its byte-exact Git path token, so the owning machine joins
+/// the path and filenames that are not valid Unicode still resolve correctly.
+pub fn open_file_in_editor(
+    machine: &MachineProfile,
+    preferences: &AppPreferences,
+    worktree_path: &str,
+    path_token: &str,
+    remote_os: Option<&str>,
+) -> Result<String, String> {
+    match machine.kind {
+        MachineKind::Local => {
+            let path = working_copy_entry_path(worktree_path, path_token)?;
+            let metadata = std::fs::metadata(&path)
+                .map_err(|error| format!("Could not inspect the file: {error}"))?;
+            if !metadata.is_file() {
+                return Err(
+                    "This change is a directory, such as a submodule, so it cannot be opened as a file."
+                        .into(),
+                );
+            }
+            let editor = choose_editor(preferences.editor_id.as_deref(), false)?;
+            launch_local_editor(&editor, path.as_os_str())?;
+            Ok(format!(
+                "Opened {} in {}.",
+                path.display(),
+                editor.definition.label
+            ))
+        }
+        MachineKind::Ssh => {
+            let path = remote_working_copy_entry_path(worktree_path, path_token, remote_os)?;
+            let editor = choose_editor(preferences.editor_id.as_deref(), true)?;
+            launch_remote_editor(machine, &editor, &path)?;
+            Ok(format!(
+                "Opened {} in {} through its SSH workspace support.",
+                path.to_string_lossy(),
+                editor.definition.label
+            ))
+        }
+    }
+}
+
+/// Exact absolute path of one changed entry inside a local working copy,
+/// rebuilt from the byte-exact Git path token rather than display text.
+pub fn working_copy_entry_path(worktree_path: &str, path_token: &str) -> Result<PathBuf, String> {
+    validate_path(worktree_path, true)?;
+    let absolute = Path::new(worktree_path).join(relative_entry_path(path_token)?);
+    if std::fs::symlink_metadata(&absolute).is_err() {
+        return Err("The selected change no longer exists on disk.".into());
+    }
+    Ok(absolute)
+}
+
+/// How paths are written on an SSH machine, learned from the agent handshake's
+/// `operating_system` report. `None` means no report is available yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemotePathStyle {
+    Posix,
+    Windows,
+}
+
+fn remote_path_style(remote_os: Option<&str>) -> Option<RemotePathStyle> {
+    remote_os.map(|os| {
+        if os.eq_ignore_ascii_case("windows") {
+            RemotePathStyle::Windows
+        } else {
+            RemotePathStyle::Posix
+        }
+    })
+}
+
+/// The same join for a working copy on an SSH machine, performed with the
+/// remote platform's path semantics and never resolved against the desktop's
+/// filesystem. Git path tokens are repo-relative with `/` separators on every
+/// platform; on Windows remotes they are rewritten to `\`.
+fn remote_working_copy_entry_path(
+    worktree_path: &str,
+    path_token: &str,
+    remote_os: Option<&str>,
+) -> Result<OsString, String> {
+    validate_path(worktree_path, false)?;
+    let style = remote_path_style(remote_os);
+    let relative = decode_path_token_bytes(path_token)?;
+    validate_remote_relative_bytes(&relative, style)?;
+    let windows = style == Some(RemotePathStyle::Windows);
+    let trimmed = if windows {
+        worktree_path.trim_end_matches(['/', '\\'])
+    } else {
+        worktree_path.trim_end_matches('/')
+    };
+    let mut joined = trimmed.as_bytes().to_vec();
+    joined.push(if windows { b'\\' } else { b'/' });
+    joined.extend(
+        relative
+            .iter()
+            .map(|&byte| if windows && byte == b'/' { b'\\' } else { byte }),
+    );
+    os_string_from_path_bytes(joined)
+}
+
+/// Rejects tokens that would escape the worktree under the remote platform's
+/// path semantics. When the platform is unknown, both interpretations must be
+/// safe: `\` is treated as a separator (as Windows would) and `..` is refused
+/// in every position, at the cost of refusing rare POSIX filenames that spell
+/// a Windows traversal.
+fn validate_remote_relative_bytes(
+    bytes: &[u8],
+    style: Option<RemotePathStyle>,
+) -> Result<(), String> {
+    if bytes.is_empty() {
+        return Err("The selected change has no path on disk.".into());
+    }
+    let windows_semantics = style != Some(RemotePathStyle::Posix);
+    let is_separator = |byte: &u8| *byte == b'/' || (windows_semantics && *byte == b'\\');
+    if is_separator(&bytes[0]) || (windows_semantics && bytes.contains(&b':')) {
+        return Err("The selected path is not inside the worktree.".into());
+    }
+    if bytes
+        .split(is_separator)
+        .any(|component| component == b"..")
+    {
+        return Err("The selected path is not inside the worktree.".into());
+    }
+    Ok(())
+}
+
+fn relative_entry_path(path_token: &str) -> Result<PathBuf, String> {
+    let relative = PathBuf::from(path_from_token(path_token)?);
+    if relative.as_os_str().is_empty() {
+        return Err("The selected change has no path on disk.".into());
+    }
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err("The selected path is not inside the worktree.".into());
+    }
+    Ok(relative)
 }
 
 fn choose_editor(preferred_id: Option<&str>, remote: bool) -> Result<ResolvedEditor, String> {
@@ -692,7 +832,7 @@ fn choose_terminal(preferred_id: Option<&str>) -> Result<ResolvedTerminal, Strin
         .ok_or_else(|| "No supported terminal was found on this computer.".into())
 }
 
-fn launch_local_editor(editor: &ResolvedEditor, path: &str) -> Result<(), String> {
+fn launch_local_editor(editor: &ResolvedEditor, path: &OsStr) -> Result<(), String> {
     match &editor.launcher {
         ResolvedLauncher::Executable(program) => {
             let args = editor_local_arguments(editor.definition, path);
@@ -706,7 +846,7 @@ fn launch_local_editor(editor: &ResolvedEditor, path: &str) -> Result<(), String
 fn launch_remote_editor(
     machine: &MachineProfile,
     editor: &ResolvedEditor,
-    path: &str,
+    path: &OsStr,
 ) -> Result<(), String> {
     let host = &machine
         .ssh
@@ -723,17 +863,17 @@ fn launch_remote_editor(
     let args = [
         OsString::from("--remote"),
         OsString::from(destination),
-        OsString::from(path),
+        path.to_os_string(),
     ];
     command::spawn_detached(program, args, None).map_err(|error| error.to_string())
 }
 
-fn editor_local_arguments(definition: &EditorDefinition, path: &str) -> Vec<OsString> {
+fn editor_local_arguments(definition: &EditorDefinition, path: &OsStr) -> Vec<OsString> {
     definition
         .base_args
         .iter()
         .map(OsString::from)
-        .chain(std::iter::once(OsString::from(path)))
+        .chain(std::iter::once(path.to_os_string()))
         .collect()
 }
 
@@ -753,7 +893,7 @@ fn launch_local_terminal(terminal: &ResolvedTerminal, path: &str) -> Result<(), 
                 .map_err(|error| error.to_string())
         }
         #[cfg(target_os = "macos")]
-        ResolvedLauncher::MacApplication(name) => launch_macos_application(name, path),
+        ResolvedLauncher::MacApplication(name) => launch_macos_application(name, OsStr::new(path)),
     }
 }
 
@@ -774,9 +914,14 @@ fn terminal_arguments(definition: &TerminalDefinition, path: &str) -> Vec<OsStri
 }
 
 #[cfg(target_os = "macos")]
-fn launch_macos_application(name: &str, path: &str) -> Result<(), String> {
+fn launch_macos_application(name: &str, path: &OsStr) -> Result<(), String> {
     let open = command::resolve_program("open").map_err(|error| error.to_string())?;
-    command::spawn_detached(&open, ["-a", name, path], None).map_err(|error| error.to_string())
+    let args = [
+        OsString::from("-a"),
+        OsString::from(name),
+        path.to_os_string(),
+    ];
+    command::spawn_detached(&open, &args, None).map_err(|error| error.to_string())
 }
 
 fn validate_path(path: &str, local: bool) -> Result<(), String> {
@@ -827,7 +972,7 @@ mod tests {
             .find(|editor| editor.id == "kiro")
             .expect("Kiro");
         assert_eq!(
-            editor_local_arguments(kiro, "/tmp/project with spaces"),
+            editor_local_arguments(kiro, OsStr::new("/tmp/project with spaces")),
             vec![
                 OsString::from("ide"),
                 OsString::from("/tmp/project with spaces")
@@ -857,6 +1002,90 @@ mod tests {
                 OsString::from("/tmp/project with spaces"),
             ]
         );
+    }
+
+    fn hex_token(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn working_copy_entry_paths_round_trip_exact_bytes_and_stay_inside_the_worktree() {
+        let directory = tempfile::tempdir().expect("temp worktree");
+        let worktree = directory.path().to_string_lossy().into_owned();
+
+        let name: &[u8] = b"plain file.txt";
+        std::fs::write(directory.path().join("plain file.txt"), "x").expect("write file");
+        let resolved = working_copy_entry_path(&worktree, &hex_token(name)).expect("resolve file");
+        assert_eq!(resolved, directory.path().join("plain file.txt"));
+
+        // Filesystems differ on whether non-UTF-8 names may exist (APFS refuses
+        // them), so byte exactness is asserted on the pure decode-and-join step.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw: &[u8] = b"caf\xc3\xa9-\xff.txt";
+            let relative = relative_entry_path(&hex_token(raw)).expect("decode odd bytes");
+            assert_eq!(relative.as_os_str(), &OsString::from_vec(raw.to_vec()));
+        }
+
+        assert!(working_copy_entry_path(&worktree, &hex_token(b"missing.txt")).is_err());
+        assert!(working_copy_entry_path(&worktree, &hex_token(b"../escape.txt")).is_err());
+        assert!(working_copy_entry_path(&worktree, &hex_token(b"")).is_err());
+    }
+
+    #[test]
+    fn remote_entry_paths_use_the_remote_platform_semantics() {
+        let posix = remote_working_copy_entry_path(
+            "/srv/project/",
+            &hex_token(b"src/main.rs"),
+            Some("linux"),
+        )
+        .expect("join posix path");
+        assert_eq!(posix, OsString::from("/srv/project/src/main.rs"));
+
+        // A backslash is an ordinary filename byte on a POSIX remote.
+        let with_backslash = remote_working_copy_entry_path(
+            "/srv/project",
+            &hex_token(b"weird\\name.txt"),
+            Some("linux"),
+        )
+        .expect("keep backslash filename");
+        assert_eq!(
+            with_backslash,
+            OsString::from("/srv/project/weird\\name.txt")
+        );
+
+        let windows = remote_working_copy_entry_path(
+            "C:\\repo\\",
+            &hex_token(b"src/main.rs"),
+            Some("windows"),
+        )
+        .expect("join windows path");
+        assert_eq!(windows, OsString::from("C:\\repo\\src\\main.rs"));
+
+        for token in [
+            &hex_token(b"../escape"),
+            &hex_token(b"..\\escape"),
+            &hex_token(b"a:b"),
+        ] {
+            assert!(remote_working_copy_entry_path("C:\\repo", token, Some("windows")).is_err());
+        }
+        assert!(remote_working_copy_entry_path(
+            "/srv/project",
+            &hex_token(b"../escape"),
+            Some("linux")
+        )
+        .is_err());
+
+        // Unknown platform: both interpretations must be safe.
+        assert!(
+            remote_working_copy_entry_path("/srv/project", &hex_token(b"..\\escape"), None)
+                .is_err()
+        );
+        let unknown =
+            remote_working_copy_entry_path("/srv/project", &hex_token(b"src/main.rs"), None)
+                .expect("join with unknown platform");
+        assert_eq!(unknown, OsString::from("/srv/project/src/main.rs"));
     }
 
     #[test]

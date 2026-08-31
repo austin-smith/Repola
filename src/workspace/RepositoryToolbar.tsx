@@ -26,6 +26,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { toast } from "@/components/ui/toast";
 import { TooltipButton } from "@/components/tooltip-button";
 import { toMessage } from "@/lib/errors";
+import { fileManagerName } from "../domain/platform";
 import { ActionableGitError } from "../components/ActionableGitError";
 import type { HistoryTarget } from "../dialogs/HistoryMutationDialog";
 import { formatMeasuredBytes, shortSha } from "../domain/format";
@@ -115,7 +116,7 @@ export function RepositoryToolbar({
                 <DropdownMenuContent align="start" className="min-w-56">
                   <DropdownMenuGroup>
                     <DropdownMenuLabel>{repository?.name ?? "Repository"}</DropdownMenuLabel>
-                    <DropdownMenuItem disabled={machineKind !== "local" || !repository} onClick={() => { if (repository) void revealWorktree(repository.path).catch((cause: unknown) => toast.add({ type: "error", title: "Could not reveal repository", description: toMessage(cause) })); }}><FolderOpenIcon aria-hidden="true" />Reveal in file manager</DropdownMenuItem>
+                    <DropdownMenuItem disabled={machineKind !== "local" || !repository} onClick={() => { if (repository) void revealWorktree(repository.path).catch((cause: unknown) => toast.add({ type: "error", title: `Could not show the repository in ${fileManagerName()}`, description: toMessage(cause) })); }}><FolderOpenIcon aria-hidden="true" />Show in {fileManagerName()}</DropdownMenuItem>
                   </DropdownMenuGroup>
                   <DropdownMenuSeparator />
                   <DropdownMenuGroup>

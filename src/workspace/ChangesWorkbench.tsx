@@ -2,6 +2,9 @@ import { Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, us
 import {
   AlertTriangleIcon,
   ArchiveIcon,
+  CopyIcon,
+  ExternalLinkIcon,
+  FolderOpenIcon,
   FileDiffIcon,
   FileMinusIcon,
   FilePenLineIcon,
@@ -19,6 +22,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from "@/components/ui/context-menu";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { FieldLabel } from "@/components/ui/field";
@@ -47,12 +51,16 @@ import {
   type CommitSelectionMap,
   type FileCommitSelection,
 } from "../domain/commit-selection";
+import { resolveAvailableToolId } from "../domain/external-tools";
+import { fileManagerName } from "../domain/platform";
 import { shortSha } from "../domain/format";
 import { SELECT_ALL_EVENT } from "../domain/select-all";
-import { loadAppPreferences } from "../ipc/app-preferences";
+import { usePathSeparator } from "../app/environment";
+import { loadAppPreferences, loadExternalTools, openFileInEditor } from "../ipc/app-preferences";
 import {
   commitWorkingCopy,
   discardAll,
+  showFileInFileManager,
   discardFile,
   fetchWorkingCopy,
   mutateRepositoryOperation,
@@ -80,7 +88,8 @@ function changeStatusIcon(change: FileChange) {
 }
 
 export function ChangesWorkbench() {
-  const { machineId, repository, worktree } = useWorkingCopy();
+  const { machineId, machineKind, machineOs, repository, worktree } = useWorkingCopy();
+  const separator = usePathSeparator();
   // File diffs are only meaningful for the snapshot they were loaded against,
   // so the cache is stored with the snapshot and replaced whenever it is.
   const [workingCopy, setWorkingCopy] = useState<{ snapshot: WorkingCopySnapshot | null; diffCache: Map<string, FileDiff> }>(() => ({ snapshot: null, diffCache: new Map() }));
@@ -190,13 +199,18 @@ export function ChangesWorkbench() {
     };
   }, [machineId, reloadSnapshot, worktree.path]);
 
+  const [editorLabel, setEditorLabel] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
-    void loadAppPreferences().then((preferences) => {
-      if (active) setSigning(preferences.defaultSignCommits ? "sign" : "default");
+    void Promise.all([loadAppPreferences(), loadExternalTools()]).then(([preferences, tools]) => {
+      if (!active) return;
+      setSigning(preferences.defaultSignCommits ? "sign" : "default");
+      const editors = machineKind === "local" ? tools.editors : tools.editors.filter((editor) => editor.supportsRemoteWorkspaces);
+      const editorId = resolveAvailableToolId(preferences.editorId, editors);
+      setEditorLabel(editors.find((editor) => editor.id === editorId)?.label ?? null);
     }).catch(() => undefined);
     return () => { active = false; };
-  }, [worktree.id]);
+  }, [machineKind, worktree.id]);
 
   const visibleChanges = useMemo(() => snapshot?.changes.filter((change) => !change.ignored) ?? [], [snapshot]);
   const normalizedFilter = changeFilter.trim().toLowerCase();
@@ -259,6 +273,29 @@ export function ChangesWorkbench() {
       current,
       new Set(selectedChanges.map((change) => change.id)),
       include,
+    ));
+  };
+
+  // Clipboard text only. Real file operations pass the exact Git path token to
+  // the backend, which joins it on the owning machine; SSH machines use POSIX
+  // separators regardless of the desktop platform.
+  const clipboardPath = (change: FileChange) => {
+    const machineSeparator = machineKind === "local" ? separator : machineOs === "windows" ? "\\" : "/";
+    return `${worktree.path.replace(/[\\/]+$/, "")}${machineSeparator}${change.path.display.split("/").join(machineSeparator)}`;
+  };
+  const copyText = (text: string) => {
+    void navigator.clipboard.writeText(text).catch((cause: unknown) => (
+      toast.add({ type: "error", title: "Could not copy to the clipboard", description: toMessage(cause) })
+    ));
+  };
+  const openChangeInEditor = (change: FileChange) => {
+    void openFileInEditor(machineId, worktree.path, change.path.token, machineOs).catch((cause: unknown) => (
+      toast.add({ type: "error", title: `Could not open ${editorLabel ?? "the editor"}`, description: toMessage(cause) })
+    ));
+  };
+  const showChangeInFileManager = (change: FileChange) => {
+    void showFileInFileManager(machineId, worktree.path, change.path.token).catch((cause: unknown) => (
+      toast.add({ type: "error", title: `Could not show the file in ${fileManagerName()}`, description: toMessage(cause) })
     ));
   };
 
@@ -533,7 +570,14 @@ export function ChangesWorkbench() {
           }}
         >
           {listedChanges.map((change) => (
-            <div key={change.id} className={cn("repola-windowed-row group/change flex min-h-7 [--windowed-row-size:28px] items-center hover:bg-accent/50", changeSelection.selectedIds.has(change.id) && "bg-accent hover:bg-accent")}>
+            <ContextMenu key={change.id}>
+              <ContextMenuTrigger
+                className={cn("repola-windowed-row group/change flex min-h-7 [--windowed-row-size:28px] items-center hover:bg-accent/50", changeSelection.selectedIds.has(change.id) && "bg-accent hover:bg-accent")}
+                onContextMenu={() => {
+                  // Right-clicking a row outside the selection acts on that row alone.
+                  if (!changeSelection.selectedIds.has(change.id)) setChangeSelection(singleChangeSelection(change.id));
+                }}
+              >
               <span className="grid w-9 shrink-0 place-items-center">
                 <Checkbox
                   checked={isIncludedInCommit(commitSelectionFor(commitSelections, change.id))}
@@ -580,7 +624,36 @@ export function ChangesWorkbench() {
                 ) : null}
                 {changeStatusIcon(change)}
               </button>
-            </div>
+              </ContextMenuTrigger>
+              <ContextMenuContent className="min-w-52">
+                <ContextMenuItem
+                  variant="destructive"
+                  disabled={busyPath !== null || commitBusy || change.conflicted || snapshot?.operation !== null}
+                  onClick={() => setPendingDiscard({ change, scope: change.unstaged || change.untracked ? "unstaged" : "all" })}
+                >
+                  <Trash2Icon aria-hidden="true" />
+                  Discard changes…
+                </ContextMenuItem>
+                <ContextMenuSeparator />
+                <ContextMenuItem onClick={() => copyText(clipboardPath(change))}>
+                  <CopyIcon aria-hidden="true" />
+                  Copy file path
+                </ContextMenuItem>
+                <ContextMenuItem onClick={() => copyText(change.path.display)}>
+                  <CopyIcon aria-hidden="true" />
+                  Copy relative path
+                </ContextMenuItem>
+                <ContextMenuSeparator />
+                <ContextMenuItem disabled={editorLabel === null || change.submodule || change.kind === "deleted"} onClick={() => openChangeInEditor(change)}>
+                  <ExternalLinkIcon aria-hidden="true" />
+                  Open in {editorLabel ?? "editor"}
+                </ContextMenuItem>
+                <ContextMenuItem disabled={machineKind !== "local" || change.kind === "deleted"} onClick={() => showChangeInFileManager(change)}>
+                  <FolderOpenIcon aria-hidden="true" />
+                  Show in {fileManagerName()}
+                </ContextMenuItem>
+              </ContextMenuContent>
+            </ContextMenu>
           ))}
           {visibleChanges.length > 0 && listedChanges.length === 0 ? (
             <p className="px-4 py-6 text-center text-sm text-muted-foreground">No changed files match “{changeFilter.trim()}”.</p>
@@ -644,13 +717,7 @@ export function ChangesWorkbench() {
             <strong className="block truncate text-sm">{selectedChange?.path.display ?? "Working copy"}</strong>
             {selectedChange?.previousPath ? <span className="block truncate text-xs text-muted-foreground">renamed from {selectedChange.previousPath.display}</span> : null}
           </div>
-          {selectedChange && !selectedChange.conflicted ? (
-            <Button variant="ghost" size="sm" className="ml-auto text-destructive" disabled={busyPath !== null} onClick={() => setPendingDiscard({ change: selectedChange, scope: selectedChange.unstaged || selectedChange.untracked ? "unstaged" : "all" })}>
-              <Trash2Icon data-icon="inline-start" aria-hidden="true" />
-              Discard…
-            </Button>
-          ) : null}
-          <Button variant="outline" size="sm" className={selectedChange && !selectedChange.conflicted ? "ml-2" : "ml-auto"} disabled={visibleChanges.length === 0} onClick={() => setDiffOpen(true)}>
+          <Button variant="outline" size="sm" className="ml-auto" disabled={visibleChanges.length === 0} onClick={() => setDiffOpen(true)}>
             <FileDiffIcon data-icon="inline-start" aria-hidden="true" />
             Review complete diff
           </Button>

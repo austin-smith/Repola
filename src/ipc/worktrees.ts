@@ -533,6 +533,12 @@ export function revealWorktree(path: string): Promise<void> {
   return revealItemInDir(path);
 }
 
+/** Show one changed file in the desktop file manager. The backend joins the
+ * exact path from the Git token; only valid for the local machine. */
+export function showFileInFileManager(machineId: string, worktreePath: string, pathToken: string): Promise<void> {
+  return invoke("show_file_in_file_manager", { machineId, worktreePath, pathToken });
+}
+
 export function openExternalUrl(url: string): Promise<void> {
   return openUrl(url);
 }

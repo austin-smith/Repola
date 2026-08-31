@@ -10,7 +10,7 @@
 - Revalidate a worktree immediately before executing a management action.
 - Preserve exact paths and pass command arguments without a shell.
 - Never guess, crawl, or hard-code user paths (no default search roots, no `~/Developer`). Register only repositories the user explicitly adds, clones, creates, or drops; report what is missing.
-- Keep every code path cross-platform (macOS, Windows, Linux): no platform-specific paths, labels, or process-spawning assumptions outside `cfg`-gated code.
+- Keep every code path cross-platform (macOS, Windows, Linux): no platform-specific paths or process-spawning assumptions outside `cfg`-gated code. User-facing labels should use the running platform's native terminology (Finder, File Explorer) when it is detected at runtime, with a generic fallback for other platforms.
 
 ## Architecture
 

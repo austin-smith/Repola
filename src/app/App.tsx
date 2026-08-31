@@ -405,14 +405,16 @@ function App() {
     ?? repositoryWorktrees[0]
     ?? null;
 
+  const selectedMachineOs = selectedMachine?.kind === "ssh" ? selectedConnection?.agent?.operatingSystem ?? null : null;
   const repositoryContext = useMemo<RepositoryContextValue>(() => ({
     machineId: selectedMachineId,
     machineKind: selectedMachine?.kind ?? "local",
+    machineOs: selectedMachineOs,
     repository: currentRepository,
     worktree: currentWorktree,
     refreshWorkspace,
     showChanges,
-  }), [currentRepository, currentWorktree, refreshWorkspace, selectedMachine?.kind, selectedMachineId, showChanges]);
+  }), [currentRepository, currentWorktree, refreshWorkspace, selectedMachine?.kind, selectedMachineId, selectedMachineOs, showChanges]);
 
   useEffect(() => {
     if (!workspaceContextHydrated) return;

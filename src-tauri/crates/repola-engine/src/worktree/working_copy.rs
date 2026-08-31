@@ -1541,7 +1541,15 @@ fn combined_output(stdout: &[u8], stderr: &[u8]) -> String {
 }
 
 pub(super) fn path_from_token(token: &str) -> Result<OsString, String> {
-    let bytes = decode_hex(token)?;
+    os_string_from_path_bytes(decode_path_token_bytes(token)?)
+}
+
+/// The exact bytes a path token encodes, without converting them to a host path.
+pub(super) fn decode_path_token_bytes(token: &str) -> Result<Vec<u8>, String> {
+    decode_hex(token)
+}
+
+pub(super) fn os_string_from_path_bytes(bytes: Vec<u8>) -> Result<OsString, String> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
