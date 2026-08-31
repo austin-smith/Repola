@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::command;
-use super::working_copy::{decode_path_token_bytes, os_string_from_path_bytes, path_from_token};
+use super::working_copy::{decode_path_token_bytes, path_from_token};
 use crate::machines::{MachineKind, MachineProfile};
 use crate::preferences::AppPreferences;
 
@@ -644,7 +644,7 @@ pub fn launch_worktree_tool(
         }
         (MachineKind::Ssh, WorktreeTool::Editor) => {
             let editor = choose_editor(preferences.editor_id.as_deref(), true)?;
-            launch_remote_editor(machine, &editor, OsStr::new(path))?;
+            launch_remote_editor(machine, &editor, path)?;
             Ok(format!(
                 "Opened {path} in {} through its SSH workspace support.",
                 editor.definition.label
@@ -686,13 +686,12 @@ pub fn open_file_in_editor(
             ))
         }
         MachineKind::Ssh => {
-            let path = remote_working_copy_entry_path(worktree_path, path_token, remote_os)?;
+            let entry = remote_working_copy_entry(worktree_path, path_token, remote_os)?;
             let editor = choose_editor(preferences.editor_id.as_deref(), true)?;
-            launch_remote_editor(machine, &editor, &path)?;
+            launch_remote_editor_file(machine, &editor, &entry.uri_path)?;
             Ok(format!(
                 "Opened {} in {} through its SSH workspace support.",
-                path.to_string_lossy(),
-                editor.definition.label
+                entry.display, editor.definition.label
             ))
         }
     }
@@ -727,15 +726,22 @@ fn remote_path_style(remote_os: Option<&str>) -> Option<RemotePathStyle> {
     })
 }
 
-/// The same join for a working copy on an SSH machine, performed with the
-/// remote platform's path semantics and never resolved against the desktop's
-/// filesystem. Git path tokens are repo-relative with `/` separators on every
-/// platform; on Windows remotes they are rewritten to `\`.
-fn remote_working_copy_entry_path(
+/// A changed entry on an SSH machine: the percent-encoded URI path that
+/// carries its exact bytes to the editor, and a human-readable form for
+/// messages. The join uses the remote platform's path semantics and is never
+/// resolved against the desktop's filesystem. Encoding to ASCII matters
+/// because a Windows desktop cannot pass arbitrary POSIX filename bytes
+/// through process arguments; a percent-encoded URI can carry any byte.
+struct RemoteWorkingCopyEntry {
+    uri_path: String,
+    display: String,
+}
+
+fn remote_working_copy_entry(
     worktree_path: &str,
     path_token: &str,
     remote_os: Option<&str>,
-) -> Result<OsString, String> {
+) -> Result<RemoteWorkingCopyEntry, String> {
     validate_path(worktree_path, false)?;
     let style = remote_path_style(remote_os);
     let relative = decode_path_token_bytes(path_token)?;
@@ -753,7 +759,38 @@ fn remote_working_copy_entry_path(
             .iter()
             .map(|&byte| if windows && byte == b'/' { b'\\' } else { byte }),
     );
-    os_string_from_path_bytes(joined)
+    let display = String::from_utf8_lossy(&joined).into_owned();
+    // URI paths always use forward slashes and a leading slash; Windows
+    // remotes appear as `/C:/path` in `vscode-remote://` URIs.
+    let mut uri_bytes = joined;
+    if windows {
+        for byte in &mut uri_bytes {
+            if *byte == b'\\' {
+                *byte = b'/';
+            }
+        }
+    }
+    let mut uri_path = String::with_capacity(uri_bytes.len() + 1);
+    if uri_bytes.first() != Some(&b'/') {
+        uri_path.push('/');
+    }
+    uri_path.push_str(&percent_encode_uri_path(&uri_bytes));
+    Ok(RemoteWorkingCopyEntry { uri_path, display })
+}
+
+/// RFC 3986 percent-encoding for a URI path: unreserved characters, `/`, and
+/// `:` (a valid path character, needed for Windows drive letters) pass
+/// through; every other byte is encoded, so the result is pure ASCII.
+fn percent_encode_uri_path(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/' | b':') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 /// Rejects tokens that would escape the worktree under the remote platform's
@@ -846,8 +883,36 @@ fn launch_local_editor(editor: &ResolvedEditor, path: &OsStr) -> Result<(), Stri
 fn launch_remote_editor(
     machine: &MachineProfile,
     editor: &ResolvedEditor,
-    path: &OsStr,
+    path: &str,
 ) -> Result<(), String> {
+    let (program, host) = remote_editor_launcher(machine, editor)?;
+    let destination = format!("ssh-remote+{host}");
+    let args = [
+        OsString::from("--remote"),
+        OsString::from(destination),
+        OsString::from(path),
+    ];
+    command::spawn_detached(program, args, None).map_err(|error| error.to_string())
+}
+
+/// Opens one remote file through a `vscode-remote://` URI. The percent-encoded
+/// URI is pure ASCII, so it survives process-argument encoding on every
+/// desktop platform, including Windows, where raw POSIX bytes cannot.
+fn launch_remote_editor_file(
+    machine: &MachineProfile,
+    editor: &ResolvedEditor,
+    uri_path: &str,
+) -> Result<(), String> {
+    let (program, host) = remote_editor_launcher(machine, editor)?;
+    let uri = format!("vscode-remote://ssh-remote+{host}{uri_path}");
+    let args = [OsString::from("--file-uri"), OsString::from(uri)];
+    command::spawn_detached(program, args, None).map_err(|error| error.to_string())
+}
+
+fn remote_editor_launcher<'a>(
+    machine: &'a MachineProfile,
+    editor: &'a ResolvedEditor,
+) -> Result<(&'a PathBuf, &'a str), String> {
     let host = &machine
         .ssh
         .as_ref()
@@ -859,13 +924,7 @@ fn launch_remote_editor(
             editor.definition.label
         )
     })?;
-    let destination = format!("ssh-remote+{host}");
-    let args = [
-        OsString::from("--remote"),
-        OsString::from(destination),
-        path.to_os_string(),
-    ];
-    command::spawn_detached(program, args, None).map_err(|error| error.to_string())
+    Ok((program, host))
 }
 
 fn editor_local_arguments(definition: &EditorDefinition, path: &OsStr) -> Vec<OsString> {
@@ -1034,58 +1093,48 @@ mod tests {
     }
 
     #[test]
-    fn remote_entry_paths_use_the_remote_platform_semantics() {
-        let posix = remote_working_copy_entry_path(
-            "/srv/project/",
-            &hex_token(b"src/main.rs"),
-            Some("linux"),
-        )
-        .expect("join posix path");
-        assert_eq!(posix, OsString::from("/srv/project/src/main.rs"));
+    fn remote_entries_encode_exact_bytes_with_the_remote_platform_semantics() {
+        let posix =
+            remote_working_copy_entry("/srv/project/", &hex_token(b"src/main.rs"), Some("linux"))
+                .expect("join posix path");
+        assert_eq!(posix.uri_path, "/srv/project/src/main.rs");
+        assert_eq!(posix.display, "/srv/project/src/main.rs");
 
-        // A backslash is an ordinary filename byte on a POSIX remote.
-        let with_backslash = remote_working_copy_entry_path(
+        // Non-UTF-8 and reserved bytes stay byte-exact through percent-encoding,
+        // and a backslash is an ordinary filename byte on a POSIX remote.
+        let odd = remote_working_copy_entry(
             "/srv/project",
-            &hex_token(b"weird\\name.txt"),
+            &hex_token(b"caf\xc3\xa9 \xffa\\b%.txt"),
             Some("linux"),
         )
-        .expect("keep backslash filename");
-        assert_eq!(
-            with_backslash,
-            OsString::from("/srv/project/weird\\name.txt")
-        );
+        .expect("encode odd bytes");
+        assert_eq!(odd.uri_path, "/srv/project/caf%C3%A9%20%FFa%5Cb%25.txt");
 
-        let windows = remote_working_copy_entry_path(
-            "C:\\repo\\",
-            &hex_token(b"src/main.rs"),
-            Some("windows"),
-        )
-        .expect("join windows path");
-        assert_eq!(windows, OsString::from("C:\\repo\\src\\main.rs"));
+        let windows =
+            remote_working_copy_entry("C:\\repo\\", &hex_token(b"src/main.rs"), Some("windows"))
+                .expect("join windows path");
+        assert_eq!(windows.uri_path, "/C:/repo/src/main.rs");
+        assert_eq!(windows.display, "C:\\repo\\src\\main.rs");
 
         for token in [
             &hex_token(b"../escape"),
             &hex_token(b"..\\escape"),
             &hex_token(b"a:b"),
         ] {
-            assert!(remote_working_copy_entry_path("C:\\repo", token, Some("windows")).is_err());
+            assert!(remote_working_copy_entry("C:\\repo", token, Some("windows")).is_err());
         }
-        assert!(remote_working_copy_entry_path(
-            "/srv/project",
-            &hex_token(b"../escape"),
-            Some("linux")
-        )
-        .is_err());
+        assert!(
+            remote_working_copy_entry("/srv/project", &hex_token(b"../escape"), Some("linux"))
+                .is_err()
+        );
 
         // Unknown platform: both interpretations must be safe.
         assert!(
-            remote_working_copy_entry_path("/srv/project", &hex_token(b"..\\escape"), None)
-                .is_err()
+            remote_working_copy_entry("/srv/project", &hex_token(b"..\\escape"), None).is_err()
         );
-        let unknown =
-            remote_working_copy_entry_path("/srv/project", &hex_token(b"src/main.rs"), None)
-                .expect("join with unknown platform");
-        assert_eq!(unknown, OsString::from("/srv/project/src/main.rs"));
+        let unknown = remote_working_copy_entry("/srv/project", &hex_token(b"src/main.rs"), None)
+            .expect("join with unknown platform");
+        assert_eq!(unknown.uri_path, "/srv/project/src/main.rs");
     }
 
     #[test]
