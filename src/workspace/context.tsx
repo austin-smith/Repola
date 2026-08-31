@@ -9,6 +9,8 @@ import type { MachineProfile, RepositorySummary, WorktreeRecord } from "../ipc/t
 export interface RepositoryContextValue {
   machineId: string;
   machineKind: MachineProfile["kind"];
+  /** The connected agent's operating system for SSH machines ("windows", "linux", ...); null when local or not yet known. */
+  machineOs: string | null;
   repository: RepositorySummary | null;
   worktree: WorktreeRecord | null;
   refreshWorkspace: () => Promise<void>;

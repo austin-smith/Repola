@@ -126,9 +126,9 @@ export function InlineFileDiff({
     && change.kind !== "renamed"
     && change.kind !== "copied";
   return (
-    <div className="flex min-h-full flex-col gap-3 p-3">
+    <div className="flex min-h-full flex-col">
       {diff.truncated ? (
-        <Alert variant="warning">
+        <Alert variant="warning" className="m-3">
           <AlertTriangleIcon aria-hidden="true" />
           <AlertDescription>This file diff exceeded 8 MiB and was truncated for display.</AlertDescription>
         </Alert>

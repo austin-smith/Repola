@@ -16,3 +16,7 @@ export function loadExternalTools(): Promise<ExternalToolAvailability> {
 export function launchWorktreeTool(machineId: string, path: string, tool: "editor" | "terminal"): Promise<string> {
   return invoke<string>("launch_worktree_tool", { machineId, path, tool });
 }
+
+export function openFileInEditor(machineId: string, worktreePath: string, pathToken: string, remoteOs: string | null): Promise<string> {
+  return invoke<string>("open_file_in_editor", { machineId, worktreePath, pathToken, remoteOs });
+}

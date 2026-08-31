@@ -2,9 +2,17 @@ import { Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, us
 import {
   AlertTriangleIcon,
   ArchiveIcon,
+  CopyIcon,
+  ExternalLinkIcon,
+  FolderOpenIcon,
   FileDiffIcon,
+  FileMinusIcon,
+  FilePenLineIcon,
+  FilePlusIcon,
+  FileSymlinkIcon,
   GitCommitIcon,
   RefreshCwIcon,
+  SearchIcon,
   Settings2Icon,
   ShieldCheckIcon,
   Trash2Icon,
@@ -14,10 +22,12 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from "@/components/ui/context-menu";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
@@ -41,12 +51,16 @@ import {
   type CommitSelectionMap,
   type FileCommitSelection,
 } from "../domain/commit-selection";
+import { resolveAvailableToolId } from "../domain/external-tools";
+import { fileManagerName } from "../domain/platform";
 import { shortSha } from "../domain/format";
 import { SELECT_ALL_EVENT } from "../domain/select-all";
-import { loadAppPreferences } from "../ipc/app-preferences";
+import { usePathSeparator } from "../app/environment";
+import { loadAppPreferences, loadExternalTools, openFileInEditor } from "../ipc/app-preferences";
 import {
   commitWorkingCopy,
   discardAll,
+  showFileInFileManager,
   discardFile,
   fetchWorkingCopy,
   mutateRepositoryOperation,
@@ -56,7 +70,7 @@ import {
   unwatchWorktree,
   watchWorktree,
 } from "../ipc/worktrees";
-import type { CommitSigning, ConflictResolutionKind, DiscardScope, FileDiff, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../ipc/types";
+import type { CommitSigning, ConflictResolutionKind, DiscardScope, FileChange, FileDiff, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../ipc/types";
 import { parseCommitPeople, parseCommitTrailers } from "./commit-form";
 import { useWorkingCopy } from "./context";
 import { sectionHeadingClass, signingItems } from "./labels";
@@ -64,8 +78,18 @@ import { LazyDialog } from "./LazyDialog";
 import { ConflictResolutionDialog, DiffDialog, InlineFileDiff } from "./lazy";
 import { operationGuidance, operationLabel, operationSupportsSkip } from "./operations";
 
+function changeStatusIcon(change: FileChange) {
+  const code = change.indexStatus !== "." ? change.indexStatus : change.worktreeStatus;
+  if (change.conflicted) return <AlertTriangleIcon className="size-3.5 shrink-0 text-destructive" role="img" aria-label="Conflicted" />;
+  if (change.untracked || code === "A" || code === "?") return <FilePlusIcon className="size-3.5 shrink-0 text-success" role="img" aria-label="Added" />;
+  if (code === "D") return <FileMinusIcon className="size-3.5 shrink-0 text-destructive" role="img" aria-label="Deleted" />;
+  if (code === "R" || code === "C") return <FileSymlinkIcon className="size-3.5 shrink-0 text-brand" role="img" aria-label="Renamed" />;
+  return <FilePenLineIcon className="size-3.5 shrink-0 text-warning" role="img" aria-label="Modified" />;
+}
+
 export function ChangesWorkbench() {
-  const { machineId, repository, worktree } = useWorkingCopy();
+  const { machineId, machineKind, machineOs, repository, worktree } = useWorkingCopy();
+  const separator = usePathSeparator();
   // File diffs are only meaningful for the snapshot they were loaded against,
   // so the cache is stored with the snapshot and replaced whenever it is.
   const [workingCopy, setWorkingCopy] = useState<{ snapshot: WorkingCopySnapshot | null; diffCache: Map<string, FileDiff> }>(() => ({ snapshot: null, diffCache: new Map() }));
@@ -93,6 +117,7 @@ export function ChangesWorkbench() {
   const [error, setError] = useState<string | null>(null);
   const [diffOpen, setDiffOpen] = useState(false);
   const [stashOpen, setStashOpen] = useState(false);
+  const [changeFilter, setChangeFilter] = useState("");
   const [pendingResolution, setPendingResolution] = useState<{
     kind: ConflictResolutionKind;
     change: WorkingCopySnapshot["changes"][number];
@@ -174,16 +199,25 @@ export function ChangesWorkbench() {
     };
   }, [machineId, reloadSnapshot, worktree.path]);
 
+  const [editorLabel, setEditorLabel] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
-    void loadAppPreferences().then((preferences) => {
-      if (active) setSigning(preferences.defaultSignCommits ? "sign" : "default");
+    void Promise.all([loadAppPreferences(), loadExternalTools()]).then(([preferences, tools]) => {
+      if (!active) return;
+      setSigning(preferences.defaultSignCommits ? "sign" : "default");
+      const editors = machineKind === "local" ? tools.editors : tools.editors.filter((editor) => editor.supportsRemoteWorkspaces);
+      const editorId = resolveAvailableToolId(preferences.editorId, editors);
+      setEditorLabel(editors.find((editor) => editor.id === editorId)?.label ?? null);
     }).catch(() => undefined);
     return () => { active = false; };
-  }, [worktree.id]);
+  }, [machineKind, worktree.id]);
 
   const visibleChanges = useMemo(() => snapshot?.changes.filter((change) => !change.ignored) ?? [], [snapshot]);
-  const visibleChangeIds = useMemo(() => visibleChanges.map((change) => change.id), [visibleChanges]);
+  const normalizedFilter = changeFilter.trim().toLowerCase();
+  const listedChanges = useMemo(() => (
+    normalizedFilter === "" ? visibleChanges : visibleChanges.filter((change) => change.path.display.toLowerCase().includes(normalizedFilter))
+  ), [visibleChanges, normalizedFilter]);
+  const listedChangeIds = useMemo(() => listedChanges.map((change) => change.id), [listedChanges]);
   const selectedChange = visibleChanges.find((change) => change.id === changeSelection.activeId) ?? null;
   // Only the diff body is expensive to build, so it alone follows the selection
   // at transition priority. The list highlight, the header, and every action
@@ -215,11 +249,11 @@ export function ChangesWorkbench() {
     const onSelectAll = (event: Event) => {
       event.preventDefault();
       changesListRef.current?.focus({ preventScroll: true });
-      setChangeSelection((current) => selectAllChanges(visibleChangeIds, current));
+      setChangeSelection((current) => selectAllChanges(listedChangeIds, current));
     };
     document.addEventListener(SELECT_ALL_EVENT, onSelectAll);
     return () => document.removeEventListener(SELECT_ALL_EVENT, onSelectAll);
-  }, [visibleChangeIds]);
+  }, [listedChangeIds]);
 
   useEffect(() => {
     if (!snapshot) return;
@@ -239,6 +273,29 @@ export function ChangesWorkbench() {
       current,
       new Set(selectedChanges.map((change) => change.id)),
       include,
+    ));
+  };
+
+  // Clipboard text only. Real file operations pass the exact Git path token to
+  // the backend, which joins it on the owning machine; SSH machines use POSIX
+  // separators regardless of the desktop platform.
+  const clipboardPath = (change: FileChange) => {
+    const machineSeparator = machineKind === "local" ? separator : machineOs === "windows" ? "\\" : "/";
+    return `${worktree.path.replace(/[\\/]+$/, "")}${machineSeparator}${change.path.display.split("/").join(machineSeparator)}`;
+  };
+  const copyText = (text: string) => {
+    void navigator.clipboard.writeText(text).catch((cause: unknown) => (
+      toast.add({ type: "error", title: "Could not copy to the clipboard", description: toMessage(cause) })
+    ));
+  };
+  const openChangeInEditor = (change: FileChange) => {
+    void openFileInEditor(machineId, worktree.path, change.path.token, machineOs).catch((cause: unknown) => (
+      toast.add({ type: "error", title: `Could not open ${editorLabel ?? "the editor"}`, description: toMessage(cause) })
+    ));
+  };
+  const showChangeInFileManager = (change: FileChange) => {
+    void showFileInFileManager(machineId, worktree.path, change.path.token).catch((cause: unknown) => (
+      toast.add({ type: "error", title: `Could not show the file in ${fileManagerName()}`, description: toMessage(cause) })
     ));
   };
 
@@ -445,6 +502,18 @@ export function ChangesWorkbench() {
             <Button variant="destructive" size="sm" className="ml-2" disabled={syncBusy || snapshot.operation !== null} onClick={() => setPendingForcePush(true)}>Force…</Button>
           ) : null}
         </div>
+        <div className="shrink-0 border-b px-3 py-2">
+          <InputGroup className="h-7">
+            <InputGroupAddon><SearchIcon aria-hidden="true" /></InputGroupAddon>
+            <InputGroupInput
+              value={changeFilter}
+              onChange={(event) => setChangeFilter(event.currentTarget.value)}
+              placeholder="Filter changed files"
+              aria-label="Filter changed files"
+              className="text-[0.8rem]"
+            />
+          </InputGroup>
+        </div>
         {snapshot?.operation ? (
           <div className="border-b bg-warning/10 px-4 py-3">
             <div className="flex items-start gap-3">
@@ -480,10 +549,10 @@ export function ChangesWorkbench() {
           tabIndex={-1}
           aria-keyshortcuts="Meta+A Control+A Space ArrowUp ArrowDown Home End"
           onKeyDown={(event) => {
-            const arrowTarget = arrowKeyChangeTarget(visibleChangeIds, changeSelection, event);
+            const arrowTarget = arrowKeyChangeTarget(listedChangeIds, changeSelection, event);
             if (arrowTarget !== null) {
               event.preventDefault();
-              setChangeSelection((current) => updateChangeSelection(visibleChangeIds, current, arrowTarget, { additive: false, range: event.shiftKey }));
+              setChangeSelection((current) => updateChangeSelection(listedChangeIds, current, arrowTarget, { additive: false, range: event.shiftKey }));
               const row = event.currentTarget.querySelector<HTMLElement>(`[data-change-id="${CSS.escape(arrowTarget)}"]`);
               row?.focus({ preventScroll: true });
               row?.scrollIntoView({ block: "nearest" });
@@ -491,7 +560,7 @@ export function ChangesWorkbench() {
             }
             if (isSelectAllChangesShortcut(event)) {
               event.preventDefault();
-              setChangeSelection((current) => selectAllChanges(visibleChangeIds, current));
+              setChangeSelection((current) => selectAllChanges(listedChangeIds, current));
               return;
             }
             if (!isToggleSelectedChangesShortcut(event)) return;
@@ -500,9 +569,16 @@ export function ChangesWorkbench() {
             toggleSelectedCommitInclusion();
           }}
         >
-          {visibleChanges.map((change) => (
-            <div key={change.id} className={cn("repola-windowed-row flex min-h-8 [--windowed-row-size:32px] items-center border-b", changeSelection.selectedIds.has(change.id) && "bg-accent")}>
-              <span className="grid w-11 shrink-0 place-items-center">
+          {listedChanges.map((change) => (
+            <ContextMenu key={change.id}>
+              <ContextMenuTrigger
+                className={cn("repola-windowed-row group/change flex min-h-7 [--windowed-row-size:28px] items-center hover:bg-accent/50", changeSelection.selectedIds.has(change.id) && "bg-accent hover:bg-accent")}
+                onContextMenu={() => {
+                  // Right-clicking a row outside the selection acts on that row alone.
+                  if (!changeSelection.selectedIds.has(change.id)) setChangeSelection(singleChangeSelection(change.id));
+                }}
+              >
+              <span className="grid w-9 shrink-0 place-items-center">
                 <Checkbox
                   checked={isIncludedInCommit(commitSelectionFor(commitSelections, change.id))}
                   indeterminate={commitSelectionFor(commitSelections, change.id).kind === "partial"}
@@ -517,7 +593,7 @@ export function ChangesWorkbench() {
               </span>
               <button
                 type="button"
-                className="flex min-w-0 flex-1 items-center gap-2 self-stretch pr-3 text-left"
+                className="flex min-w-0 flex-1 items-center gap-2 self-stretch pr-2.5 text-left"
                 data-change-id={change.id}
                 aria-pressed={changeSelection.selectedIds.has(change.id)}
                 onClick={(event) => {
@@ -526,17 +602,17 @@ export function ChangesWorkbench() {
                   // command target so Edit > Select All and Cmd+A reach this list.
                   event.currentTarget.focus({ preventScroll: true });
                   setChangeSelection((current) => updateChangeSelection(
-                    visibleChangeIds,
+                    listedChangeIds,
                     current,
                     change.id,
                     { additive: event.metaKey || event.ctrlKey, range: event.shiftKey },
                   ));
                 }}
               >
-                <span className={cn("w-5 shrink-0 text-center font-mono text-xs font-medium", change.conflicted ? "text-destructive" : "text-brand")}>
-                  {change.conflicted ? "!" : change.indexStatus !== "." ? change.indexStatus : change.worktreeStatus}
+                <span className="flex min-w-0 flex-1 items-baseline text-[0.8rem]" title={change.path.display}>
+                  <span className="min-w-0 shrink truncate text-muted-foreground">{change.path.display.slice(0, change.path.display.search(/[^\\/]*$/))}</span>
+                  <span className="shrink-0 whitespace-nowrap text-foreground">{change.path.display.split(/[\\/]/).pop()}</span>
                 </span>
-                <span className="min-w-0 flex-1 truncate text-sm" title={change.path.display}><span className="text-muted-foreground">{change.path.display.slice(0, change.path.display.search(/[^\\/]*$/))}</span><span className="text-foreground">{change.path.display.split(/[\\/]/).pop()}</span></span>
                 {change.submodule ? <Badge variant="outline">submodule</Badge> : null}
                 {change.modeChange === "executableBit" ? <Badge variant="outline">executable bit</Badge> : null}
                 {change.modeChange === "symlink" ? <Badge variant="outline">symlink</Badge> : null}
@@ -546,9 +622,42 @@ export function ChangesWorkbench() {
                     <TooltipContent>{[change.headMode, change.indexMode, change.worktreeMode].filter(Boolean).join(" → ")}</TooltipContent>
                   </Tooltip>
                 ) : null}
+                {changeStatusIcon(change)}
               </button>
-            </div>
+              </ContextMenuTrigger>
+              <ContextMenuContent className="min-w-52">
+                <ContextMenuItem
+                  variant="destructive"
+                  disabled={busyPath !== null || commitBusy || change.conflicted || snapshot?.operation !== null}
+                  onClick={() => setPendingDiscard({ change, scope: change.unstaged || change.untracked ? "unstaged" : "all" })}
+                >
+                  <Trash2Icon aria-hidden="true" />
+                  Discard changes…
+                </ContextMenuItem>
+                <ContextMenuSeparator />
+                <ContextMenuItem onClick={() => copyText(clipboardPath(change))}>
+                  <CopyIcon aria-hidden="true" />
+                  Copy file path
+                </ContextMenuItem>
+                <ContextMenuItem onClick={() => copyText(change.path.display)}>
+                  <CopyIcon aria-hidden="true" />
+                  Copy relative path
+                </ContextMenuItem>
+                <ContextMenuSeparator />
+                <ContextMenuItem disabled={editorLabel === null || change.submodule || change.kind === "deleted"} onClick={() => openChangeInEditor(change)}>
+                  <ExternalLinkIcon aria-hidden="true" />
+                  Open in {editorLabel ?? "editor"}
+                </ContextMenuItem>
+                <ContextMenuItem disabled={machineKind !== "local" || change.kind === "deleted"} onClick={() => showChangeInFileManager(change)}>
+                  <FolderOpenIcon aria-hidden="true" />
+                  Show in {fileManagerName()}
+                </ContextMenuItem>
+              </ContextMenuContent>
+            </ContextMenu>
           ))}
+          {visibleChanges.length > 0 && listedChanges.length === 0 ? (
+            <p className="px-4 py-6 text-center text-sm text-muted-foreground">No changed files match “{changeFilter.trim()}”.</p>
+          ) : null}
           {visibleChanges.length === 0 ? (
             <Empty className="h-full py-12">
               <EmptyHeader>
@@ -608,13 +717,7 @@ export function ChangesWorkbench() {
             <strong className="block truncate text-sm">{selectedChange?.path.display ?? "Working copy"}</strong>
             {selectedChange?.previousPath ? <span className="block truncate text-xs text-muted-foreground">renamed from {selectedChange.previousPath.display}</span> : null}
           </div>
-          {selectedChange && !selectedChange.conflicted ? (
-            <Button variant="ghost" size="sm" className="ml-auto text-destructive" disabled={busyPath !== null} onClick={() => setPendingDiscard({ change: selectedChange, scope: selectedChange.unstaged || selectedChange.untracked ? "unstaged" : "all" })}>
-              <Trash2Icon data-icon="inline-start" aria-hidden="true" />
-              Discard…
-            </Button>
-          ) : null}
-          <Button variant="outline" size="sm" className={selectedChange && !selectedChange.conflicted ? "ml-2" : "ml-auto"} disabled={visibleChanges.length === 0} onClick={() => setDiffOpen(true)}>
+          <Button variant="outline" size="sm" className="ml-auto" disabled={visibleChanges.length === 0} onClick={() => setDiffOpen(true)}>
             <FileDiffIcon data-icon="inline-start" aria-hidden="true" />
             Review complete diff
           </Button>
