@@ -38,6 +38,9 @@ pub fn working_copy_snapshot(request: WorkingCopyRequest) -> Result<WorkingCopyS
         return Err("The selected worktree does not belong to the selected repository.".into());
     }
 
+    // Captured before `git status` runs so any write that lands while the
+    // snapshot is being taken counts as racy when stamping below.
+    let snapshot_start = std::time::SystemTime::now();
     // Ignored files are intentionally not requested; the parser still accepts
     // `!` records so the `ignored` guards below stay correct if they ever appear.
     let output = command::git_at(
@@ -55,7 +58,7 @@ pub fn working_copy_snapshot(request: WorkingCopyRequest) -> Result<WorkingCopyS
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     let mut snapshot = parse_status(&output.stdout)?;
-    stamp_worktree_entries(&worktree, &mut snapshot.changes);
+    stamp_worktree_entries(&worktree, snapshot_start, &mut snapshot.changes);
     snapshot.repository_path = repository.to_string_lossy().into_owned();
     snapshot.worktree_path = worktree.to_string_lossy().into_owned();
     snapshot.remote = resolve_remote(&worktree, snapshot.branch.as_deref());
@@ -1855,18 +1858,34 @@ fn change(
     }
 }
 
+/// The mtime granularity we must assume across supported filesystems (FAT
+/// rounds to 2 seconds); a file whose mtime falls within one tick of the
+/// snapshot could be rewritten again without the stamp seeing it.
+const RACY_STAMP_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+
+static RACY_STAMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Records each entry's on-disk identity — the same file type, size, and
 /// mtime signals Git's own index uses to decide whether a file is dirty — so
 /// two snapshots that agree on a stamp are known to describe the same
 /// content. Status output alone cannot carry this: a file edited twice stays
 /// `M` while its diff changes.
-fn stamp_worktree_entries(worktree: &Path, changes: &mut [FileChange]) {
+///
+/// Entries modified within one timestamp tick of the snapshot get a stamp
+/// that never repeats (Git calls this window "racy"): a coarse filesystem
+/// clock could hide a second same-size write there, so such entries always
+/// reload until their mtime settles behind the tick.
+fn stamp_worktree_entries(
+    worktree: &Path,
+    snapshot_start: std::time::SystemTime,
+    changes: &mut [FileChange],
+) {
     for change in changes {
-        change.worktree_stamp = Some(worktree_stamp(worktree, &change.path.token));
+        change.worktree_stamp = Some(worktree_stamp(worktree, snapshot_start, &change.path.token));
     }
 }
 
-fn worktree_stamp(worktree: &Path, token: &str) -> String {
+fn worktree_stamp(worktree: &Path, snapshot_start: std::time::SystemTime, token: &str) -> String {
     // Tokens come from this snapshot's own `git status` output, so they are
     // always relative paths inside the worktree.
     let Ok(relative) = path_from_token(token) else {
@@ -1882,9 +1901,19 @@ fn worktree_stamp(worktree: &Path, token: &str) -> String {
             } else {
                 'f'
             };
-            let mtime = metadata
-                .modified()
-                .ok()
+            let modified = metadata.modified().ok();
+            let racy = modified.is_none_or(|time| {
+                snapshot_start
+                    .duration_since(time)
+                    .map(|elapsed| elapsed < RACY_STAMP_TICK)
+                    .unwrap_or(true)
+            });
+            if racy {
+                let sequence =
+                    RACY_STAMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return format!("racy:{sequence}");
+            }
+            let mtime = modified
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|duration| format!("{}.{:09}", duration.as_secs(), duration.subsec_nanos()))
                 .unwrap_or_else(|| "unknown".into());
@@ -2096,6 +2125,8 @@ mod tests {
         command::successful_git_at(repository.path(), ["commit", "-m", "base"]).expect("commit");
         std::fs::write(repository.path().join("kept.txt"), "kept edited\n").expect("edit");
         std::fs::remove_file(repository.path().join("gone.txt")).expect("delete");
+        // Settle the mtime behind the racy window so the stamp is comparable.
+        backdate(&repository.path().join("kept.txt"));
 
         let first = working_copy_snapshot(request(repository.path())).expect("first snapshot");
         let second = working_copy_snapshot(request(repository.path())).expect("second snapshot");
@@ -2119,8 +2150,29 @@ mod tests {
         assert_eq!(stamp(&first, "kept.txt"), stamp(&second, "kept.txt"));
 
         std::fs::write(repository.path().join("kept.txt"), "kept edited again\n").expect("edit");
+        backdate(&repository.path().join("kept.txt"));
         let third = working_copy_snapshot(request(repository.path())).expect("third snapshot");
         assert_ne!(stamp(&second, "kept.txt"), stamp(&third, "kept.txt"));
+
+        // A write inside the snapshot's own timestamp tick could be followed
+        // by another same-size write the stamp cannot see, so it must never
+        // produce a repeatable identity.
+        std::fs::write(repository.path().join("kept.txt"), "kept racy edit 1\n").expect("edit");
+        let racy = working_copy_snapshot(request(repository.path())).expect("racy snapshot");
+        let racy_again = working_copy_snapshot(request(repository.path())).expect("racy again");
+        assert!(stamp(&racy, "kept.txt").starts_with("racy:"));
+        assert_ne!(stamp(&racy, "kept.txt"), stamp(&racy_again, "kept.txt"));
+    }
+
+    /// Moves a file's mtime behind the racy-stamp window, as time passing
+    /// would, so tests need not sleep through real filesystem ticks.
+    fn backdate(path: &Path) {
+        let file = fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for backdating");
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .expect("backdate mtime");
     }
 
     #[test]
