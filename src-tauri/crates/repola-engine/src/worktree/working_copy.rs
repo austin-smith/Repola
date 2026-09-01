@@ -38,6 +38,9 @@ pub fn working_copy_snapshot(request: WorkingCopyRequest) -> Result<WorkingCopyS
         return Err("The selected worktree does not belong to the selected repository.".into());
     }
 
+    // Captured before `git status` runs so any write that lands while the
+    // snapshot is being taken counts as racy when stamping below.
+    let snapshot_start = std::time::SystemTime::now();
     // Ignored files are intentionally not requested; the parser still accepts
     // `!` records so the `ignored` guards below stay correct if they ever appear.
     let output = command::git_at(
@@ -55,6 +58,7 @@ pub fn working_copy_snapshot(request: WorkingCopyRequest) -> Result<WorkingCopyS
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     let mut snapshot = parse_status(&output.stdout)?;
+    stamp_worktree_entries(&worktree, snapshot_start, &mut snapshot.changes);
     snapshot.repository_path = repository.to_string_lossy().into_owned();
     snapshot.worktree_path = worktree.to_string_lossy().into_owned();
     snapshot.remote = resolve_remote(&worktree, snapshot.branch.as_deref());
@@ -1720,7 +1724,10 @@ fn parse_ordinary(field: &[u8]) -> Result<FileChange, String> {
         index_status,
         worktree_status,
         parts[2] != b"N...",
-        Some((parts[3], parts[4], parts[5])),
+        Some(TrackedSides {
+            modes: (parts[3], parts[4], parts[5]),
+            oids: (parts[6], parts[7]),
+        }),
     ))
 }
 
@@ -1740,7 +1747,10 @@ fn parse_rename(field: &[u8], previous: &[u8]) -> Result<FileChange, String> {
         index_status,
         worktree_status,
         parts[2] != b"N...",
-        Some((parts[3], parts[4], parts[5])),
+        Some(TrackedSides {
+            modes: (parts[3], parts[4], parts[5]),
+            oids: (parts[6], parts[7]),
+        }),
     ))
 }
 
@@ -1781,6 +1791,13 @@ fn simple_change(path: &[u8], kind: FileChangeKind, index: char, worktree: char)
     change(path, None, kind, index, worktree, false, None)
 }
 
+/// The mode and object-id columns porcelain v2 reports for tracked records;
+/// untracked, ignored, and unmerged records carry neither.
+struct TrackedSides<'a> {
+    modes: (&'a [u8], &'a [u8], &'a [u8]),
+    oids: (&'a [u8], &'a [u8]),
+}
+
 fn change(
     path: &[u8],
     previous: Option<&[u8]>,
@@ -1788,11 +1805,13 @@ fn change(
     index_status: char,
     worktree_status: char,
     submodule: bool,
-    modes: Option<(&[u8], &[u8], &[u8])>,
+    tracked: Option<TrackedSides>,
 ) -> FileChange {
     let path = git_path(path);
-    let (head_mode, index_mode, worktree_mode, mode_change) = modes
-        .map(|(head, index, worktree)| {
+    let (head_mode, index_mode, worktree_mode, mode_change) = tracked
+        .as_ref()
+        .map(|sides| {
+            let (head, index, worktree) = sides.modes;
             let head = String::from_utf8_lossy(head).into_owned();
             let index = String::from_utf8_lossy(index).into_owned();
             let worktree = String::from_utf8_lossy(worktree).into_owned();
@@ -1806,6 +1825,14 @@ fn change(
             (Some(head), Some(index), Some(worktree), changed)
         })
         .unwrap_or((None, None, None, None));
+    let (head_oid, index_oid) = tracked
+        .map(|sides| {
+            (
+                Some(String::from_utf8_lossy(sides.oids.0).into_owned()),
+                Some(String::from_utf8_lossy(sides.oids.1).into_owned()),
+            )
+        })
+        .unwrap_or((None, None));
     FileChange {
         id: path.token.clone(),
         path,
@@ -1823,6 +1850,76 @@ fn change(
         index_mode,
         worktree_mode,
         mode_change,
+        head_oid,
+        index_oid,
+        // Filled by `working_copy_snapshot` once the worktree root is known;
+        // the parser alone cannot stat anything.
+        worktree_stamp: None,
+    }
+}
+
+/// The mtime granularity we must assume across supported filesystems (FAT
+/// rounds to 2 seconds); a file whose mtime falls within one tick of the
+/// snapshot could be rewritten again without the stamp seeing it.
+const RACY_STAMP_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+
+static RACY_STAMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Records each entry's on-disk identity — the same file type, size, and
+/// mtime signals Git's own index uses to decide whether a file is dirty — so
+/// two snapshots that agree on a stamp are known to describe the same
+/// content. Status output alone cannot carry this: a file edited twice stays
+/// `M` while its diff changes.
+///
+/// Entries modified within one timestamp tick of the snapshot get a stamp
+/// that never repeats (Git calls this window "racy"): a coarse filesystem
+/// clock could hide a second same-size write there, so such entries always
+/// reload until their mtime settles behind the tick.
+fn stamp_worktree_entries(
+    worktree: &Path,
+    snapshot_start: std::time::SystemTime,
+    changes: &mut [FileChange],
+) {
+    for change in changes {
+        change.worktree_stamp = Some(worktree_stamp(worktree, snapshot_start, &change.path.token));
+    }
+}
+
+fn worktree_stamp(worktree: &Path, snapshot_start: std::time::SystemTime, token: &str) -> String {
+    // Tokens come from this snapshot's own `git status` output, so they are
+    // always relative paths inside the worktree.
+    let Ok(relative) = path_from_token(token) else {
+        return "absent".into();
+    };
+    match fs::symlink_metadata(worktree.join(relative)) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            let kind = if file_type.is_symlink() {
+                'l'
+            } else if file_type.is_dir() {
+                'd'
+            } else {
+                'f'
+            };
+            let modified = metadata.modified().ok();
+            let racy = modified.is_none_or(|time| {
+                snapshot_start
+                    .duration_since(time)
+                    .map(|elapsed| elapsed < RACY_STAMP_TICK)
+                    .unwrap_or(true)
+            });
+            if racy {
+                let sequence =
+                    RACY_STAMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return format!("racy:{sequence}");
+            }
+            let mtime = modified
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| format!("{}.{:09}", duration.as_secs(), duration.subsec_nanos()))
+                .unwrap_or_else(|| "unknown".into());
+            format!("{kind}:{}:{mtime}", metadata.len())
+        }
+        Err(_) => "absent".into(),
     }
 }
 
@@ -1987,6 +2084,27 @@ mod tests {
                 .map(|path| path.display.as_str()),
             Some("old.txt")
         );
+        assert_eq!(renamed.head_oid.as_deref(), Some("abc"));
+        assert_eq!(renamed.index_oid.as_deref(), Some("def"));
+        let staged = snapshot
+            .changes
+            .iter()
+            .find(|change| change.path.display == "staged.txt")
+            .expect("ordinary record");
+        assert_eq!(staged.head_oid.as_deref(), Some("abc"));
+        assert_eq!(staged.index_oid.as_deref(), Some("def"));
+        let untracked = snapshot
+            .changes
+            .iter()
+            .find(|change| change.untracked)
+            .expect("untracked record");
+        assert_eq!(untracked.head_oid, None);
+        assert_eq!(untracked.index_oid, None);
+        // The parser never stats anything; stamps belong to the snapshot step.
+        assert!(snapshot
+            .changes
+            .iter()
+            .all(|change| change.worktree_stamp.is_none()));
         assert!(snapshot.changes.iter().any(|change| change.conflicted));
         assert!(snapshot
             .changes
@@ -1996,6 +2114,65 @@ mod tests {
             .changes
             .iter()
             .any(|change| change.mode_change == Some(FileModeChange::Symlink)));
+    }
+
+    #[test]
+    fn snapshots_carry_a_content_stamp_that_is_stable_until_the_file_changes() {
+        let repository = repository();
+        std::fs::write(repository.path().join("kept.txt"), "kept\n").expect("kept");
+        std::fs::write(repository.path().join("gone.txt"), "gone\n").expect("gone");
+        command::successful_git_at(repository.path(), ["add", "--all"]).expect("stage");
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).expect("commit");
+        std::fs::write(repository.path().join("kept.txt"), "kept edited\n").expect("edit");
+        std::fs::remove_file(repository.path().join("gone.txt")).expect("delete");
+        // Settle the mtime behind the racy window so the stamp is comparable.
+        backdate(&repository.path().join("kept.txt"));
+
+        let first = working_copy_snapshot(request(repository.path())).expect("first snapshot");
+        let second = working_copy_snapshot(request(repository.path())).expect("second snapshot");
+        assert!(first
+            .changes
+            .iter()
+            .all(|change| change.worktree_stamp.is_some()));
+        let stamp = |snapshot: &WorkingCopySnapshot, path: &str| {
+            snapshot
+                .changes
+                .iter()
+                .find(|change| change.path.display == path)
+                .expect("change present")
+                .worktree_stamp
+                .clone()
+                .expect("stamped")
+        };
+        assert_eq!(stamp(&first, "gone.txt"), "absent");
+        // Nothing touched the file between snapshots, so its identity holds
+        // and a cached diff for it is proven still valid.
+        assert_eq!(stamp(&first, "kept.txt"), stamp(&second, "kept.txt"));
+
+        std::fs::write(repository.path().join("kept.txt"), "kept edited again\n").expect("edit");
+        backdate(&repository.path().join("kept.txt"));
+        let third = working_copy_snapshot(request(repository.path())).expect("third snapshot");
+        assert_ne!(stamp(&second, "kept.txt"), stamp(&third, "kept.txt"));
+
+        // A write inside the snapshot's own timestamp tick could be followed
+        // by another same-size write the stamp cannot see, so it must never
+        // produce a repeatable identity.
+        std::fs::write(repository.path().join("kept.txt"), "kept racy edit 1\n").expect("edit");
+        let racy = working_copy_snapshot(request(repository.path())).expect("racy snapshot");
+        let racy_again = working_copy_snapshot(request(repository.path())).expect("racy again");
+        assert!(stamp(&racy, "kept.txt").starts_with("racy:"));
+        assert_ne!(stamp(&racy, "kept.txt"), stamp(&racy_again, "kept.txt"));
+    }
+
+    /// Moves a file's mtime behind the racy-stamp window, as time passing
+    /// would, so tests need not sleep through real filesystem ticks.
+    fn backdate(path: &Path) {
+        let file = fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for backdating");
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .expect("backdate mtime");
     }
 
     #[test]

@@ -460,6 +460,18 @@ pub struct FileChange {
     pub index_mode: Option<String>,
     pub worktree_mode: Option<String>,
     pub mode_change: Option<FileModeChange>,
+    /// Object IDs reported by porcelain v2 (`None` for records without them,
+    /// e.g. untracked and unmerged entries) and a stat stamp of the entry on
+    /// disk. Together they identify the change's content, so a diff loaded
+    /// for one snapshot can be proven still valid in the next. All three
+    /// default to `None` when an older agent omits them, which callers must
+    /// read as "content identity unknown".
+    #[serde(default)]
+    pub head_oid: Option<String>,
+    #[serde(default)]
+    pub index_oid: Option<String>,
+    #[serde(default)]
+    pub worktree_stamp: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

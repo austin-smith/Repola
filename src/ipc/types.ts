@@ -311,6 +311,15 @@ export interface FileChange {
   indexMode: string | null;
   worktreeMode: string | null;
   modeChange: FileModeChange | null;
+  /**
+   * Content identity: the HEAD/index object IDs from porcelain v2 (null for
+   * records without them, e.g. untracked and unmerged entries) and a stat
+   * stamp of the entry on disk. Older agents omit all three, so `undefined`
+   * (as opposed to null) means the content identity is unknown.
+   */
+  headOid?: string | null;
+  indexOid?: string | null;
+  worktreeStamp?: string | null;
 }
 
 export type ConflictResolutionKind = "ours" | "theirs" | "both" | "manual" | "markResolved" | "remove";
