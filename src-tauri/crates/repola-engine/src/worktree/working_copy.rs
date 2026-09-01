@@ -55,6 +55,7 @@ pub fn working_copy_snapshot(request: WorkingCopyRequest) -> Result<WorkingCopyS
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     let mut snapshot = parse_status(&output.stdout)?;
+    stamp_worktree_entries(&worktree, &mut snapshot.changes);
     snapshot.repository_path = repository.to_string_lossy().into_owned();
     snapshot.worktree_path = worktree.to_string_lossy().into_owned();
     snapshot.remote = resolve_remote(&worktree, snapshot.branch.as_deref());
@@ -1720,7 +1721,10 @@ fn parse_ordinary(field: &[u8]) -> Result<FileChange, String> {
         index_status,
         worktree_status,
         parts[2] != b"N...",
-        Some((parts[3], parts[4], parts[5])),
+        Some(TrackedSides {
+            modes: (parts[3], parts[4], parts[5]),
+            oids: (parts[6], parts[7]),
+        }),
     ))
 }
 
@@ -1740,7 +1744,10 @@ fn parse_rename(field: &[u8], previous: &[u8]) -> Result<FileChange, String> {
         index_status,
         worktree_status,
         parts[2] != b"N...",
-        Some((parts[3], parts[4], parts[5])),
+        Some(TrackedSides {
+            modes: (parts[3], parts[4], parts[5]),
+            oids: (parts[6], parts[7]),
+        }),
     ))
 }
 
@@ -1781,6 +1788,13 @@ fn simple_change(path: &[u8], kind: FileChangeKind, index: char, worktree: char)
     change(path, None, kind, index, worktree, false, None)
 }
 
+/// The mode and object-id columns porcelain v2 reports for tracked records;
+/// untracked, ignored, and unmerged records carry neither.
+struct TrackedSides<'a> {
+    modes: (&'a [u8], &'a [u8], &'a [u8]),
+    oids: (&'a [u8], &'a [u8]),
+}
+
 fn change(
     path: &[u8],
     previous: Option<&[u8]>,
@@ -1788,11 +1802,13 @@ fn change(
     index_status: char,
     worktree_status: char,
     submodule: bool,
-    modes: Option<(&[u8], &[u8], &[u8])>,
+    tracked: Option<TrackedSides>,
 ) -> FileChange {
     let path = git_path(path);
-    let (head_mode, index_mode, worktree_mode, mode_change) = modes
-        .map(|(head, index, worktree)| {
+    let (head_mode, index_mode, worktree_mode, mode_change) = tracked
+        .as_ref()
+        .map(|sides| {
+            let (head, index, worktree) = sides.modes;
             let head = String::from_utf8_lossy(head).into_owned();
             let index = String::from_utf8_lossy(index).into_owned();
             let worktree = String::from_utf8_lossy(worktree).into_owned();
@@ -1806,6 +1822,14 @@ fn change(
             (Some(head), Some(index), Some(worktree), changed)
         })
         .unwrap_or((None, None, None, None));
+    let (head_oid, index_oid) = tracked
+        .map(|sides| {
+            (
+                Some(String::from_utf8_lossy(sides.oids.0).into_owned()),
+                Some(String::from_utf8_lossy(sides.oids.1).into_owned()),
+            )
+        })
+        .unwrap_or((None, None));
     FileChange {
         id: path.token.clone(),
         path,
@@ -1823,6 +1847,50 @@ fn change(
         index_mode,
         worktree_mode,
         mode_change,
+        head_oid,
+        index_oid,
+        // Filled by `working_copy_snapshot` once the worktree root is known;
+        // the parser alone cannot stat anything.
+        worktree_stamp: None,
+    }
+}
+
+/// Records each entry's on-disk identity — the same file type, size, and
+/// mtime signals Git's own index uses to decide whether a file is dirty — so
+/// two snapshots that agree on a stamp are known to describe the same
+/// content. Status output alone cannot carry this: a file edited twice stays
+/// `M` while its diff changes.
+fn stamp_worktree_entries(worktree: &Path, changes: &mut [FileChange]) {
+    for change in changes {
+        change.worktree_stamp = Some(worktree_stamp(worktree, &change.path.token));
+    }
+}
+
+fn worktree_stamp(worktree: &Path, token: &str) -> String {
+    // Tokens come from this snapshot's own `git status` output, so they are
+    // always relative paths inside the worktree.
+    let Ok(relative) = path_from_token(token) else {
+        return "absent".into();
+    };
+    match fs::symlink_metadata(worktree.join(relative)) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            let kind = if file_type.is_symlink() {
+                'l'
+            } else if file_type.is_dir() {
+                'd'
+            } else {
+                'f'
+            };
+            let mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| format!("{}.{:09}", duration.as_secs(), duration.subsec_nanos()))
+                .unwrap_or_else(|| "unknown".into());
+            format!("{kind}:{}:{mtime}", metadata.len())
+        }
+        Err(_) => "absent".into(),
     }
 }
 
@@ -1987,6 +2055,27 @@ mod tests {
                 .map(|path| path.display.as_str()),
             Some("old.txt")
         );
+        assert_eq!(renamed.head_oid.as_deref(), Some("abc"));
+        assert_eq!(renamed.index_oid.as_deref(), Some("def"));
+        let staged = snapshot
+            .changes
+            .iter()
+            .find(|change| change.path.display == "staged.txt")
+            .expect("ordinary record");
+        assert_eq!(staged.head_oid.as_deref(), Some("abc"));
+        assert_eq!(staged.index_oid.as_deref(), Some("def"));
+        let untracked = snapshot
+            .changes
+            .iter()
+            .find(|change| change.untracked)
+            .expect("untracked record");
+        assert_eq!(untracked.head_oid, None);
+        assert_eq!(untracked.index_oid, None);
+        // The parser never stats anything; stamps belong to the snapshot step.
+        assert!(snapshot
+            .changes
+            .iter()
+            .all(|change| change.worktree_stamp.is_none()));
         assert!(snapshot.changes.iter().any(|change| change.conflicted));
         assert!(snapshot
             .changes
@@ -1996,6 +2085,42 @@ mod tests {
             .changes
             .iter()
             .any(|change| change.mode_change == Some(FileModeChange::Symlink)));
+    }
+
+    #[test]
+    fn snapshots_carry_a_content_stamp_that_is_stable_until_the_file_changes() {
+        let repository = repository();
+        std::fs::write(repository.path().join("kept.txt"), "kept\n").expect("kept");
+        std::fs::write(repository.path().join("gone.txt"), "gone\n").expect("gone");
+        command::successful_git_at(repository.path(), ["add", "--all"]).expect("stage");
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).expect("commit");
+        std::fs::write(repository.path().join("kept.txt"), "kept edited\n").expect("edit");
+        std::fs::remove_file(repository.path().join("gone.txt")).expect("delete");
+
+        let first = working_copy_snapshot(request(repository.path())).expect("first snapshot");
+        let second = working_copy_snapshot(request(repository.path())).expect("second snapshot");
+        assert!(first
+            .changes
+            .iter()
+            .all(|change| change.worktree_stamp.is_some()));
+        let stamp = |snapshot: &WorkingCopySnapshot, path: &str| {
+            snapshot
+                .changes
+                .iter()
+                .find(|change| change.path.display == path)
+                .expect("change present")
+                .worktree_stamp
+                .clone()
+                .expect("stamped")
+        };
+        assert_eq!(stamp(&first, "gone.txt"), "absent");
+        // Nothing touched the file between snapshots, so its identity holds
+        // and a cached diff for it is proven still valid.
+        assert_eq!(stamp(&first, "kept.txt"), stamp(&second, "kept.txt"));
+
+        std::fs::write(repository.path().join("kept.txt"), "kept edited again\n").expect("edit");
+        let third = working_copy_snapshot(request(repository.path())).expect("third snapshot");
+        assert_ne!(stamp(&second, "kept.txt"), stamp(&third, "kept.txt"));
     }
 
     #[test]

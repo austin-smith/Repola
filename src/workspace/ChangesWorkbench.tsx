@@ -51,6 +51,7 @@ import {
   type CommitSelectionMap,
   type FileCommitSelection,
 } from "../domain/commit-selection";
+import { changeDiffKey, retainDiffEntries, workingCopySnapshotsEqual } from "../domain/diff-cache";
 import { resolveAvailableToolId } from "../domain/external-tools";
 import { fileManagerName } from "../domain/platform";
 import { shortSha } from "../domain/format";
@@ -92,9 +93,22 @@ export function ChangesWorkbench() {
   const separator = usePathSeparator();
   // File diffs are only meaningful for the snapshot they were loaded against,
   // so the cache is stored with the snapshot and replaced whenever it is.
-  const [workingCopy, setWorkingCopy] = useState<{ snapshot: WorkingCopySnapshot | null; diffCache: Map<string, FileDiff> }>(() => ({ snapshot: null, diffCache: new Map() }));
-  const { snapshot, diffCache } = workingCopy;
-  const setSnapshot = useCallback((next: WorkingCopySnapshot | null) => setWorkingCopy({ snapshot: next, diffCache: new Map() }), []);
+  const [workingCopy, setWorkingCopy] = useState<{ snapshot: WorkingCopySnapshot | null; diffCache: Map<string, FileDiff>; generation: number }>(() => ({ snapshot: null, diffCache: new Map(), generation: 0 }));
+  const { snapshot, diffCache, generation } = workingCopy;
+  // A snapshot that changed nothing (its content stamps prove it) is dropped
+  // whole, so focus and watcher refreshes over a quiet working copy render
+  // nothing new. When it did change, diff-cache entries whose content
+  // identity the new change list still produces are proven current and carry
+  // forward; only genuinely changed files load again.
+  const setSnapshot = useCallback((next: WorkingCopySnapshot | null) => setWorkingCopy((current) => {
+    if (next && current.snapshot && workingCopySnapshotsEqual(current.snapshot, next)) return current;
+    const generation = current.generation + 1;
+    return {
+      snapshot: next,
+      diffCache: next ? retainDiffEntries(current.diffCache, next.changes, generation) : new Map(),
+      generation,
+    };
+  }), []);
   const [changeSelection, setChangeSelection] = useState(emptyChangeSelection);
   const [commitSelections, setCommitSelections] = useState<CommitSelectionMap>(() => new Map());
   const changesListRef = useRef<HTMLDivElement>(null);
@@ -741,6 +755,7 @@ export function ChangesWorkbench() {
                 repositoryPath={repository.path}
                 worktreePath={worktree.path}
                 change={diffChange}
+                diffKey={changeDiffKey(diffChange, generation)}
                 cache={diffCache}
                 scrollElement={diffScroller}
                 selection={commitSelectionFor(commitSelections, diffChange.id)}
