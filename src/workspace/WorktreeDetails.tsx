@@ -19,9 +19,9 @@ import { Spinner } from "@/components/ui/spinner";
 import { toast } from "@/components/ui/toast";
 import { TooltipButton } from "@/components/tooltip-button";
 import { toMessage } from "@/lib/errors";
-import { safetyBadgeVariant } from "./WorktreeRow";
 import { useShortPath } from "../app/environment";
 import { formatAge, formatDate, formatMeasuredBytes, shortSha } from "../domain/format";
+import { fileManagerName } from "../domain/platform";
 import { actionForWorktree } from "../domain/inventory";
 import { launchWorktreeTool } from "../ipc/app-preferences";
 import { openExternalUrl, revealWorktree } from "../ipc/worktrees";
@@ -92,10 +92,7 @@ export function WorktreeDetails({
   return (
     <div className="flex min-h-full flex-col gap-6 p-5">
       <div className="flex flex-col gap-2">
-        <div className="flex items-center justify-between">
-          <span className="text-xs font-medium tracking-widest text-brand uppercase">{worktree.repositoryName}</span>
-          <Badge variant={safetyBadgeVariant[worktree.safety.level]}>{worktree.safety.label}</Badge>
-        </div>
+        <span className="text-xs font-medium tracking-widest text-brand uppercase">{worktree.repositoryName}</span>
         <h2 className="text-lg leading-tight font-medium break-all">{worktree.branch ?? "Detached HEAD"}</h2>
         <code className="font-mono text-xs break-all text-muted-foreground">{shortPath(worktree.path)}</code>
         <div className="flex flex-wrap gap-1.5">
@@ -121,12 +118,12 @@ export function WorktreeDetails({
             tooltip={machineKind === "ssh" ? "This path belongs to the remote machine." : null}
           >
             {opening ? <Spinner data-icon="inline-start" /> : <FolderOpenIcon data-icon="inline-start" aria-hidden="true" />}
-            File Manager
+            Show in {fileManagerName()}
           </TooltipButton>
         </div>
       </div>
 
-      <DetailSection title="Review signal">
+      <DetailSection title="Safety">
         <Alert variant={safetyAlertVariant}>
           <ShieldCheckIcon aria-hidden="true" />
           <AlertTitle>{worktree.safety.label}</AlertTitle>
@@ -151,7 +148,7 @@ export function WorktreeDetails({
         )}
       </DetailSection>
 
-      <DetailSection title="Integration evidence">
+      <DetailSection title="Integration">
         <p className="text-sm leading-relaxed">{worktree.integration.summary}</p>
         {worktree.unpushedCommitCount !== null && worktree.unpushedCommitCount > 0 && (
           <p className="text-sm text-warning">

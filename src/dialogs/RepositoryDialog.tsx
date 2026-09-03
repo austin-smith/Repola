@@ -23,7 +23,7 @@ export function RepositoryDialog({
   onCompleted: (repositoryPath: string) => Promise<boolean>;
   onClose: () => void;
 }) {
-  const [mode, setMode] = useState<RepositoryMode>("clone");
+  const [mode, setMode] = useState<RepositoryMode>("add");
   const [source, setSource] = useState("");
   const [destination, setDestination] = useState("");
   const [existingPath, setExistingPath] = useState("");
@@ -82,9 +82,9 @@ export function RepositoryDialog({
       <DialogContent className="sm:max-w-lg" showCloseButton={!busy}>
         <form className="contents" onSubmit={(event) => void submit(event)}>
           <DialogHeader>
-            <DialogTitle>Add a repository on {machine.name}</DialogTitle>
+            <DialogTitle>{machine.kind === "local" ? "Add Repository" : `Add Repository on ${machine.name}`}</DialogTitle>
             <DialogDescription>
-              Repository commands run where the working copy lives. Git credentials remain owned by that machine.
+              Open an existing repository, clone one, or create a new one.
             </DialogDescription>
           </DialogHeader>
           <ToggleGroup className="w-full" value={[mode]} onValueChange={(value) => { const next = value[0] as RepositoryMode | undefined; if (next && !busy) { setMode(next); setError(null); } }}>
@@ -97,7 +97,7 @@ export function RepositoryDialog({
             machine.kind === "ssh" ? (
               <Field>
                 <FieldLabel htmlFor="existing-repository-path">Repository path</FieldLabel>
-                <Input id="existing-repository-path" autoFocus className="font-mono" value={existingPath} onChange={(event) => setExistingPath(event.currentTarget.value)} placeholder="/srv/projects/example" spellCheck={false} disabled={busy} />
+                <Input id="existing-repository-path" name="existing-repository-path" autoComplete="off" autoFocus className="font-mono" value={existingPath} onChange={(event) => setExistingPath(event.currentTarget.value)} spellCheck={false} disabled={busy} />
                 <FieldDescription>Enter the full path as it exists on {machine.name}.</FieldDescription>
               </Field>
             ) : (
@@ -111,18 +111,18 @@ export function RepositoryDialog({
               {mode === "clone" ? (
                 <Field>
                   <FieldLabel htmlFor="clone-source">Repository URL</FieldLabel>
-                  <Input id="clone-source" autoFocus value={source} onChange={(event) => setSource(event.currentTarget.value)} placeholder="git@github.com:owner/project.git" spellCheck={false} disabled={busy} />
+                  <Input id="clone-source" name="clone-source" autoComplete="off" autoFocus value={source} onChange={(event) => setSource(event.currentTarget.value)} placeholder="git@github.com:owner/project.git" spellCheck={false} disabled={busy} />
                   <FieldDescription>HTTPS, SSH, and local Git sources are supported.</FieldDescription>
                 </Field>
               ) : (
                 <Field>
                   <FieldLabel htmlFor="initial-branch">Initial branch</FieldLabel>
-                  <Input id="initial-branch" autoFocus value={initialBranch} onChange={(event) => setInitialBranch(event.currentTarget.value)} placeholder="main" spellCheck={false} disabled={busy} />
+                  <Input id="initial-branch" name="initial-branch" autoComplete="off" autoFocus value={initialBranch} onChange={(event) => setInitialBranch(event.currentTarget.value)} spellCheck={false} disabled={busy} />
                 </Field>
               )}
               <Field>
                 <FieldLabel htmlFor="repository-destination">Destination path</FieldLabel>
-                <Input id="repository-destination" className="font-mono" value={destination} onChange={(event) => setDestination(event.currentTarget.value)} placeholder={machine.kind === "ssh" ? "/srv/projects/example" : "/Users/you/Developer/example"} spellCheck={false} disabled={busy} />
+                <Input id="repository-destination" name="repository-destination" autoComplete="off" className="font-mono" value={destination} onChange={(event) => setDestination(event.currentTarget.value)} spellCheck={false} disabled={busy} />
                 <FieldDescription>The full destination path must not exist or must be empty.</FieldDescription>
               </Field>
             </>

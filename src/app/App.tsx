@@ -11,13 +11,11 @@ import {
   FolderOpenIcon,
   FolderPlusIcon,
   GitCommitIcon,
-  HardDriveIcon,
   RefreshCwIcon,
   SearchIcon,
   SearchXIcon,
   SettingsIcon,
   ShieldCheckIcon,
-  SlidersHorizontalIcon,
   Trash2Icon,
   WrenchIcon,
   XIcon,
@@ -26,14 +24,11 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
-import { Field, FieldLabel } from "@/components/ui/field";
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from "@/components/ui/input-group";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/toast";
-import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { ModeToggle } from "@/components/mode-toggle";
 import { TooltipButton } from "@/components/tooltip-button";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { cn } from "@/lib/utils";
@@ -84,7 +79,7 @@ import {
   unregisterRepository,
 } from "../ipc/worktrees";
 import { RepositoryProvider, type RepositoryContextValue } from "../workspace/context";
-import { ContextHeader, type MachineConnection } from "../workspace/ContextHeader";
+import { AppSidebar, type MachineConnection } from "../workspace/AppSidebar";
 import { RepositoryToolbar } from "../workspace/RepositoryToolbar";
 import { ChangesWorkbench } from "../workspace/ChangesWorkbench";
 import { HistoryWorkbench } from "../workspace/HistoryWorkbench";
@@ -92,7 +87,6 @@ import { WorktreeDetails, type PullState } from "../workspace/WorktreeDetails";
 import { PaneResizeHandle } from "../workspace/PaneResizeHandle";
 import { LazyDialog } from "../workspace/LazyDialog";
 import { DiffDialog } from "../workspace/lazy";
-import { sectionHeadingClass } from "../workspace/labels";
 
 const stateOptions: { value: StateFilter; label: string }[] = [
   { value: "all", label: "Every state" },
@@ -886,9 +880,24 @@ function App() {
     { id: "settings", label: "Settings…", detail: "Machines, tools, Git defaults, and appearance.", shortcut: "⌘,", run: () => setSettingsOpen(true) },
   ];
   const commandPalette = <CommandPalette open={commandPaletteOpen} commands={paletteCommands} onOpenChange={setCommandPaletteOpen} />;
+  const worktreeContextAction = worktreeContext ? actionForWorktree(worktreeContext.worktree) : null;
   const overlays = <>
     {settingsDialog}
     {commandPalette}
+    {createWorktreeOpen && currentRepository && currentWorktree ? (
+      <CreateWorktreeDialog
+        machineId={selectedMachineId}
+        repository={currentRepository}
+        sourceWorktree={currentWorktree}
+        onClose={() => setCreateWorktreeOpen(false)}
+        onCreated={async (result) => {
+          setCurrentRepositoryPath(result.repositoryPath);
+          setCurrentWorktreePath(result.worktreePath);
+          await refreshWorkspace();
+          toast.add({ type: "success", title: "Worktree created", description: `${result.branch} · ${result.worktreePath}` });
+        }}
+      />
+    ) : null}
     {dropActive && (
       <div className="pointer-events-none fixed inset-3 z-[100] grid place-items-center border-2 border-dashed border-brand bg-background/90 backdrop-blur-sm">
         <div className="flex flex-col items-center gap-2 text-center">
@@ -903,7 +912,7 @@ function App() {
         <button role="menuitem" className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent" onClick={() => { const item = worktreeContext.worktree; setWorktreeContext(null); void launchWorktreeTool(selectedMachineId, item.path, "editor").catch((cause: unknown) => toast.add({ type: "error", title: "Could not open editor", description: toMessage(cause) })); }}><Code2Icon className="size-4" aria-hidden="true" />Open in Editor</button>
         <button role="menuitem" className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent" onClick={() => { const item = worktreeContext.worktree; setCurrentRepositoryPath(item.repositoryPath); setCurrentWorktreePath(item.path); setWorkspaceView("changes"); setWorktreeContext(null); }}><FileDiffIcon className="size-4" aria-hidden="true" />View Changes</button>
         {isRemovable(worktreeContext.worktree) && <button role="menuitem" className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent" onClick={() => { toggleChecked(worktreeContext.worktree.id); setWorktreeContext(null); }}><Checkbox checked={checked.has(worktreeContext.worktree.id)} aria-hidden="true" />Select for Cleanup</button>}
-        {actionForWorktree(worktreeContext.worktree) && <><div className="my-1 border-t" /><button role="menuitem" className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm text-destructive hover:bg-destructive/10" onClick={() => { reviewAction(actionForWorktree(worktreeContext.worktree)!.kind, worktreeContext.worktree); setWorktreeContext(null); }}><WrenchIcon className="size-4" aria-hidden="true" />Review Management Action…</button></>}
+        {worktreeContextAction ? <><div className="my-1 border-t" /><button role="menuitem" className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm text-destructive hover:bg-destructive/10" onClick={() => { reviewAction(worktreeContextAction.kind, worktreeContext.worktree); setWorktreeContext(null); }}><WrenchIcon className="size-4" aria-hidden="true" />Review Management Action…</button></> : null}
       </div>
     )}
   </>;
@@ -929,52 +938,31 @@ function App() {
     );
   }
 
-  const headerActions = (
-    <>
-      <TooltipButton variant="ghost" size="icon-sm" onClick={() => setRepositoryDialogOpen(true)} aria-label="Add repository" tooltip="Add repository">
-        <FolderPlusIcon aria-hidden="true" />
-      </TooltipButton>
-      <ModeToggle />
-      <TooltipButton variant="ghost" size="icon-sm" onClick={() => setSettingsOpen(true)} aria-label="Settings" tooltip="Settings (⌘,)">
-        <SettingsIcon aria-hidden="true" />
-      </TooltipButton>
-    </>
-  );
-
-  const contextHeader = (status?: ReactNode, extraActions?: ReactNode) => (
-    <>
-      <ContextHeader
-        machines={machines}
-        selectedMachine={selectedMachine ?? machines[0]}
-        selectedMachineId={selectedMachineId}
-        connection={selectedConnection}
-        disabled={actionBusy || bulkBusy}
-        onChange={switchMachine}
-        onRetry={() => void probeMachineConnection(selectedMachineId, true)}
-      >
-        {status}
-        {extraActions}
-        {headerActions}
-      </ContextHeader>
-      {repositoryDialog}
-    </>
-  );
-
   const shell = (children: ReactNode) => (
     <RepositoryProvider value={repositoryContext}>
-      <main className="flex h-full flex-col bg-background">{children}</main>
+      <div className="flex h-full min-w-0 bg-background">
+        <a href="#main-content" className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:bg-background focus:px-3 focus:py-2 focus:ring-2 focus:ring-ring">Skip to main content</a>
+        <AppSidebar
+          machines={machines}
+          selectedMachine={selectedMachine ?? machines[0]}
+          selectedMachineId={selectedMachineId}
+          connection={selectedConnection}
+          disabled={actionBusy || bulkBusy}
+          view={workspaceView}
+          onMachineChange={switchMachine}
+          onRetry={() => void probeMachineConnection(selectedMachineId, true)}
+          onViewChange={setWorkspaceView}
+          onOpenSettings={() => setSettingsOpen(true)}
+        />
+        <main id="main-content" className="flex min-w-0 flex-1 flex-col bg-background">{children}</main>
+        {repositoryDialog}
+      </div>
     </RepositoryProvider>
   );
 
   if (!scan && loading) {
     return shell(
       <>
-        {contextHeader(
-          <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
-            <span className="size-1.5 animate-pulse rounded-full bg-brand" aria-hidden="true" />
-            Connecting and scanning…
-          </div>,
-        )}
         <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3">
           <Spinner className="size-6" />
           <strong className="text-base font-medium">Mapping worktrees on {selectedMachine?.name}</strong>
@@ -989,7 +977,6 @@ function App() {
   if (!scan && error) {
     return shell(
       <>
-        {contextHeader()}
         <Empty className="min-h-0 flex-1">
           <EmptyHeader>
             <EmptyMedia variant="icon"><AlertTriangleIcon className="text-destructive" aria-hidden="true" /></EmptyMedia>
@@ -1013,7 +1000,6 @@ function App() {
     // No repositories configured: show the explicit onboarding flow.
     return shell(
       <>
-        {contextHeader()}
         <Empty className="min-h-0 flex-1">
           <EmptyHeader>
             <EmptyMedia variant="icon"><FolderOpenIcon aria-hidden="true" /></EmptyMedia>
@@ -1036,40 +1022,36 @@ function App() {
 
   const selectedProvider: RemoteProvider = scan.repositories
     .find((repo) => repo.path === selected?.repositoryPath)?.provider ?? "none";
+  const repositoryFilterOptions = [
+    { value: "all", label: "All repositories" },
+    ...scan.repositories.map((item) => ({ value: item.path, label: item.name })),
+  ];
+  const repositoryFilterItems = Object.fromEntries(repositoryFilterOptions.map((item) => [item.value, item.label]));
+  const ageOptions: { value: AgeFilter; label: string }[] = [
+    { value: 0, label: "Any activity" },
+    { value: 30, label: "Idle 30+ days" },
+    { value: 90, label: "Idle 90+ days" },
+    { value: 180, label: "Idle 180+ days" },
+    { value: 365, label: "Idle 1+ year" },
+  ];
+  const ageItems = Object.fromEntries(ageOptions.map((item) => [String(item.value), item.label]));
   const bulkFollowUpLabel = bulk?.stage === "done" && bulk.kind === "remove" && bulk.followUps.length > 0
     ? `Review ${bulk.followUps.length} branch deletion${bulk.followUps.length === 1 ? "" : "s"}…`
     : null;
 
   const workspaceToolbar = (
-    <>
-      <RepositoryToolbar
-        repositories={scan.repositories}
-        worktrees={repositoryWorktrees}
-        view={workspaceView}
-        onRepositoryChange={(path) => {
-          setCurrentRepositoryPath(path);
-          setCurrentWorktreePath(null);
-        }}
-        onWorktreeChange={setCurrentWorktreePath}
-        onViewChange={setWorkspaceView}
-        onCreateWorktree={() => setCreateWorktreeOpen(true)}
-        onRemoveRepository={removeRepositoryFromList}
-      />
-      {createWorktreeOpen && currentRepository && currentWorktree ? (
-        <CreateWorktreeDialog
-          machineId={selectedMachineId}
-          repository={currentRepository}
-          sourceWorktree={currentWorktree}
-          onClose={() => setCreateWorktreeOpen(false)}
-          onCreated={async (result) => {
-            setCurrentRepositoryPath(result.repositoryPath);
-            setCurrentWorktreePath(result.worktreePath);
-            await refreshWorkspace();
-            toast.add({ type: "success", title: "Worktree created", description: `${result.branch} · ${result.worktreePath}` });
-          }}
-        />
-      ) : null}
-    </>
+    <RepositoryToolbar
+      repositories={scan.repositories}
+      worktrees={repositoryWorktrees}
+      onRepositoryChange={(path) => {
+        setCurrentRepositoryPath(path);
+        setCurrentWorktreePath(null);
+      }}
+      onWorktreeChange={setCurrentWorktreePath}
+      onAddRepository={() => setRepositoryDialogOpen(true)}
+      onCreateWorktree={() => setCreateWorktreeOpen(true)}
+      onRemoveRepository={removeRepositoryFromList}
+    />
   );
 
   const noWorkingCopy = (title: string, description: string) => (
@@ -1085,12 +1067,6 @@ function App() {
   if (workspaceView === "changes") {
     return shell(
       <>
-        {contextHeader(
-          <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
-            <span className="size-1.5 rounded-full bg-success" aria-hidden="true" />
-            {currentWorktree ? `${currentWorktree.status.total} changed` : "No working copy"}
-          </div>,
-        )}
         {workspaceToolbar}
         {currentRepository && currentWorktree ? (
           <ErrorBoundary label="The changes view" resetKey={currentWorktree.id}>
@@ -1105,7 +1081,6 @@ function App() {
   if (workspaceView === "history") {
     return shell(
       <>
-        {contextHeader()}
         {workspaceToolbar}
         {currentRepository && currentWorktree ? (
           <ErrorBoundary label="The history view" resetKey={currentWorktree.id}>
@@ -1119,39 +1094,36 @@ function App() {
 
   return shell(
     <>
-      {contextHeader(
-        <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
-          <span className={cn("size-1.5 rounded-full", loading ? "animate-pulse bg-brand" : "bg-success")} aria-hidden="true" />
-          {loading ? "Scanning…" : `Scanned ${formatAge(scan.scannedAtMs, Date.now())}`}
-        </div>,
-        <TooltipButton variant="ghost" size="icon-sm" disabled={!auditPath} onClick={() => void showAuditLog()} aria-label="Show audit log" tooltip="Show audit log">
-          <FileClockIcon aria-hidden="true" />
-        </TooltipButton>,
-      )}
-      {workspaceToolbar}
-
-      <section className="flex h-13 shrink-0 items-center border-b bg-surface-inverse px-5 text-surface-inverse-foreground" aria-label="Inventory summary">
-        <SummaryCell icon={<DatabaseIcon aria-hidden="true" />} value={String(scan.totals.linkedCount)} label="linked worktrees" />
-        <SummaryCell icon={<HardDriveIcon aria-hidden="true" />} value={formatMeasuredBytes(scan.totals.linkedSizeBytes, scan.worktrees.some((item) => item.sizeIncomplete))} label="allocated" />
-        <SummaryCell icon={<AlertTriangleIcon className="text-brand" aria-hidden="true" />} value={String(scan.totals.dirtyCount)} label="with local changes" />
-        <SummaryCell icon={<ClockIcon aria-hidden="true" />} value={String(scan.totals.prunableCount)} label="prunable records" />
-        <p className="ml-auto hidden text-xs text-surface-inverse-foreground/60 xl:block">
-          {scan.totals.repositoryCount} repositories · {scan.totals.primaryCount} primary worktrees · {scan.totals.missingCount} missing paths
-        </p>
-        <TooltipButton variant="ghost" size="icon-sm" className="ml-3 text-surface-inverse-foreground hover:text-surface-inverse-foreground" disabled={loading} onClick={() => void refreshWorkspace()} aria-label="Refresh worktrees" tooltip="Refresh worktrees (⌘R)">
-          <RefreshCwIcon className={loading ? "animate-spin" : ""} aria-hidden="true" />
-        </TooltipButton>
+      <section className="flex h-16 shrink-0 items-center border-b bg-card px-5" aria-labelledby="worktree-manager-title">
+        <div className="min-w-0">
+          <h2 id="worktree-manager-title" className="text-lg leading-tight font-semibold tracking-tight text-balance">Worktrees</h2>
+          <p className="truncate text-xs text-muted-foreground">{selectedMachine?.name} · scanned {formatAge(scan.scannedAtMs, Date.now())}</p>
+        </div>
+        <div className="ml-auto flex items-center gap-1">
+          <Button
+            size="sm"
+            disabled={!selected?.exists}
+            onClick={() => {
+              if (!selected) return;
+              setCurrentRepositoryPath(selected.repositoryPath);
+              setCurrentWorktreePath(selected.path);
+              setCreateWorktreeOpen(true);
+            }}
+          >
+            <FolderPlusIcon data-icon="inline-start" aria-hidden="true" />
+            New Worktree…
+          </Button>
+          <TooltipButton variant="ghost" size="icon-sm" disabled={!auditPath} onClick={() => void showAuditLog()} aria-label="Show audit log" tooltip="Show audit log">
+            <FileClockIcon aria-hidden="true" />
+          </TooltipButton>
+          <TooltipButton variant="ghost" size="icon-sm" disabled={loading} onClick={() => void refreshWorkspace()} aria-label="Refresh worktrees" tooltip="Refresh worktrees (⌘R)">
+            <RefreshCwIcon className={loading ? "animate-spin" : ""} aria-hidden="true" />
+          </TooltipButton>
+        </div>
       </section>
 
-      <div className="grid min-h-0 flex-1" style={{ gridTemplateColumns: `${workspaceLayout.inventorySidebarWidth}px 5px minmax(0, 1fr) 5px ${workspaceLayout.detailsWidth}px` }}>
-        <aside className="flex min-h-0 flex-col gap-5 overflow-y-auto border-r bg-sidebar p-4">
-          <div className="flex items-center gap-2">
-            <SlidersHorizontalIcon className="size-4" aria-hidden="true" />
-            <h2 className={sectionHeadingClass.replace("text-muted-foreground", "text-foreground")}>Scope</h2>
-            {filtersActive && <Button variant="link" size="xs" className="ml-auto" onClick={clearFilters}>Reset</Button>}
-          </div>
-
-          <InputGroup>
+      <section className="flex h-14 shrink-0 items-center gap-2 border-b bg-muted/25 px-4" aria-label="Worktree filters">
+          <InputGroup className="w-72 shrink-0">
             <InputGroupAddon><SearchIcon aria-hidden="true" /></InputGroupAddon>
             <InputGroupInput
               name="worktree-search"
@@ -1173,96 +1145,45 @@ function App() {
               </InputGroupAddon>
             )}
           </InputGroup>
+          <Select items={repositoryFilterItems} value={repository} onValueChange={(value) => setRepository(value ?? "all")}>
+            <SelectTrigger className="w-48" aria-label="Filter by repository"><DatabaseIcon aria-hidden="true" /><SelectValue /></SelectTrigger>
+            <SelectContent align="start" alignItemWithTrigger={false}>
+              <SelectGroup>
+                {repositoryFilterOptions.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+          <Select items={stateItems} value={state} onValueChange={(value) => setState((value ?? "all") as StateFilter)}>
+            <SelectTrigger className="w-40" aria-label="Filter by worktree state"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                {stateOptions.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+          <Select items={ageItems} value={String(age)} onValueChange={(value) => setAge(Number(value ?? 0) as AgeFilter)}>
+            <SelectTrigger className="w-40" aria-label="Filter by last activity"><ClockIcon aria-hidden="true" /><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                {ageOptions.map((option) => <SelectItem key={option.value} value={String(option.value)}>{option.label}</SelectItem>)}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+          {filtersActive ? <Button variant="ghost" size="sm" onClick={clearFilters}>Reset</Button> : null}
+          <span className="ml-auto text-xs tabular-nums text-muted-foreground">{filtered.length} of {scan.worktrees.length}</span>
+          {(error || scan.warnings.length > 0) && (
+            <Tooltip>
+              <TooltipTrigger render={<Badge variant="destructive" tabIndex={0} />}>
+                <AlertTriangleIcon aria-hidden="true" />
+                {error ? "Refresh failed" : `${scan.warnings.length} warning${scan.warnings.length === 1 ? "" : "s"}`}
+              </TooltipTrigger>
+              <TooltipContent className="whitespace-pre-line">{error ?? scan.warnings.join("\n")}</TooltipContent>
+            </Tooltip>
+          )}
+      </section>
 
-          <div className="flex flex-col gap-2">
-            <span className={sectionHeadingClass}>Age</span>
-            <ToggleGroup
-              orientation="vertical"
-              className="w-full"
-              value={[String(age)]}
-              onValueChange={(groupValue) => setAge(Number(groupValue[0] ?? 0) as AgeFilter)}
-            >
-              {([0, 30, 90, 180, 365] as AgeFilter[]).map((days) => (
-                <ToggleGroupItem key={days} value={String(days)} className="justify-between">
-                  <span>{days === 0 ? "Any activity" : `${days}+ days idle`}</span>
-                  {days === 0 && <span className="font-mono text-xs text-muted-foreground">{scan.worktrees.length}</span>}
-                </ToggleGroupItem>
-              ))}
-            </ToggleGroup>
-          </div>
-
-          <Field>
-            <FieldLabel htmlFor="state-filter">State</FieldLabel>
-            <Select
-              items={stateItems}
-              value={state}
-              onValueChange={(value) => setState((value ?? "all") as StateFilter)}
-            >
-              <SelectTrigger id="state-filter" className="w-full"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  {stateOptions.map((option) => (
-                    <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
-                  ))}
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-          </Field>
-
-          <div className="flex flex-col gap-2">
-            <span className={sectionHeadingClass}>Repository</span>
-            <ToggleGroup
-              orientation="vertical"
-              className="w-full"
-              value={[repository]}
-              onValueChange={(groupValue) => setRepository(String(groupValue[0] ?? "all"))}
-            >
-              <ToggleGroupItem value="all" className="justify-between">
-                <span>All repositories</span>
-                <span className="font-mono text-xs text-muted-foreground">{scan.worktrees.length}</span>
-              </ToggleGroupItem>
-              {scan.repositories.map((repo) => (
-                <Tooltip key={repo.path}>
-                  <TooltipTrigger render={<ToggleGroupItem value={repo.path} className="justify-between" />}>
-                    <span className="truncate">{repo.name}</span>
-                    <span className="flex items-center gap-1.5">
-                      {repo.attentionCount + repo.conflictedCount > 0 ? <span className="size-1.5 rounded-full bg-warning" aria-label="Needs attention" /> : null}
-                      <span className="font-mono text-xs text-muted-foreground">{repo.worktreeCount}</span>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent>{repo.path}</TooltipContent>
-                </Tooltip>
-              ))}
-            </ToggleGroup>
-          </div>
-
-          <div className="mt-auto border-t pt-4">
-            <Button variant="outline" size="sm" className="w-full" onClick={() => setRepositoryDialogOpen(true)}>
-              <FolderPlusIcon data-icon="inline-start" aria-hidden="true" />
-              Add Repository…
-            </Button>
-          </div>
-        </aside>
-
-        <PaneResizeHandle side="left" value={workspaceLayout.inventorySidebarWidth} minimum={180} maximum={420} onChange={(value) => setWorkspaceLayout((current) => ({ ...current, inventorySidebarWidth: value }))} />
-
+      <div className="grid min-h-0 flex-1" style={{ gridTemplateColumns: `minmax(0, 1fr) 5px ${workspaceLayout.detailsWidth}px` }}>
         <section className="flex min-h-0 min-w-0 flex-col bg-background">
-          <div className="flex h-16 shrink-0 items-center justify-between border-b px-4">
-            <div>
-              <h2 className="text-base font-medium">All worktrees</h2>
-              <p className="text-xs text-muted-foreground">{filtered.length} of {scan.worktrees.length}, oldest activity first</p>
-            </div>
-            {(error || scan.warnings.length > 0) && (
-              <Tooltip>
-                <TooltipTrigger render={<Badge variant="destructive" tabIndex={0} />}>
-                  <AlertTriangleIcon aria-hidden="true" />
-                  {error ? "Last refresh failed" : `${scan.warnings.length} scan warning${scan.warnings.length === 1 ? "" : "s"}`}
-                </TooltipTrigger>
-                <TooltipContent className="whitespace-pre-line">{error ?? scan.warnings.join("\n")}</TooltipContent>
-              </Tooltip>
-            )}
-          </div>
-
           {checkedRecords.length > 0 && (
             <div className="flex shrink-0 items-center gap-3 border-b bg-warning/10 px-4 py-2">
               <strong className="font-mono text-sm">{checkedRecords.length} selected</strong>
@@ -1285,7 +1206,7 @@ function App() {
                   onCheckedChange={toggleAllFiltered}
                 />
               </span>
-              <span role="columnheader">Worktree</span><span role="columnheader">Last activity</span><span role="columnheader">Local state</span><span role="columnheader">Integration evidence</span><span role="columnheader">Size</span><span role="columnheader" aria-label="Actions" />
+              <span role="columnheader">Worktree</span><span role="columnheader">Last activity</span><span role="columnheader">Local state</span><span role="columnheader">Integration</span><span role="columnheader">Size</span><span role="columnheader" aria-label="Actions" />
             </div>
             {filtered.map((worktree) => (
               <WorktreeRow
@@ -1295,8 +1216,6 @@ function App() {
                 checked={checked.has(worktree.id)}
                 onSelect={(id) => {
                   setSelectedId(id);
-                  setCurrentRepositoryPath(worktree.repositoryPath);
-                  setCurrentWorktreePath(worktree.path);
                   setActionError(null);
                 }}
                 onToggleChecked={toggleChecked}
@@ -1374,16 +1293,6 @@ function App() {
       ) : null}
       {overlays}
     </>,
-  );
-}
-
-function SummaryCell({ icon, value, label }: { icon: ReactNode; value: string; label: string }) {
-  return (
-    <div className="flex h-7 items-center gap-2 border-r border-surface-inverse-foreground/25 px-4 text-xs first:pl-0 [&_svg:not([class*='size-'])]:size-3.5">
-      {icon}
-      <strong className="font-mono text-sm tabular-nums">{value}</strong>
-      <span className="text-surface-inverse-foreground/70">{label}</span>
-    </div>
   );
 }
 

@@ -3,7 +3,7 @@ import { AlertTriangleIcon } from "lucide-react";
 import { PatchDiff } from "@pierre/diffs/react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
 import { useTheme } from "@/components/theme-provider";
 import type { WorktreeChanges, WorktreeRecord } from "../ipc/types";
 import { useShortPath } from "../app/environment";
@@ -49,10 +49,9 @@ export function DiffDialog({ machineId, worktree, onClose }: DiffDialogProps) {
 
         <div className="flex min-h-0 flex-col gap-3 overflow-y-auto">
           {!changes && !error && (
-            <div className="flex flex-col gap-2">
-              <Skeleton className="h-4 w-1/3" />
-              <Skeleton className="h-24 w-full" />
-              <Skeleton className="h-24 w-full" />
+            <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-muted-foreground" role="status">
+              <Spinner aria-hidden="true" />
+              Loading changes…
             </div>
           )}
           {unavailableReason && (

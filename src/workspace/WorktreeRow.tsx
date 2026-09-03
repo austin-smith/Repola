@@ -46,7 +46,7 @@ export const WorktreeRow = memo(function WorktreeRow({ now, selected, checked, w
             ? "Missing"
             : dirty
               ? `${worktree.status.total} changed`
-              : worktree.status.available ? "Clean" : "Inspect";
+              : worktree.status.available ? "Clean" : "Unavailable";
 
   return (
     <div
@@ -83,9 +83,7 @@ export const WorktreeRow = memo(function WorktreeRow({ now, selected, checked, w
         <span className="flex min-w-0 items-center gap-1.5">
           <GitBranchIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
           <span className="truncate text-sm font-medium">{worktree.branch ?? "detached HEAD"}</span>
-          <Badge variant={worktree.origin.kind === "agent" ? "brand" : "outline"} data-origin-id={worktree.origin.id}>
-            {worktree.origin.label}
-          </Badge>
+          {worktree.origin.kind === "agent" ? <Badge variant="brand" data-origin-id={worktree.origin.id}>{worktree.origin.label}</Badge> : null}
         </span>
         <span className="truncate text-xs font-medium text-foreground/70">{worktree.repositoryName}</span>
         <Tooltip>
@@ -108,7 +106,7 @@ export const WorktreeRow = memo(function WorktreeRow({ now, selected, checked, w
         </Badge>
       </span>
       <span className="text-xs text-muted-foreground" role="cell">
-        {worktree.integration.kind === "headContained" ? "HEAD contained" :
+        {worktree.integration.kind === "headContained" ? "Contained" :
           worktree.integration.kind === "headNotContained" ? "Not contained" :
             worktree.integration.kind === "notApplicable" ? "—" : "Unknown"}
       </span>

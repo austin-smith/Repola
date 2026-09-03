@@ -1,13 +1,13 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import {
+  CheckIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
   DatabaseIcon,
-  FileDiffIcon,
   FolderOpenIcon,
   FolderPlusIcon,
   GitBranchIcon,
-  GitCommitIcon,
   GitMergeIcon,
-  HardDriveIcon,
   MoreHorizontalIcon,
   PencilIcon,
   PlusIcon,
@@ -22,119 +22,96 @@ import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/toast";
-import { TooltipButton } from "@/components/tooltip-button";
 import { toMessage } from "@/lib/errors";
 import { fileManagerName } from "../domain/platform";
 import { ActionableGitError } from "../components/ActionableGitError";
 import type { HistoryTarget } from "../dialogs/HistoryMutationDialog";
-import { formatMeasuredBytes, shortSha } from "../domain/format";
+import { shortSha } from "../domain/format";
 import { loadBranches, mutateBranch, revealWorktree } from "../ipc/worktrees";
-import type { BranchInfo, RepositorySummary, WorkspaceView, WorktreeRecord } from "../ipc/types";
+import type { BranchInfo, RepositorySummary, WorktreeRecord } from "../ipc/types";
 import { useRepositoryContext, useWorkingCopy } from "./context";
 import { historyMutationTitles } from "./labels";
 import { LazyDialog } from "./LazyDialog";
 import { HistoryMutationDialog, TagsDialog } from "./lazy";
 
-function ContextToolbarField({
-  id,
-  label,
-  children,
-}: {
-  id: string;
-  label: string;
-  children: ReactNode;
-}) {
-  return (
-    <Field className="min-w-0">
-      <FieldLabel htmlFor={id}>{label}</FieldLabel>
-      <div className="flex min-w-0 items-center gap-1">
-        {children}
-      </div>
-    </Field>
-  );
-}
-
 export function RepositoryToolbar({
   repositories,
   worktrees,
-  view,
   onRepositoryChange,
   onWorktreeChange,
-  onViewChange,
+  onAddRepository,
   onCreateWorktree,
   onRemoveRepository,
 }: {
   repositories: RepositorySummary[];
   worktrees: WorktreeRecord[];
-  view: WorkspaceView;
   onRepositoryChange: (path: string) => void;
   onWorktreeChange: (path: string) => void;
-  onViewChange: (view: WorkspaceView) => void;
+  onAddRepository: () => void;
   onCreateWorktree: () => void;
   onRemoveRepository: (repositoryPath: string) => Promise<void>;
 }) {
   const { machineKind, repository, worktree } = useRepositoryContext();
   const [pendingRepositoryRemoval, setPendingRepositoryRemoval] = useState(false);
-  const repositoryItems = Object.fromEntries(repositories.map((item) => [item.path, item.name]));
   const worktreeItems = Object.fromEntries(worktrees.map((item) => [
     item.path,
     item.branch ?? `Detached at ${shortSha(item.head)}`,
   ]));
   return (
-    <section className="flex shrink-0 items-stretch border-b bg-card" aria-label="Repository context">
-      <div className="flex min-w-0 flex-1 border-r px-4 py-3">
-        <ContextToolbarField id="current-repository" label="Repository">
-          <Select items={repositoryItems} value={repository?.path ?? null} onValueChange={(value) => { if (value) onRepositoryChange(value); }}>
-            <SelectTrigger id="current-repository" className="min-w-0 flex-1" aria-label="Current repository">
-              <DatabaseIcon aria-hidden="true" />
-              <SelectValue placeholder="Select a repository" />
-            </SelectTrigger>
-            <SelectContent className="min-w-80" align="start" alignItemWithTrigger={false}>
-              <SelectGroup>
+    <section className="flex h-16 shrink-0 items-center gap-1 border-b bg-card px-3" aria-label="Working-copy context">
+      <div className="flex min-w-0 flex-1 items-center gap-1">
+        <span className="sr-only">Current repository and working copy</span>
+          <DropdownMenu>
+            <DropdownMenuTrigger render={<Button id="current-repository" variant="ghost" className="w-56 justify-between font-medium" aria-label="Current repository" />}>
+              <span className="flex min-w-0 items-center gap-1.5">
+                <DatabaseIcon data-icon="inline-start" aria-hidden="true" />
+                <span className="truncate">{repository?.name ?? "Select a repository…"}</span>
+              </span>
+              <ChevronDownIcon data-icon="inline-end" className="text-muted-foreground" aria-hidden="true" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent className="min-w-64" align="start">
+              <DropdownMenuGroup>
                 {repositories.map((item) => (
-                  <SelectItem key={item.path} value={item.path} label={item.name}>
-                    <span className="flex min-w-64 items-center gap-2">
-                      <span className="min-w-0 flex-1"><span className="block truncate">{item.name}</span><span className="block text-xs text-muted-foreground">{item.worktreeCount} worktree{item.worktreeCount === 1 ? "" : "s"} · {formatMeasuredBytes(item.allocatedBytes, item.allocationIncomplete)}</span></span>
-                      {item.conflictedCount > 0 ? <Badge variant="destructive">{item.conflictedCount} conflicted</Badge> : item.attentionCount > 0 ? <Badge variant="warning">{item.attentionCount} attention</Badge> : <Badge variant="success">healthy</Badge>}
+                  <DropdownMenuItem key={item.path} onClick={() => onRepositoryChange(item.path)}>
+                    <span className="flex min-w-0 flex-1 items-center gap-2">
+                      <span className="min-w-0 flex-1 truncate">{item.name}</span>
+                      {item.path === repository?.path ? <CheckIcon aria-hidden="true" /> : null}
                     </span>
-                  </SelectItem>
+                  </DropdownMenuItem>
                 ))}
-              </SelectGroup>
-            </SelectContent>
-          </Select>
-          <TooltipButton variant="ghost" size="icon-sm" onClick={onCreateWorktree} disabled={!repository || !worktree} aria-label="Create linked worktree" tooltip="Create linked worktree">
-            <FolderPlusIcon aria-hidden="true" />
-          </TooltipButton>
-          <Tooltip>
-            <TooltipTrigger render={<span className="inline-flex w-fit" tabIndex={repository ? undefined : 0} />}>
-              <DropdownMenu>
-                <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" disabled={!repository} aria-label="Repository actions" />}>
-                  <MoreHorizontalIcon aria-hidden="true" />
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="start" className="min-w-56">
-                  <DropdownMenuGroup>
-                    <DropdownMenuLabel>{repository?.name ?? "Repository"}</DropdownMenuLabel>
-                    <DropdownMenuItem disabled={machineKind !== "local" || !repository} onClick={() => { if (repository) void revealWorktree(repository.path).catch((cause: unknown) => toast.add({ type: "error", title: `Could not show the repository in ${fileManagerName()}`, description: toMessage(cause) })); }}><FolderOpenIcon aria-hidden="true" />Show in {fileManagerName()}</DropdownMenuItem>
-                  </DropdownMenuGroup>
+              </DropdownMenuGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuGroup>
+                <DropdownMenuItem onClick={onAddRepository}>
+                  <FolderPlusIcon aria-hidden="true" />
+                  Add Repository…
+                </DropdownMenuItem>
+                {machineKind === "local" && repository ? (
+                  <DropdownMenuItem onClick={() => { void revealWorktree(repository.path).catch((cause: unknown) => toast.add({ type: "error", title: `Could not show the repository in ${fileManagerName()}`, description: toMessage(cause) })); }}>
+                    <FolderOpenIcon aria-hidden="true" />
+                    Show in {fileManagerName()}
+                  </DropdownMenuItem>
+                ) : null}
+              </DropdownMenuGroup>
+              {repository ? (
+                <>
                   <DropdownMenuSeparator />
                   <DropdownMenuGroup>
-                    <DropdownMenuItem variant="destructive" disabled={!repository} onClick={() => setPendingRepositoryRemoval(true)}><Trash2Icon aria-hidden="true" />Remove from Repola…</DropdownMenuItem>
+                    <DropdownMenuItem variant="destructive" onClick={() => setPendingRepositoryRemoval(true)}>
+                      <Trash2Icon aria-hidden="true" />
+                      Remove from Repola…
+                    </DropdownMenuItem>
                   </DropdownMenuGroup>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </TooltipTrigger>
-            <TooltipContent>Repository actions</TooltipContent>
-          </Tooltip>
-        </ContextToolbarField>
-      </div>
-      <div className="flex min-w-0 flex-1 border-r px-4 py-3">
-        <ContextToolbarField id="current-worktree" label="Worktree">
+                </>
+              ) : null}
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
           <Select items={worktreeItems} value={worktree?.path ?? null} onValueChange={(value) => { if (value) onWorktreeChange(value); }}>
-            <SelectTrigger id="current-worktree" className="min-w-0 flex-1" aria-label="Current worktree">
+            <SelectTrigger id="current-worktree" className="w-52 border-transparent bg-transparent hover:bg-accent" aria-label="Current working copy">
               <FolderOpenIcon aria-hidden="true" />
-              <SelectValue placeholder="Select a worktree" />
+              <SelectValue placeholder="Select a working copy…" />
             </SelectTrigger>
             <SelectContent>
               <SelectGroup>
@@ -146,29 +123,17 @@ export function RepositoryToolbar({
               </SelectGroup>
             </SelectContent>
           </Select>
-        </ContextToolbarField>
-      </div>
-      <div className="flex min-w-64 flex-1 items-center border-r px-4 py-3">
+          <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
         {repository && worktree ? (
-          <BranchControl />
+          <BranchControl key={`${repository.path}\0${worktree.id}\0${worktree.head ?? ""}`} />
         ) : (
           <span className="text-sm text-muted-foreground">No branch</span>
         )}
       </div>
-      <div className="ml-auto flex items-center gap-1 px-4">
-        <Button variant={view === "changes" ? "secondary" : "ghost"} size="sm" onClick={() => onViewChange("changes")}>
-          <FileDiffIcon data-icon="inline-start" aria-hidden="true" />
-          Changes
-        </Button>
-        <Button variant={view === "history" ? "secondary" : "ghost"} size="sm" onClick={() => onViewChange("history")}>
-          <GitCommitIcon data-icon="inline-start" aria-hidden="true" />
-          History
-        </Button>
-        <Button variant={view === "worktrees" ? "secondary" : "ghost"} size="sm" onClick={() => onViewChange("worktrees")}>
-          <HardDriveIcon data-icon="inline-start" aria-hidden="true" />
-          Worktrees
-        </Button>
-      </div>
+      <Button variant="outline" size="sm" onClick={onCreateWorktree} disabled={!repository || !worktree}>
+        <FolderPlusIcon data-icon="inline-start" aria-hidden="true" />
+        New Worktree…
+      </Button>
       <Dialog open={pendingRepositoryRemoval} onOpenChange={setPendingRepositoryRemoval}>
         <DialogContent>
           <DialogHeader>
@@ -198,8 +163,6 @@ function BranchControl() {
 
   useEffect(() => {
     const controller = new AbortController();
-    setBranches(null);
-    setError(null);
     void loadBranches(machineId, repository.path, worktree.path, controller.signal)
       .then(setBranches)
       .catch((cause: unknown) => {
@@ -276,14 +239,13 @@ function BranchControl() {
   };
 
   return (
-    <div className="min-w-0 flex-1">
-      <ContextToolbarField id="current-branch" label="Branch">
+    <div className="flex min-w-0 flex-1 items-center gap-1">
         <Select items={items} value={current?.fullName ?? null} disabled={busy || branches === null} onValueChange={selectBranch}>
-          <SelectTrigger id="current-branch" className="min-w-0 flex-1" aria-label="Current branch">
+          <SelectTrigger id="current-branch" className="w-56 border-transparent bg-transparent hover:bg-accent" aria-label="Current branch">
             {busy || branches === null
               ? <Spinner />
               : <GitBranchIcon aria-hidden="true" />}
-            <SelectValue placeholder="Select a branch">
+            <SelectValue placeholder="Select a branch…">
               {current?.name ?? (worktree.branch ? worktree.branch : `Detached at ${shortSha(worktree.head)}`)}
             </SelectValue>
           </SelectTrigger>
@@ -317,19 +279,20 @@ function BranchControl() {
             ) : null}
           </SelectContent>
         </Select>
-        <TooltipButton variant="ghost" size="icon-sm" disabled={busy || branches === null} tooltip="Create branch" aria-label="Create branch" onClick={() => openDialog("create")}>
-          <PlusIcon aria-hidden="true" />
-        </TooltipButton>
-        <TooltipButton variant="ghost" size="icon-sm" disabled={busy || current === null} tooltip="Rename current branch" aria-label="Rename current branch" onClick={() => openDialog("rename")}>
-          <PencilIcon aria-hidden="true" />
-        </TooltipButton>
-        <TooltipButton variant="ghost" size="icon-sm" disabled={busy || current === null || historyTargets.length === 0} tooltip="Merge or rebase" aria-label="Merge or rebase" onClick={() => setHistoryActionsOpen(true)}>
-          <GitMergeIcon aria-hidden="true" />
-        </TooltipButton>
-        <TooltipButton variant="ghost" size="icon-sm" disabled={busy || worktree.head === null} tooltip="Tags" aria-label="Tags" onClick={() => setTagsOpen(true)}>
-          <TagIcon aria-hidden="true" />
-        </TooltipButton>
-      </ContextToolbarField>
+        <DropdownMenu>
+          <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Branch actions" disabled={busy || branches === null} />}>
+            <MoreHorizontalIcon aria-hidden="true" />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-52">
+            <DropdownMenuGroup>
+              <DropdownMenuLabel>Branch actions</DropdownMenuLabel>
+              <DropdownMenuItem onClick={() => openDialog("create")}><PlusIcon aria-hidden="true" />Create branch…</DropdownMenuItem>
+              <DropdownMenuItem disabled={current === null} onClick={() => openDialog("rename")}><PencilIcon aria-hidden="true" />Rename current branch…</DropdownMenuItem>
+              <DropdownMenuItem disabled={current === null || historyTargets.length === 0} onClick={() => setHistoryActionsOpen(true)}><GitMergeIcon aria-hidden="true" />Merge or rebase…</DropdownMenuItem>
+              <DropdownMenuItem disabled={worktree.head === null} onClick={() => setTagsOpen(true)}><TagIcon aria-hidden="true" />Tags…</DropdownMenuItem>
+            </DropdownMenuGroup>
+          </DropdownMenuContent>
+        </DropdownMenu>
       <Dialog open={dialogKind !== null} onOpenChange={(open) => { if (!open && !busy) setDialogKind(null); }}>
         <DialogContent>
           <form className="contents" onSubmit={submitDialog}>
