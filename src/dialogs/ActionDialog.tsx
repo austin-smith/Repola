@@ -28,13 +28,13 @@ export function ActionDialog({ busy, error, plan, onCancel, onConfirm }: ActionD
 
   return (
     <Dialog open onOpenChange={(open) => { if (!open && !busy) onCancel(); }}>
-      <DialogContent className="sm:max-w-lg" initialFocus={inputRef}>
+      <DialogContent className="max-h-[calc(100dvh-2rem)] grid-cols-1 overflow-y-auto sm:max-w-lg" initialFocus={inputRef}>
         <DialogHeader>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 pr-6">
             <div className={`flex size-9 shrink-0 items-center justify-center ${plan.destructive ? "bg-destructive/10 text-destructive" : "bg-success/10 text-success"}`}>
               {plan.destructive ? <AlertTriangleIcon className="size-4" aria-hidden="true" /> : <CheckIcon className="size-4" aria-hidden="true" />}
             </div>
-            <div className="flex flex-col gap-1">
+            <div className="flex min-w-0 flex-col gap-1 wrap-anywhere">
               <span className="text-xs font-medium tracking-widest text-muted-foreground uppercase">Preflight complete</span>
               <DialogTitle>{plan.title}</DialogTitle>
             </div>
@@ -42,13 +42,13 @@ export function ActionDialog({ busy, error, plan, onCancel, onConfirm }: ActionD
           <DialogDescription>{plan.summary}</DialogDescription>
         </DialogHeader>
 
-        <div className="grid grid-cols-3 gap-px border bg-border">
+        <div className="grid auto-cols-fr grid-flow-col gap-px border bg-border">
           <DialogFact label="Repository" value={shortPath(plan.repositoryPath)} />
           {plan.branch && <DialogFact label="Branch" value={plan.branch} />}
           <DialogFact label="Affected" value={affectedLabel} />
         </div>
 
-        <ScrollArea className="max-h-28 border bg-card">
+        <ScrollArea className="min-w-0 border bg-card [&_[data-slot=scroll-area-viewport]]:max-h-28">
           <div className="flex flex-col gap-1 p-2">
             {plan.affectedPaths.map((path) => (
               <code key={path} className="font-mono text-xs break-all text-muted-foreground">{shortPath(path)}</code>
@@ -65,7 +65,7 @@ export function ActionDialog({ busy, error, plan, onCancel, onConfirm }: ActionD
 
         <div className="flex flex-col gap-1.5">
           <span className="text-xs font-medium tracking-widest text-muted-foreground uppercase">Exact command</span>
-          <code className="overflow-x-auto border-l-2 border-foreground bg-muted p-2 font-mono text-xs whitespace-nowrap">{plan.commandDisplay}</code>
+          <code className="border-l-2 border-foreground bg-muted p-2 font-mono text-xs whitespace-pre-wrap break-all">{plan.commandDisplay}</code>
         </div>
 
         <Field>
