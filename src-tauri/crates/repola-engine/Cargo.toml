@@ -28,3 +28,6 @@ minisign-verify = "0.2.5"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"] }
 sha2 = "0.11"
 notify = "8"
+
+[target.'cfg(windows)'.dependencies]
+process-wrap = { version = "10.0.1", default-features = false, features = ["std", "job-object", "creation-flags"] }

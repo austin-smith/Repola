@@ -288,15 +288,15 @@ fn request_model_catalog() -> Result<ModelListResult, String> {
     let mut child = command::spawn_piped_at(temporary.path(), "codex", ["app-server", "--stdio"])
         .map_err(codex_launch_error)?;
     let mut stdin = child
-        .stdin
+        .stdin()
         .take()
         .ok_or_else(|| "Could not open Codex app-server input.".to_string())?;
     let stdout = child
-        .stdout
+        .stdout()
         .take()
         .ok_or_else(|| "Could not read Codex app-server output.".to_string())?;
     let stderr = child
-        .stderr
+        .stderr()
         .take()
         .ok_or_else(|| "Could not read Codex app-server diagnostics.".to_string())?;
     let (sender, receiver) = mpsc::sync_channel(32);

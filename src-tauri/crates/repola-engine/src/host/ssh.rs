@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::io::Read;
-use std::process::{Child, ExitStatus};
+use std::process::ExitStatus;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,7 +12,7 @@ use crate::protocol::{
     read_frame, write_frame, AgentCapability, AgentErrorKind, AgentInfo, AgentRequest, AgentResult,
     RequestEnvelope, ResponseBody, ResponseEnvelope, PROTOCOL_VERSION,
 };
-use crate::worktree::command;
+use crate::worktree::command::{self, ManagedChild};
 
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -86,7 +86,7 @@ where
     let request_id = request.request_id.clone();
 
     let mut input = child
-        .stdin
+        .stdin()
         .take()
         .ok_or_else(|| HostError::Transport("OpenSSH stdin was not available".into()))?;
     let handshake_id = format!("{}:handshake", request.request_id);
@@ -112,11 +112,11 @@ where
     drop(input);
 
     let mut output = child
-        .stdout
+        .stdout()
         .take()
         .ok_or_else(|| HostError::Transport("OpenSSH stdout was not available".into()))?;
     let stderr = child
-        .stderr
+        .stderr()
         .take()
         .ok_or_else(|| HostError::Transport("OpenSSH stderr was not available".into()))?;
     let diagnostic_reader = thread::spawn(move || bounded_diagnostics(stderr));
@@ -382,7 +382,10 @@ fn operation_timeout(request: &AgentRequest) -> Duration {
     }
 }
 
-fn wait_for_exit(child: &mut Child, grace_period: Duration) -> Result<ExitStatus, HostError> {
+fn wait_for_exit(
+    child: &mut ManagedChild,
+    grace_period: Duration,
+) -> Result<ExitStatus, HostError> {
     let deadline = Instant::now() + grace_period;
     loop {
         match child.try_wait() {
@@ -484,7 +487,7 @@ fn ssh_exit_error(machine: &MachineProfile, status: ExitStatus, diagnostics: Str
     HostError::Transport(detail)
 }
 
-fn terminate(child: &mut Child) {
+fn terminate(child: &mut ManagedChild) {
     let _ = child.kill();
 }
 
