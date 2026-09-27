@@ -32,6 +32,7 @@ const LINE_ROW_ESTIMATE = 20;
 const GUTTER_WIDTH_PX = 28 + 44 + 44;
 
 interface SelectableHunkListProps {
+  disabled?: boolean;
   hunks: readonly PatchHunk[];
   selection: FileCommitSelection;
   /** The ancestor that scrolls the diff pane. Rows are windowed against it. */
@@ -44,7 +45,7 @@ interface SelectableHunkListProps {
  * only mount the rows currently visible in the scroll container. Each hunk's
  * visible rows are wrapped in their own labelled group.
  */
-export function SelectableHunkList({ hunks, selection, scrollElement, onHunkSelectionChange }: SelectableHunkListProps) {
+export function SelectableHunkList({ hunks, selection, scrollElement, onHunkSelectionChange, disabled = false }: SelectableHunkListProps) {
   const rows = useMemo(() => buildRows(hunks, selection), [hunks, selection]);
   const longestLine = useMemo(
     () => rows.reduce((longest, row) => (row.kind === "line" ? Math.max(longest, row.line.content.length) : longest), 0),
@@ -119,8 +120,8 @@ export function SelectableHunkList({ hunks, selection, scrollElement, onHunkSele
               const row = rows[item.index];
               if (!row) return null;
               return row.kind === "header"
-                ? <HunkHeaderRow key={item.key} index={item.index} measure={virtualizer.measureElement} hunk={row.hunk.hunk} selectedCount={row.hunk.selected.length} selectableCount={row.hunk.selectable.length} onToggle={toggleHunk} />
-                : <HunkLineRow key={item.key} index={item.index} measure={virtualizer.measureElement} hunkIndex={row.hunk.hunk.index} line={row.line} checked={row.checked} onToggle={toggleLine} />;
+                ? <HunkHeaderRow key={item.key} disabled={disabled} index={item.index} measure={virtualizer.measureElement} hunk={row.hunk.hunk} selectedCount={row.hunk.selected.length} selectableCount={row.hunk.selectable.length} onToggle={toggleHunk} />
+                : <HunkLineRow key={item.key} disabled={disabled} index={item.index} measure={virtualizer.measureElement} hunkIndex={row.hunk.hunk.index} line={row.line} checked={row.checked} onToggle={toggleLine} />;
             })}
           </div>
         ))}
@@ -130,12 +131,13 @@ export function SelectableHunkList({ hunks, selection, scrollElement, onHunkSele
 }
 
 interface RowChromeProps {
+  disabled: boolean;
   index: number;
   measure: (element: HTMLElement | null) => void;
   style?: CSSProperties;
 }
 
-const HunkHeaderRow = memo(function HunkHeaderRow({ index, measure, hunk, selectedCount, selectableCount, onToggle }: RowChromeProps & {
+const HunkHeaderRow = memo(function HunkHeaderRow({ index, measure, hunk, selectedCount, selectableCount, onToggle, disabled }: RowChromeProps & {
   hunk: PatchHunk;
   selectedCount: number;
   selectableCount: number;
@@ -145,6 +147,7 @@ const HunkHeaderRow = memo(function HunkHeaderRow({ index, measure, hunk, select
   return (
     <div ref={measure} data-index={index} className="flex h-8 items-center gap-2.5 border-t bg-muted/40 pr-3 pl-1.5 first:border-t-0">
       <Checkbox
+        disabled={disabled}
         checked={allSelected}
         indeterminate={selectedCount > 0 && !allSelected}
         onCheckedChange={(checked) => onToggle(hunk.index, checked === true)}
@@ -155,7 +158,7 @@ const HunkHeaderRow = memo(function HunkHeaderRow({ index, measure, hunk, select
   );
 });
 
-const HunkLineRow = memo(function HunkLineRow({ index, measure, hunkIndex, line, checked, onToggle }: RowChromeProps & {
+const HunkLineRow = memo(function HunkLineRow({ index, measure, hunkIndex, line, checked, onToggle, disabled }: RowChromeProps & {
   hunkIndex: number;
   line: SelectableLine;
   checked: boolean;
@@ -181,6 +184,7 @@ const HunkLineRow = memo(function HunkLineRow({ index, measure, hunkIndex, line,
           <>
             <input
               type="checkbox"
+              disabled={disabled}
               className="sr-only"
               checked={checked}
               onChange={() => onToggle(hunkIndex, line.index)}

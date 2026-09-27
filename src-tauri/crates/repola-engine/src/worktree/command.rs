@@ -132,6 +132,15 @@ fn launch(
     command: &mut Command,
     input: Option<&[u8]>,
 ) -> Result<Output, CommandError> {
+    launch_with_timeout(program, command, input, COMMAND_TIMEOUT)
+}
+
+fn launch_with_timeout(
+    program: &str,
+    command: &mut Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<Output, CommandError> {
     let token = operation::current_operation();
     if token.is_cancelled() {
         return Err(CommandError::Cancelled {
@@ -179,14 +188,14 @@ fn launch(
                 program: program.to_string(),
             });
         }
-        if started.elapsed() >= COMMAND_TIMEOUT {
+        if started.elapsed() >= timeout {
             terminate_and_reap(&mut child);
             let _ = finish_input();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(CommandError::Timeout {
                 program: program.to_string(),
-                seconds: COMMAND_TIMEOUT.as_secs(),
+                seconds: timeout.as_secs(),
             });
         }
         match child.try_wait() {
@@ -286,7 +295,34 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    spawn_piped_in(None, program, args)
+}
+
+pub(crate) fn spawn_piped_at<I, S>(
+    directory: &Path,
+    program: &str,
+    args: I,
+) -> Result<Child, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    spawn_piped_in(Some(directory), program, args)
+}
+
+fn spawn_piped_in<I, S>(
+    directory: Option<&Path>,
+    program: &str,
+    args: I,
+) -> Result<Child, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut command = command(program)?;
+    if let Some(directory) = directory {
+        command.current_dir(directory);
+    }
     command
         .args(args)
         .stdin(Stdio::piped())
@@ -307,6 +343,22 @@ where
     let mut command = command(program)?;
     command.current_dir(directory).args(args);
     launch(program, &mut command, None)
+}
+
+pub(crate) fn output_at_with_input_timeout<I, S>(
+    directory: &Path,
+    program: &str,
+    args: I,
+    input: &[u8],
+    timeout: Duration,
+) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = command(program)?;
+    command.current_dir(directory).args(args);
+    launch_with_timeout(program, &mut command, Some(input), timeout)
 }
 
 pub fn git_at<I, S>(path: &Path, args: I) -> Result<Output, CommandError>

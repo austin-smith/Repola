@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowDownIcon, ArrowUpIcon, CheckCircle2Icon, LaptopIcon, PencilIcon, PlusIcon, ServerIcon, Trash2Icon, WifiIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -14,10 +14,14 @@ import { TooltipButton } from "@/components/tooltip-button";
 import { loadAppPreferences, loadExternalTools, saveAppPreferences } from "../ipc/app-preferences";
 import { UpdateSettings } from "../app/AppUpdater";
 import { resolveAvailableToolId, toolLabels } from "../domain/external-tools";
-import type { AgentInfo, AppPreferences, ExternalToolAvailability, MachineProfile, MachineProfileInput } from "../ipc/types";
+import { CommitMessageSettings } from "./CommitMessageSettings";
+import { activeGenerationSelection, rememberGenerationSelection } from "../domain/text-generation";
+import { toMessage } from "../lib/errors";
+import type { AgentInfo, AppPreferences, TextGenerationSelection, ExternalToolAvailability, MachineProfile, MachineProfileInput } from "../ipc/types";
 
 interface SettingsDialogProps {
   machines: MachineProfile[];
+  selectedMachineId: string;
   busy: boolean;
   onClose: () => void;
   onRemoveMachine: (machineId: string) => Promise<boolean>;
@@ -41,6 +45,7 @@ function inputFor(machine?: MachineProfile): MachineProfileInput {
 
 export function SettingsDialog({
   machines,
+  selectedMachineId,
   busy,
   onClose,
   onRemoveMachine,
@@ -55,6 +60,10 @@ export function SettingsDialog({
   const [externalTools, setExternalTools] = useState<ExternalToolAvailability | null>(null);
   const [preferencesBusy, setPreferencesBusy] = useState(false);
   const [preferencesError, setPreferencesError] = useState<string | null>(null);
+  const [generationSaveError, setGenerationSaveError] = useState<string | null>(null);
+  const [generationSaving, setGenerationSaving] = useState(false);
+  const savingPreferences = useRef(false);
+  const selectedMachine = machines.find((machine) => machine.id === selectedMachineId) ?? machines[0];
 
   useEffect(() => {
     let active = true;
@@ -73,14 +82,16 @@ export function SettingsDialog({
   }, []);
 
   const persistPreferences = async () => {
-    if (!preferences) return;
+    if (!preferences || savingPreferences.current) return;
+    savingPreferences.current = true;
     setPreferencesBusy(true);
     setPreferencesError(null);
     try {
-      setPreferences(await saveAppPreferences(preferences));
+      await saveAppPreferences(preferences);
     } catch (cause) {
       setPreferencesError(cause instanceof Error ? cause.message : String(cause));
     } finally {
+      savingPreferences.current = false;
       setPreferencesBusy(false);
     }
   };
@@ -102,6 +113,41 @@ export function SettingsDialog({
   const terminalOptions = externalTools?.terminals ?? [];
   const editorItems = toolLabels(editorOptions);
   const terminalItems = toolLabels(terminalOptions);
+  const persistGenerationSelection = async (selection: TextGenerationSelection) => {
+    if (!preferences || savingPreferences.current) return;
+    savingPreferences.current = true;
+    const machineId = selectedMachine.id;
+    const previous = preferences.textGenerationSelections[machineId];
+    const remembered = rememberGenerationSelection(previous, selection);
+    const next = {
+      ...preferences,
+      textGenerationSelections: { ...preferences.textGenerationSelections, [machineId]: remembered },
+    };
+    setPreferences(next);
+    setGenerationSaving(true);
+    setGenerationSaveError(null);
+    try {
+      // Keep unsaved editor/terminal form choices out of this automatic save.
+      const stored = await loadAppPreferences();
+      const saved = await saveAppPreferences({
+        ...stored,
+        textGenerationSelections: { ...stored.textGenerationSelections, [machineId]: remembered },
+      });
+      setPreferences((current) => current && ({ ...current, textGenerationSelections: saved.textGenerationSelections }));
+    } catch (cause) {
+      setPreferences((current) => {
+        if (!current) return current;
+        const selections = { ...current.textGenerationSelections };
+        if (previous) selections[machineId] = previous;
+        else delete selections[machineId];
+        return { ...current, textGenerationSelections: selections };
+      });
+      setGenerationSaveError(toMessage(cause));
+    } finally {
+      savingPreferences.current = false;
+      setGenerationSaving(false);
+    }
+  };
 
   return (
     <Dialog open onOpenChange={(open) => { if (!open && !busy) onClose(); }}>
@@ -281,6 +327,17 @@ export function SettingsDialog({
 
         <Separator />
 
+        <CommitMessageSettings
+          machine={selectedMachine}
+          selection={activeGenerationSelection(preferences?.textGenerationSelections[selectedMachine.id])}
+          providerSelections={preferences?.textGenerationSelections[selectedMachine.id]?.selections}
+          saveError={generationSaveError}
+          disabled={preferencesBusy || generationSaving || !preferences}
+          onChange={(selection) => void persistGenerationSelection(selection)}
+        />
+
+        <Separator />
+
         <section aria-labelledby="settings-tools" className="flex flex-col gap-3">
           <div className="flex flex-col gap-1">
             <h3 id="settings-tools" className={sectionTitleClass}>Tools & Git</h3>
@@ -315,7 +372,7 @@ export function SettingsDialog({
                 <FieldLabel htmlFor="settings-sign-commits" className="font-normal">Sign commits by default using Git configuration</FieldLabel>
               </Field>
               <div className="col-span-2 flex justify-end">
-                <Button size="sm" disabled={preferencesBusy} onClick={() => void persistPreferences()}>{preferencesBusy ? <Spinner data-icon="inline-start" /> : null}Save preferences</Button>
+                <Button size="sm" disabled={preferencesBusy || generationSaving} onClick={() => void persistPreferences()}>{preferencesBusy ? <Spinner data-icon="inline-start" /> : null}Save preferences</Button>
               </div>
             </div>
           ) : <p className="text-sm text-muted-foreground">Loading application preferences…</p>}

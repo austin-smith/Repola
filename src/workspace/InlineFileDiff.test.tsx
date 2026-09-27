@@ -89,7 +89,7 @@ function ScrollHost({ children }: { children: (scrollElement: HTMLDivElement | n
   );
 }
 
-function renderDiff(selection: FileCommitSelection, overrides: Partial<FileChange> = {}, cache = new Map<string, FileDiff>(), diffKey = "key-1") {
+function renderDiff(selection: FileCommitSelection, overrides: Partial<FileChange> = {}, cache = new Map<string, FileDiff>(), diffKey = "key-1", selectionDisabled = false) {
   const onSelectionChange = vi.fn();
   const tree = (diffCache: Map<string, FileDiff>, key: string, changeOverrides: Partial<FileChange>) => (
     <ThemeProvider storageKey="test-theme">
@@ -104,6 +104,7 @@ function renderDiff(selection: FileCommitSelection, overrides: Partial<FileChang
             cache={diffCache}
             scrollElement={scrollElement}
             selection={selection}
+            selectionDisabled={selectionDisabled}
             onSelectionChange={onSelectionChange}
           />
         )}
@@ -125,6 +126,17 @@ describe("InlineFileDiff", () => {
   beforeEach(() => {
     ipc.fetchFileDiff.mockReset();
     ipc.fetchFileDiff.mockResolvedValue(diff);
+  });
+
+  it("disables both hunk and line selection while generation is pending", async () => {
+    const { onSelectionChange } = renderDiff(includeAllChanges, {}, new Map(), "key-1", true);
+    await screen.findAllByRole("group", { name: "Select changed lines" });
+    for (const checkbox of screen.getAllByRole("checkbox")) {
+      if (checkbox instanceof HTMLInputElement) expect(checkbox).toBeDisabled();
+      else expect(checkbox).toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(checkbox);
+    }
+    expect(onSelectionChange).not.toHaveBeenCalled();
   });
 
   it("requests the diff for the change and renders one selectable group per hunk", async () => {

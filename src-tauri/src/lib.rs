@@ -25,14 +25,14 @@ use worktree::{
     CloneRepositoryRequest, CommitChangedFile, CommitFileDiffRequest, CommitFilesRequest,
     CommitRequest, CommitResult, ConflictFile, ConflictFileRequest, CreateRepositoryRequest,
     CreateWorktreeRequest, CreateWorktreeResult, DiscardAllRequest, DiscardFileRequest, FileDiff,
-    FileDiffRequest, HistoryMutationRequest, HistoryMutationResult, HistoryPage, HistoryRequest,
-    PullRequestEvidence, PullRequestMutationRequest, PullRequestMutationResult, ReflogEntry,
-    ReflogRequest, RepositoryOperationMutationResult, RepositoryOperationRequest,
-    RepositoryOperationResult, ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult,
-    SetFileStagingRequest, StashEntry, StashMutationRequest, StashMutationResult, StashRequest,
-    SyncRequest, SyncResult, TagInfo, TagMutationRequest, TagMutationResult, TagRequest,
-    UndoCommitRequest, UndoCommitResult, WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges,
-    WorktreeWatcher,
+    FileDiffRequest, GenerateCommitMessageRequest, GeneratedCommitMessage, HistoryMutationRequest,
+    HistoryMutationResult, HistoryPage, HistoryRequest, PullRequestEvidence,
+    PullRequestMutationRequest, PullRequestMutationResult, ReflogEntry, ReflogRequest,
+    RepositoryOperationMutationResult, RepositoryOperationRequest, RepositoryOperationResult,
+    ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry,
+    StashMutationRequest, StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo,
+    TagMutationRequest, TagMutationResult, TagRequest, TextGenerationStatus, UndoCommitRequest,
+    UndoCommitResult, WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges, WorktreeWatcher,
 };
 
 const WORKTREE_CHANGED_EVENT: &str = "repola://worktree-changed";
@@ -694,6 +694,65 @@ async fn commit_working_copy(
 }
 
 #[tauri::command]
+async fn generate_commit_message(
+    app: tauri::AppHandle,
+    operations: tauri::State<'_, OperationRegistry>,
+    machine_id: String,
+    operation_id: String,
+    mut request: GenerateCommitMessageRequest,
+) -> Result<GeneratedCommitMessage, String> {
+    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+    let preferences = settings::app_preferences(&app).map_err(|error| error.to_string())?;
+    request.text_generation_selection = preferences
+        .text_generation_selections
+        .get(&machine_id)
+        .map(|settings| settings.selection());
+    let token = operations.begin(&operation_id)?;
+    let request_id = operation_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        match execute_on_machine(
+            &machine,
+            request_id,
+            AgentRequest::GenerateCommitMessage { request },
+            token,
+        )? {
+            AgentResult::GeneratedCommitMessage { message } => Ok(message),
+            _ => Err("The Repola agent returned an unexpected response.".to_string()),
+        }
+    })
+    .await;
+    operations.finish(&operation_id);
+    result.map_err(|error| format!("Commit-message task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn text_generation_status(
+    app: tauri::AppHandle,
+    operations: tauri::State<'_, OperationRegistry>,
+    machine_id: String,
+    provider: repola_engine::preferences::TextGenerationProvider,
+    operation_id: String,
+) -> Result<TextGenerationStatus, String> {
+    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+    let token = operations.begin(&operation_id)?;
+    let request_id = operation_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        match execute_on_machine(
+            &machine,
+            request_id,
+            AgentRequest::TextGenerationStatus { provider },
+            token,
+        )? {
+            AgentResult::TextGenerationStatus { status } => Ok(status),
+            _ => Err("The Repola agent returned an unexpected response.".to_string()),
+        }
+    })
+    .await;
+    operations.finish(&operation_id);
+    result.map_err(|error| format!("Text generation status task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn undo_commit(
     app: tauri::AppHandle,
     operations: tauri::State<'_, OperationRegistry>,
@@ -1341,7 +1400,9 @@ pub fn run() {
             cancel_operation,
             apply_patch_hunk,
             clone_repository,
+            text_generation_status,
             commit_working_copy,
+            generate_commit_message,
             commit_file_diff,
             create_repository,
             create_worktree,

@@ -11,10 +11,10 @@ use super::models::{
     ApplyPatchHunkRequest, CommitFileSelection, CommitHunkSelection, CommitPerson, CommitRequest,
     CommitResult, CommitSigning, CommitTrailer, ConflictFile, ConflictFileRequest,
     ConflictResolutionKind, DiscardAllRequest, DiscardFileRequest, DiscardScope, FileChange,
-    FileChangeKind, FileDiff, FileDiffRequest, FileModeChange, GitPath, ImagePreview, PatchHunk,
-    PatchHunkAction, RepositoryOperation, ResolveConflictRequest, ReviewedFileChange,
-    SetFileStagingRequest, UndoCommitRequest, UndoCommitResult, WorkingCopyRequest,
-    WorkingCopySnapshot,
+    FileChangeKind, FileDiff, FileDiffRequest, FileModeChange, GenerateCommitMessageRequest,
+    GitPath, ImagePreview, PatchHunk, PatchHunkAction, RepositoryOperation, ResolveConflictRequest,
+    ReviewedFileChange, SetFileStagingRequest, UndoCommitRequest, UndoCommitResult,
+    WorkingCopyRequest, WorkingCopySnapshot,
 };
 
 const MAX_COMMIT_SUMMARY_BYTES: usize = 998;
@@ -1060,6 +1060,170 @@ pub(super) fn truncate_file_patch(bytes: &[u8]) -> (String, bool) {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SelectedCommitContext {
+    /// Full selected-tree identity, including binary and oversized patches.
+    pub tree_oid: String,
+    pub branch: Option<String>,
+    pub changed_files: String,
+    pub patch: String,
+    pub recent_subjects: Vec<String>,
+}
+
+pub(super) fn selected_commit_context(
+    request: &GenerateCommitMessageRequest,
+) -> Result<SelectedCommitContext, String> {
+    let snapshot = working_copy_snapshot(WorkingCopyRequest {
+        repository_path: request.repository_path.clone(),
+        worktree_path: request.worktree_path.clone(),
+    })?;
+    if snapshot.head != request.expected_head {
+        return Err(
+            "The working-copy HEAD changed after the commit was reviewed. Refresh and try again."
+                .into(),
+        );
+    }
+    if request.included_changes.is_empty() && !request.amend {
+        return Err("Include at least one change before generating a commit message.".into());
+    }
+    validate_commit_selections(&snapshot, &request.included_changes)?;
+
+    let worktree = PathBuf::from(&snapshot.worktree_path);
+    let temporary_index = tempfile::tempdir()
+        .map_err(|error| format!("Could not create a temporary Git index: {error}"))?;
+    let index_path = temporary_index.path().join("index");
+    let objects_path = temporary_index.path().join("objects");
+    fs::create_dir(&objects_path).map_err(|error| error.to_string())?;
+    let object_output = command::git_at(
+        &worktree,
+        [
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    if !object_output.status.success() {
+        return Err("Could not resolve the repository object directory.".into());
+    }
+    // C-quote one exact alternate; Git paths may contain newlines or delimiters.
+    let object_bytes = object_output
+        .stdout
+        .strip_suffix(b"\n")
+        .ok_or("Git returned an incomplete object directory.")?;
+    let alternate = OsString::from(quote_alternate_directory(object_bytes));
+    let environment = [
+        ("GIT_INDEX_FILE", index_path.as_os_str()),
+        ("GIT_OBJECT_DIRECTORY", objects_path.as_os_str()),
+        ("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternate.as_os_str()),
+    ];
+    initialize_commit_index(&worktree, snapshot.head.as_deref(), &environment)?;
+    populate_commit_index(
+        &snapshot,
+        &request.included_changes,
+        &worktree,
+        &environment,
+    )?;
+
+    let tree = command::git_at_with_env(&worktree, ["write-tree"], environment.iter().copied())
+        .map_err(|error| error.to_string())?;
+    if !tree.status.success() {
+        return Err("Could not fingerprint the selected changes.".into());
+    }
+    let tree_oid = String::from_utf8_lossy(&tree.stdout).trim().to_string();
+
+    let base = if request.amend {
+        let parent = command::git_at(&worktree, ["rev-parse", "--verify", "HEAD^"])
+            .map_err(|error| error.to_string())?;
+        if parent.status.success() {
+            String::from_utf8_lossy(&parent.stdout).trim().to_string()
+        } else {
+            empty_tree(&worktree)?
+        }
+    } else if let Some(head) = &snapshot.head {
+        head.clone()
+    } else {
+        empty_tree(&worktree)?
+    };
+
+    let changed_output = command::git_at_with_env(
+        &worktree,
+        [
+            "diff",
+            "--cached",
+            "--name-status",
+            "--no-color",
+            &base,
+            "--",
+        ],
+        environment.iter().copied(),
+    )
+    .map_err(|error| error.to_string())?;
+    if !changed_output.status.success() {
+        return Err(String::from_utf8_lossy(&changed_output.stderr)
+            .trim()
+            .to_string());
+    }
+    let changed_files = String::from_utf8_lossy(&changed_output.stdout)
+        .trim()
+        .to_string();
+    if changed_files.is_empty() {
+        return Err("The included changes do not produce a commit.".into());
+    }
+
+    let patch = match command::git_at_with_env(
+        &worktree,
+        [
+            "diff",
+            "--cached",
+            "--patch",
+            "--minimal",
+            "--no-ext-diff",
+            "--no-color",
+            &base,
+            "--",
+        ],
+        environment.iter().copied(),
+    ) {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+        Ok(output) => return Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        Err(command::CommandError::OutputTooLarge {
+            stream: "stdout", ..
+        }) => "[Selected patch is too large to include; use the file list and repository style.]"
+            .into(),
+        Err(error) => return Err(error.to_string()),
+    };
+
+    let mut log_args = vec!["log", "-n", "12", "--no-merges"];
+    if request.amend {
+        log_args.push("--skip=1");
+    }
+    log_args.push("--pretty=format:%s");
+    let recent_subjects = command::git_at(&worktree, log_args)
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(SelectedCommitContext {
+        tree_oid,
+        branch: snapshot.branch,
+        changed_files,
+        patch,
+        recent_subjects,
+    })
+}
+
 pub fn commit(request: CommitRequest) -> Result<CommitResult, String> {
     validate_commit_message(&request.summary, &request.description)?;
     validate_commit_metadata(&request)?;
@@ -1113,8 +1277,14 @@ pub fn commit(request: CommitRequest) -> Result<CommitResult, String> {
     let temporary_index = tempfile::tempdir()
         .map_err(|error| format!("Could not create a temporary Git index: {error}"))?;
     let index_path = temporary_index.path().join("index");
-    initialize_commit_index(&worktree, snapshot.head.as_deref(), &index_path)?;
-    populate_commit_index(&snapshot, &request.included_changes, &worktree, &index_path)?;
+    let environment = [("GIT_INDEX_FILE", index_path.as_os_str())];
+    initialize_commit_index(&worktree, snapshot.head.as_deref(), &environment)?;
+    populate_commit_index(
+        &snapshot,
+        &request.included_changes,
+        &worktree,
+        &environment,
+    )?;
     if !request.amend
         && commit_index_matches_base(&worktree, &index_path, snapshot.head.as_deref())?
     {
@@ -1226,18 +1396,26 @@ fn validate_commit_selections(
     Ok(())
 }
 
+fn quote_alternate_directory(bytes: &[u8]) -> String {
+    let mut quoted = String::from("\"");
+    for byte in bytes {
+        quoted.push_str(&format!("\\{byte:03o}"));
+    }
+    quoted.push('"');
+    quoted
+}
+
 fn initialize_commit_index(
     worktree: &Path,
     head: Option<&str>,
-    index_path: &Path,
+    environment: &[(&str, &std::ffi::OsStr)],
 ) -> Result<(), String> {
     let args = match head {
         Some(head) => vec![OsString::from("read-tree"), OsString::from(head)],
         None => vec![OsString::from("read-tree"), OsString::from("--empty")],
     };
-    let output =
-        command::git_at_with_env(worktree, args, [("GIT_INDEX_FILE", index_path.as_os_str())])
-            .map_err(|error| error.to_string())?;
+    let output = command::git_at_with_env(worktree, args, environment.iter().copied())
+        .map_err(|error| error.to_string())?;
     ensure_success(output, "initialize the commit index")
 }
 
@@ -1245,7 +1423,7 @@ fn populate_commit_index(
     snapshot: &WorkingCopySnapshot,
     selections: &[CommitFileSelection],
     worktree: &Path,
-    index_path: &Path,
+    environment: &[(&str, &std::ffi::OsStr)],
 ) -> Result<(), String> {
     let mut whole_paths = BTreeSet::<OsString>::new();
     for selection in selections.iter().filter(|selection| selection.include_all) {
@@ -1261,9 +1439,8 @@ fn populate_commit_index(
             OsString::from("--"),
         ];
         args.extend(whole_paths);
-        let output =
-            command::git_at_with_env(worktree, args, [("GIT_INDEX_FILE", index_path.as_os_str())])
-                .map_err(|error| error.to_string())?;
+        let output = command::git_at_with_env(worktree, args, environment.iter().copied())
+            .map_err(|error| error.to_string())?;
         ensure_success(output, "include the selected files in the commit")?;
     }
 
@@ -1296,14 +1473,14 @@ fn populate_commit_index(
                 change.path.display
             ));
         }
-        apply_commit_hunks(worktree, index_path, &diff.hunks, &selection.hunks)?;
+        apply_commit_hunks(worktree, environment, &diff.hunks, &selection.hunks)?;
     }
     Ok(())
 }
 
 fn apply_commit_hunks(
     worktree: &Path,
-    index_path: &Path,
+    environment: &[(&str, &std::ffi::OsStr)],
     current_hunks: &[PatchHunk],
     selections: &[CommitHunkSelection],
 ) -> Result<(), String> {
@@ -1330,7 +1507,7 @@ fn apply_commit_hunks(
             worktree,
             ["apply", "--cached", "--whitespace=nowarn"],
             patch.as_bytes(),
-            [("GIT_INDEX_FILE", index_path.as_os_str())],
+            environment.iter().copied(),
         )
         .map_err(|error| error.to_string())?;
         ensure_success(output, "include the selected lines in the commit")?;
@@ -2026,6 +2203,107 @@ mod tests {
             include_all: true,
             hunks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn commit_message_context_uses_only_the_reviewed_selection_without_touching_the_index() {
+        let repository = repository();
+        std::fs::write(repository.path().join("included.txt"), "before included\n")
+            .expect("included base");
+        std::fs::write(repository.path().join("excluded.txt"), "before excluded\n")
+            .expect("excluded base");
+        command::successful_git_at(repository.path(), ["add", "--", "."]).expect("stage base");
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"])
+            .expect("commit base");
+        std::fs::write(repository.path().join("included.txt"), "after included\n")
+            .expect("included edit");
+        std::fs::write(repository.path().join("excluded.txt"), "after excluded\n")
+            .expect("excluded edit");
+        command::successful_git_at(repository.path(), ["add", "--", "excluded.txt"])
+            .expect("stage excluded file outside Repola");
+        let index_before =
+            git_text(repository.path(), ["diff", "--cached", "--patch"]).expect("index before");
+
+        let snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
+        let included = snapshot
+            .changes
+            .iter()
+            .find(|change| change.path.display == "included.txt")
+            .map(include_whole)
+            .expect("included change");
+        let context = selected_commit_context(&GenerateCommitMessageRequest {
+            repository_path: snapshot.repository_path.clone(),
+            worktree_path: snapshot.worktree_path.clone(),
+            expected_head: snapshot.head.clone(),
+            included_changes: vec![included],
+            amend: false,
+            text_generation_selection: None,
+        })
+        .expect("context");
+
+        assert!(context.changed_files.contains("included.txt"));
+        assert!(!context.changed_files.contains("excluded.txt"));
+        assert!(context.patch.contains("+after included"));
+        assert!(!context.patch.contains("after excluded"));
+        assert_eq!(
+            git_text(repository.path(), ["diff", "--cached", "--patch"]).expect("index after"),
+            index_before
+        );
+    }
+
+    #[test]
+    fn amended_commit_context_describes_the_final_replacement_commit() {
+        let repository = repository();
+        std::fs::write(repository.path().join("message.txt"), "base\n").expect("base");
+        command::successful_git_at(repository.path(), ["add", "--", "."]).expect("stage base");
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"])
+            .expect("commit base");
+        std::fs::write(repository.path().join("message.txt"), "second\n").expect("second");
+        command::successful_git_at(repository.path(), ["commit", "-am", "second"])
+            .expect("commit second");
+        std::fs::write(repository.path().join("message.txt"), "final\n").expect("final");
+
+        let snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
+        let included = snapshot.changes.first().map(include_whole).expect("change");
+        let context = selected_commit_context(&GenerateCommitMessageRequest {
+            repository_path: snapshot.repository_path.clone(),
+            worktree_path: snapshot.worktree_path.clone(),
+            expected_head: snapshot.head.clone(),
+            included_changes: vec![included],
+            amend: true,
+            text_generation_selection: None,
+        })
+        .expect("amended context");
+
+        assert!(context.patch.contains("+final"));
+        assert!(!context.patch.contains("-second"));
+        assert!(!context
+            .recent_subjects
+            .iter()
+            .any(|subject| subject == "second"));
+    }
+
+    #[test]
+    fn message_only_amend_context_describes_the_existing_commit() {
+        let repository = repository();
+        std::fs::write(repository.path().join("message.txt"), "committed\n").expect("write");
+        command::successful_git_at(repository.path(), ["add", "--", "."]).expect("stage");
+        command::successful_git_at(repository.path(), ["commit", "-m", "existing message"])
+            .expect("commit");
+
+        let snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
+        let context = selected_commit_context(&GenerateCommitMessageRequest {
+            repository_path: snapshot.repository_path.clone(),
+            worktree_path: snapshot.worktree_path.clone(),
+            expected_head: snapshot.head.clone(),
+            included_changes: vec![],
+            amend: true,
+            text_generation_selection: None,
+        })
+        .expect("amended context");
+
+        assert!(context.changed_files.contains("message.txt"));
+        assert!(context.patch.contains("+committed"));
     }
 
     fn conflicted_repository() -> (tempfile::TempDir, WorkingCopySnapshot, GitPath) {

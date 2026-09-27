@@ -9,7 +9,7 @@ use crate::host::HostError;
 use crate::machines::MachineProfile;
 use crate::operation::OperationToken;
 use crate::protocol::{
-    read_frame, write_frame, AgentCapability, AgentInfo, AgentRequest, AgentResult,
+    read_frame, write_frame, AgentCapability, AgentErrorKind, AgentInfo, AgentRequest, AgentResult,
     RequestEnvelope, ResponseBody, ResponseEnvelope, PROTOCOL_VERSION,
 };
 use crate::worktree::command;
@@ -17,6 +17,7 @@ use crate::worktree::command;
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const STANDARD_TIMEOUT: Duration = Duration::from_secs(120);
+const TEXT_GENERATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const EXIT_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
@@ -163,10 +164,15 @@ where
             }
         };
         if response.protocol_version != PROTOCOL_VERSION {
-            break Err(HostError::Protocol(format!(
+            let detail = format!(
                 "agent responded with protocol version {}; expected {}",
                 response.protocol_version, PROTOCOL_VERSION
-            )));
+            );
+            break Err(if awaiting_handshake {
+                preflight_protocol_error(machine, detail)
+            } else {
+                HostError::Protocol(detail)
+            });
         }
         let expected_id = if awaiting_handshake {
             &handshake_id
@@ -196,7 +202,11 @@ where
                     ));
                 }
                 ResponseBody::Failure { error } => {
-                    break Err(HostError::Remote(error.summary.clone()));
+                    break Err(if error.kind == AgentErrorKind::Protocol {
+                        preflight_protocol_error(machine, error.summary.clone())
+                    } else {
+                        HostError::Remote(error.summary.clone())
+                    });
                 }
             }
         }
@@ -239,6 +249,13 @@ fn agent_recovery_allowed(error: &HostError) -> bool {
         error,
         HostError::AgentUnavailable { .. } | HostError::AgentVersionMismatch { .. }
     )
+}
+
+fn preflight_protocol_error(machine: &MachineProfile, detail: String) -> HostError {
+    HostError::AgentUnavailable {
+        machine: machine.name.clone(),
+        detail,
+    }
 }
 
 fn validate_handshake(
@@ -289,6 +306,9 @@ fn validate_handshake(
         | AgentRequest::MutateRepositoryOperation { .. }
         | AgentRequest::Commit { .. }
         | AgentRequest::UndoCommit { .. } => &[AgentCapability::WorkingCopy],
+        AgentRequest::GenerateCommitMessage { .. } | AgentRequest::TextGenerationStatus { .. } => {
+            &[AgentCapability::TextGeneration]
+        }
         AgentRequest::History { .. }
         | AgentRequest::Reflog { .. }
         | AgentRequest::CommitFiles { .. }
@@ -325,9 +345,11 @@ fn operation_timeout(request: &AgentRequest) -> Duration {
     match request {
         AgentRequest::Handshake { .. } => HANDSHAKE_TIMEOUT,
         AgentRequest::ScanWorktrees { .. } => SCAN_TIMEOUT,
+        AgentRequest::GenerateCommitMessage { .. } => TEXT_GENERATION_TIMEOUT,
         AgentRequest::ResolveRepository { .. }
         | AgentRequest::FetchPullRequests { .. }
         | AgentRequest::MutatePullRequest { .. }
+        | AgentRequest::TextGenerationStatus { .. }
         | AgentRequest::WorktreeChanges { .. }
         | AgentRequest::FileDiff { .. }
         | AgentRequest::WorkingCopySnapshot { .. }
@@ -509,6 +531,17 @@ mod tests {
             ]
             .map(OsString::from)
         );
+    }
+
+    #[test]
+    fn preflight_protocol_errors_allow_the_managed_agent_to_be_refreshed() {
+        let error = preflight_protocol_error(&profile(), "protocol 13 is too old".into());
+        assert!(agent_recovery_allowed(&error));
+        assert!(matches!(
+            error,
+            HostError::AgentUnavailable { machine, detail }
+                if machine == "Build server" && detail == "protocol 13 is too old"
+        ));
     }
 
     #[test]

@@ -76,6 +76,7 @@ where
                             AgentCapability::WorktreeManagement,
                             AgentCapability::Stashes,
                             AgentCapability::ProviderIntegration,
+                            AgentCapability::TextGeneration,
                         ],
                     },
                 })
@@ -123,6 +124,14 @@ where
         AgentRequest::Commit { request } => worktree::commit(request)
             .map(|result| AgentResult::Commit { result })
             .map_err(AgentError::operation),
+        AgentRequest::GenerateCommitMessage { request } => {
+            worktree::generate_commit_message(request)
+                .map(|message| AgentResult::GeneratedCommitMessage { message })
+                .map_err(AgentError::operation)
+        }
+        AgentRequest::TextGenerationStatus { provider } => Ok(AgentResult::TextGenerationStatus {
+            status: worktree::text_generation_status(provider),
+        }),
         AgentRequest::UndoCommit { request } => worktree::undo_commit(request)
             .map(|result| AgentResult::CommitUndone {
                 result: Box::new(result),

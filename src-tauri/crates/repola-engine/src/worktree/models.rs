@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::preferences::TextGenerationSelection;
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanRequest {
@@ -720,6 +722,71 @@ pub struct CommitRequest {
     pub trailers: Vec<CommitTrailer>,
     #[serde(default)]
     pub signing: CommitSigning,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateCommitMessageRequest {
+    pub repository_path: String,
+    pub worktree_path: String,
+    pub expected_head: Option<String>,
+    #[serde(default)]
+    pub included_changes: Vec<CommitFileSelection>,
+    #[serde(default)]
+    pub amend: bool,
+    #[serde(default)]
+    pub text_generation_selection: Option<TextGenerationSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratedCommitMessage {
+    pub summary: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextGenerationStatusKind {
+    Ready,
+    NotInstalled,
+    SignedOut,
+    UpdateRequired,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextGenerationStatus {
+    pub status: TextGenerationStatusKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub version: Option<String>,
+    #[serde(default)]
+    pub models: Vec<TextGenerationModel>,
+    pub recommended_selection: Option<TextGenerationSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextGenerationModel {
+    pub model: String,
+    pub display_name: String,
+    pub description: String,
+    pub is_default: bool,
+    #[serde(default)]
+    pub recommended_for_commit_messages: bool,
+    #[serde(default)]
+    pub upgrade: Option<String>,
+    pub default_reasoning_effort: Option<String>,
+    pub supported_reasoning_efforts: Vec<ReasoningEffort>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningEffort {
+    pub reasoning_effort: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -274,16 +274,48 @@ pub fn set_app_preferences<R: Runtime>(
     preferences.version = APP_PREFERENCES_VERSION;
     preferences.editor_id = normalize_tool_id(preferences.editor_id);
     preferences.terminal_id = normalize_tool_id(preferences.terminal_id);
+    if !preferences
+        .text_generation_selections
+        .iter()
+        .all(|(machine_id, selection)| {
+            !machine_id.is_empty()
+                && machine_id.len() <= 128
+                && machine_id
+                    .chars()
+                    .all(|character| !character.is_control() && !character.is_whitespace())
+                && selection.is_valid()
+        })
+    {
+        return Err(SettingsError::Invalid(
+            "invalid commit-message provider or model selection".into(),
+        ));
+    }
     let store = open_store(app)?;
+    write_app_preferences(&store, &preferences)?;
+    Ok(preferences)
+}
+
+fn write_app_preferences<R: Runtime>(
+    store: &Store<R>,
+    preferences: &AppPreferences,
+) -> Result<(), SettingsError> {
+    let previous = store.get(APP_PREFERENCES_KEY);
     store.set(
         APP_PREFERENCES_KEY,
-        serde_json::to_value(&preferences)
+        serde_json::to_value(preferences)
             .map_err(|error| SettingsError::Store(error.to_string()))?,
     );
-    store
-        .save()
-        .map_err(|error| SettingsError::Store(error.to_string()))?;
-    Ok(preferences)
+    if let Err(error) = store.save() {
+        // Store::set changes the in-memory cache before save can fail. Restore
+        // that cache too, so later loads/generation cannot use an unsaved choice.
+        if let Some(previous) = previous {
+            store.set(APP_PREFERENCES_KEY, previous);
+        } else {
+            store.delete(APP_PREFERENCES_KEY);
+        }
+        return Err(SettingsError::Store(error.to_string()));
+    }
+    Ok(())
 }
 
 pub fn window_state<R: Runtime>(app: &AppHandle<R>) -> Result<Option<WindowState>, SettingsError> {
@@ -381,10 +413,22 @@ pub fn remove_machine<R: Runtime>(
             serde_json::to_value(repositories)
                 .map_err(|error| SettingsError::Store(error.to_string()))?,
         );
-        store
-            .save()
-            .map_err(|error| SettingsError::Store(error.to_string()))?;
     }
+    let mut preferences = read_app_preferences(&store);
+    if preferences
+        .text_generation_selections
+        .remove(&machine_id)
+        .is_some()
+    {
+        store.set(
+            APP_PREFERENCES_KEY,
+            serde_json::to_value(preferences)
+                .map_err(|error| SettingsError::Store(error.to_string()))?,
+        );
+    }
+    store
+        .save()
+        .map_err(|error| SettingsError::Store(error.to_string()))?;
     Ok(with_local_machine(stored))
 }
 
@@ -636,6 +680,32 @@ mod tests {
             .build()
             .expect("store at temp path");
         (app, store)
+    }
+
+    #[test]
+    fn failed_preference_saves_restore_the_in_memory_value() {
+        for had_previous in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("settings.json");
+            let (_app, store) = mock_store(&path);
+            let previous = AppPreferences::default();
+            if had_previous {
+                store.set(
+                    APP_PREFERENCES_KEY,
+                    serde_json::to_value(&previous).unwrap(),
+                );
+            }
+            // A directory at the destination deterministically makes save fail
+            // on every platform, without changing permissions or user data.
+            std::fs::create_dir(&path).unwrap();
+            let changed = AppPreferences {
+                default_sign_commits: true,
+                ..previous.clone()
+            };
+            assert!(write_app_preferences(&store, &changed).is_err());
+            assert_eq!(read_app_preferences(&store), previous);
+            assert_eq!(store.get(APP_PREFERENCES_KEY).is_some(), had_previous);
+        }
     }
 
     #[test]
