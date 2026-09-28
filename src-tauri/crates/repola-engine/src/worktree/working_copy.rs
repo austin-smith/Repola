@@ -1267,7 +1267,7 @@ fn filtered_paths(
     if !fields.len().is_multiple_of(3) {
         return Err("Git returned invalid filter attributes.".into());
     }
-    for entry in fields.chunks_exact(3) {
+    for entry in fields.as_chunks::<3>().0 {
         let absent = matches!(entry[2], b"unspecified" | b"unset");
         // check-attr renders these sentinel states exactly like literal driver
         // names. If such a driver was configured (and disabled above), treat
