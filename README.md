@@ -1,77 +1,80 @@
-# Repola
+<h1 align="center">
+  <img src="src-tauri/icons/128x128@2x.png" alt="Repola icon" width="128" height="128">
+  <br><span style="font-family: monospace;">Repola</span>
+</h1>
 
-A cross-platform Git workbench for local repositories and working copies hosted on machines reached through SSH. Repola combines the focused daily workflow of a native Git client with safe, repository-wide worktree inventory and management.
+<p align="center">
+  A cross-platform Git workbench for local and SSH-hosted working copies.
+</p>
 
-Repola is being built around one context hierarchy: machine → repository → worktree → Git operation. The built-in local machine and SSH machines share a versioned agent protocol, so local and remote working copies receive the same Git behavior rather than separate feature sets.
+<p align="center">
+  <a href="https://v2.tauri.app"><img alt="Tauri 2" src="https://img.shields.io/badge/Tauri%202-24C8D8?logo=tauri&logoColor=white"></a>
+  <a href="https://www.rust-lang.org"><img alt="Rust" src="https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white"></a>
+  <a href="https://react.dev"><img alt="React 19" src="https://img.shields.io/badge/React%2019-61DAFB?logo=react&logoColor=black"></a>
+  <a href="https://www.typescriptlang.org"><img alt="TypeScript 6" src="https://img.shields.io/badge/TypeScript%206-3178C6?logo=typescript&logoColor=white"></a>
+</p>
 
-The inherited worktree engine inspects explicitly added repositories and their linked-worktree registries, inventories every registered worktree, measures allocated disk usage, inspects local changes, and presents explicit commit-containment evidence. It deliberately does not call a worktree “merged” based on ancestry alone.
+## About
 
-The app never guesses where your code lives and never crawls parent folders. A repository enters the list only when you explicitly add, clone, create, or drag it into Repola. The same rule applies independently to every configured machine. Machine profiles, the per-machine repository list, workspace context, window and pane layout, filters, theme, editor, terminal, and Git preferences are stored as independently versioned records in Repola's platform app-data directory. A registered repository that is temporarily missing or unreadable is reported and skipped, never silently replaced with guessed repositories.
+Repola combines the daily workflow of a native Git client with repository-wide worktree inventory and cleanup. Your local computer and every SSH machine run the same `repola-agent`, so remote working copies get the same Git features as local ones, with no mounted filesystems or shadow clones.
 
-Age filters and ordering use the latest observed activity from the worktree’s files, its HEAD commit, or the folder creation timestamp—not folder creation alone. A `≥` size means some entries could not be measured and the displayed allocation is a lower bound.
+Repola only lists repositories you add, clone, create, or drop into it. It never crawls folders or guesses where your code lives.
 
-## Safety model
+## Features
 
-- Primary, dirty, detached, locked, and uninspectable worktrees are protected from normal removal.
-- Removal uses `git worktree remove <path>` and never adds `--force`.
-- Branches are retained when a worktree is removed.
-- Every action gets a fresh Rust-side preflight and is revalidated after confirmation.
-- The revalidation fingerprint includes the worktree path, repository, HEAD, branch, and affected paths.
-- Commands receive exact arguments directly; no shell evaluates worktree paths.
-- Repository-wide pruning previews every registration Git currently marks prunable.
-- Successful and failed execution attempts are appended to `actions.jsonl` in the app data directory.
-- Commit containment is shown as evidence, not pull-request status.
+- **Changes**: Stage and discard by file, hunk, or line; commit, amend, and undo; fetch, pull, and push
+- **History**: Browse and search commits, compare branches, and merge, rebase, cherry-pick, revert, and reset with reflog-based undo points
+- **Worktrees**: See every worktree's changes, unpushed commits, disk usage, recent activity, and agent origin, then create, switch, or clean them up
+- **SSH machines**: Work on remote repositories through your system OpenSSH config, with a signed agent installed automatically
+- **Pull requests**: Show GitHub and Azure DevOps pull-request, review, and check context, and create GitHub pull requests
+- **AI commit messages**: Draft commit messages from the selected changes with Codex or Claude Code
+- **Desktop integration**: Open worktrees in your editor, terminal, or file manager, with a command palette and keyboard shortcuts
 
-## Architecture
+## Safety
 
-- Tauri 2 provides the native shell and typed command boundary on macOS, Windows, and Linux.
-- A packaged `repola-agent` owns Git and filesystem operations on the machine containing a working copy. Local requests use the same typed envelopes in process; remote requests use length-prefixed JSON over system OpenSSH stdio.
-- SSH profiles reference OpenSSH configuration and never store keys or passphrases. Repola disables agent forwarding and exposes no generic remote-command endpoint.
-- The Rust side is a Cargo workspace: the `repola` Tauri app crate and `repola-engine` (`src-tauri/crates/repola-engine`), which owns everything Git-related and has no Tauri dependency. The `repola-agent` binary is built from the engine crate alone.
-- Persistent settings (including each machine's explicit repository list) go through `tauri-plugin-store`, owned by `src-tauri/src/settings.rs`; the frontend never reads or writes them directly.
-- Every child process (`git`, `gh`, `az`) is resolved on `PATH` the way the platform shell would (including `PATHEXT` shims on Windows) and spawned without a console window; see `src-tauri/crates/repola-engine/src/worktree/command.rs`.
-- Rust owns discovery, Git execution, status parsing, sizing, safety classification, actions, and auditing.
-- Agent detection is defined by one backend registry in `src-tauri/crates/repola-engine/src/worktree/agents.rs`; the API returns generic, self-describing origin data and the frontend contains no agent-specific names or path rules.
-- React and TypeScript provide the inventory workbench, filters, evidence inspector, and confirmation flow.
-- The `repola-cli` example exposes the same read-only scanner as JSON for diagnostics without becoming part of the app bundle.
+- Primary, dirty, detached, locked, and uninspectable worktrees are protected from removal.
+- Worktree removal never uses `--force` and never deletes branches.
+- Every destructive action is previewed, then revalidated against a fresh fingerprint right before it runs.
+- Git receives exact arguments; no shell ever evaluates a path.
+- Commit containment is shown as evidence. Repola never infers that a pull request merged from ancestry alone.
+- Every action attempt is logged to `actions.jsonl` in the app data directory.
 
 ## Development
 
-Requirements: a current Rust toolchain, Node.js, pnpm, and Git.
+Running from source requires [Rust](https://rustup.rs/), [Node.js](https://nodejs.org), [pnpm](https://pnpm.io), and Git.
 
-```bash
+```sh
 pnpm install
-pnpm tauri dev
+pnpm tauri dev        # run the app
+pnpm tauri build      # build a native bundle for this platform
 ```
 
-Run the complete validation suite:
+Validation (CI runs the same suite on Ubuntu, macOS, and Windows):
 
-```bash
+```sh
 pnpm typecheck
 pnpm lint
 pnpm test
 pnpm build
+
 cd src-tauri
 cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-CI runs the same suite on Ubuntu, macOS, and Windows (`.github/workflows/ci.yml`).
+The `repola-cli` example prints a read-only JSON inventory of the repositories you pass it:
 
-Build a native bundle for the current platform:
-
-```bash
-pnpm tauri build
-```
-
-Run a read-only JSON inventory from the command line:
-
-```bash
+```sh
 cd src-tauri
 cargo run --package repola-engine --example repola-cli -- /path/to/repository
 ```
 
-The CLI takes exact Git repository paths as arguments; with none it exits with an error rather than scanning a guessed location.
+## Architecture
 
-The complete product acceptance matrix lives in [`docs/product-requirements.md`](docs/product-requirements.md), with process boundaries and safety invariants in [`docs/architecture.md`](docs/architecture.md).
+- **`src/`**: React and TypeScript frontend
+- **`src-tauri/`**: Tauri app crate with thin IPC commands and persisted settings
+- **`src-tauri/crates/repola-engine`**: Git, filesystem, process, protocol, and SSH behavior with no Tauri dependency; builds the `repola-agent` binary
+- **Protocol**: Requests to the local machine run in process; requests to SSH machines use length-prefixed JSON over OpenSSH stdio
+
+See [`docs/architecture.md`](docs/architecture.md) for process boundaries and safety invariants, [`docs/product-requirements.md`](docs/product-requirements.md) for the acceptance matrix, and [`docs/releasing.md`](docs/releasing.md) for release signing.
