@@ -119,6 +119,7 @@ export function ChangesWorkbench() {
   const [generateBusy, setGenerateBusy] = useState(false);
   const [generationCancelling, setGenerationCancelling] = useState(false);
   const generationController = useRef<AbortController | null>(null);
+  const generationSnapshot = useRef<WorkingCopySnapshot | null>(null);
   const [syncBusy, setSyncBusy] = useState(false);
   const [operationBusy, setOperationBusy] = useState(false);
   const [pendingForcePush, setPendingForcePush] = useState(false);
@@ -181,14 +182,24 @@ export function ChangesWorkbench() {
   const mutatingRef = useRef(mutating);
   useEffect(() => { mutatingRef.current = mutating; }, [mutating]);
   const reloadController = useRef<AbortController | null>(null);
+  const pendingReload = useRef<Promise<void> | null>(null);
   const reloadSnapshot = useCallback(() => {
     if (mutatingRef.current) return;
     reloadController.current?.abort();
     const controller = new AbortController();
     reloadController.current = controller;
-    void fetchWorkingCopy(machineId, repository.path, worktree.path, controller.signal)
+    pendingReload.current = fetchWorkingCopy(machineId, repository.path, worktree.path, controller.signal)
       .then((next) => {
         if (controller.signal.aborted || mutatingRef.current) return;
+        const generating = generationController.current;
+        if (generating && !generating.signal.aborted && generationSnapshot.current
+          && !workingCopySnapshotsEqual(generationSnapshot.current, next)) {
+          // Reconciliation can include newly created files. Never apply a message
+          // generated for the previous selection after that selection changes.
+          generating.abort();
+          setGenerationCancelling(true);
+          toast.add({ type: "error", title: "Working copy changed during generation", description: "Review the updated changes and generate the message again." });
+        }
         setSnapshot(next);
         setChangeSelection((current) => {
           const ids = new Set(next.changes.map((change) => change.id));
@@ -198,10 +209,20 @@ export function ChangesWorkbench() {
         });
       })
       .catch((cause: unknown) => {
-        if (!controller.signal.aborted) setError(toMessage(cause));
+        if (!controller.signal.aborted) {
+          const generating = generationController.current;
+          if (generating) {
+            generating.abort();
+            setGenerationCancelling(true);
+          }
+          setError(toMessage(cause));
+        }
       })
       .finally(() => {
-        if (reloadController.current === controller) reloadController.current = null;
+        if (reloadController.current === controller) {
+          reloadController.current = null;
+          pendingReload.current = null;
+        }
       });
   }, [machineId, repository.path, setSnapshot, worktree.path]);
   useEffect(() => () => reloadController.current?.abort(), []);
@@ -309,6 +330,7 @@ export function ChangesWorkbench() {
     if (!snapshot || (!amend && includedCount === 0) || generationController.current) return;
     const controller = new AbortController();
     generationController.current = controller;
+    generationSnapshot.current = snapshot;
     setGenerateBusy(true);
     setGenerationCancelling(false);
     try {
@@ -319,6 +341,19 @@ export function ChangesWorkbench() {
         includedChanges: commitSelectionRequest(visibleChanges, commitSelections),
         amend,
       }, controller.signal);
+      // A refresh started before the provider finished may still discover a
+      // changed selection. Let it validate/cancel this result before applying it.
+      while (pendingReload.current && !controller.signal.aborted) {
+        const pending = pendingReload.current;
+        await new Promise<void>((resolve) => {
+          const finish = () => {
+            controller.signal.removeEventListener("abort", finish);
+            resolve();
+          };
+          controller.signal.addEventListener("abort", finish, { once: true });
+          void pending.then(finish, finish);
+        });
+      }
       if (controller.signal.aborted) return;
       setSummary(message.subject);
       setDescription(message.body);
