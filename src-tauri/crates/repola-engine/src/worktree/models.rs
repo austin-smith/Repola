@@ -741,8 +741,8 @@ pub struct GenerateCommitMessageRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeneratedCommitMessage {
-    pub summary: String,
-    pub description: String,
+    pub subject: String,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

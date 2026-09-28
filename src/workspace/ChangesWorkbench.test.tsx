@@ -40,6 +40,18 @@ describe("commit-message generation", () => {
     ipc.onWorktreeChanged.mockResolvedValue(() => undefined);
   });
 
+  it("fills the commit form from the generated subject and body", async () => {
+    ipc.generateCommitMessage.mockResolvedValue({
+      subject: "improve commit generation",
+      body: "- use standard Git terminology",
+    } satisfies GeneratedCommitMessage);
+    render(<ChangesWorkbench />);
+    const generate = await screen.findByRole("button", { name: "Generate commit message" });
+    await act(async () => fireEvent.click(generate));
+    expect(screen.getByPlaceholderText("Summary (required)")).toHaveValue("improve commit generation");
+    expect(screen.getByPlaceholderText("Description")).toHaveValue("- use standard Git terminology");
+  });
+
   it("locks selection, offers cancellation, and ignores a late cancelled response", async () => {
     let complete!: (message: GeneratedCommitMessage) => void;
     ipc.generateCommitMessage.mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
@@ -56,7 +68,7 @@ describe("commit-message generation", () => {
     const signal = ipc.generateCommitMessage.mock.calls[0][2] as AbortSignal;
     expect(signal.aborted).toBe(true);
     expect(summary).toBeDisabled(); // Keep the form locked until the operation settles.
-    await act(async () => complete({ summary: "stale result", description: "discard me" }));
+    await act(async () => complete({ subject: "stale result", body: "discard me" }));
     expect(summary).toHaveValue("my existing message");
     expect(summary).toBeEnabled();
     expect(screen.getByRole("checkbox", { name: "Select diff line" })).toBeEnabled();

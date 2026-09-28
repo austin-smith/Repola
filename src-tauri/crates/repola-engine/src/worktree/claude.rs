@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn accepts_only_successful_structured_results() {
-        assert!(parse_output(br#"{"type":"result","subtype":"success","is_error":false,"structured_output":{"summary":"test","description":""}}"#, true).is_ok());
+        assert!(parse_output(br#"{"type":"result","subtype":"success","is_error":false,"structured_output":{"subject":"test","body":""}}"#, true).is_ok());
         assert!(parse_output(br#"{"type":"result","subtype":"error_max_turns","is_error":false,"structured_output":{}}"#, true).is_err());
         assert!(parse_output(
             br#"{"type":"result","subtype":"success","is_error":false}"#,

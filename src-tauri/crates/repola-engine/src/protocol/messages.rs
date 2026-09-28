@@ -16,7 +16,7 @@ use crate::worktree::{
     UndoCommitResult, WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges,
 };
 
-pub const PROTOCOL_VERSION: u16 = 16;
+pub const PROTOCOL_VERSION: u16 = 17;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -386,7 +386,7 @@ mod tests {
         let json = serde_json::to_string(&request).expect("serialize request");
         assert_eq!(
             json,
-            r#"{"protocolVersion":16,"requestId":"golden-1","request":{"type":"handshake","clientVersion":"0.1.0","minimumProtocolVersion":16,"maximumProtocolVersion":16}}"#
+            r#"{"protocolVersion":17,"requestId":"golden-1","request":{"type":"handshake","clientVersion":"0.1.0","minimumProtocolVersion":17,"maximumProtocolVersion":17}}"#
         );
 
         let with_future_field = json.replace(

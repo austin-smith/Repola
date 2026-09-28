@@ -419,8 +419,8 @@ export interface GenerateCommitMessageRequest {
 }
 
 export interface GeneratedCommitMessage {
-  summary: string;
-  description: string;
+  subject: string;
+  body: string;
 }
 
 export type TextGenerationStatusKind = "ready" | "notInstalled" | "signedOut" | "updateRequired" | "unavailable";

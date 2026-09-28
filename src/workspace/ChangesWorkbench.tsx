@@ -320,8 +320,8 @@ export function ChangesWorkbench() {
         amend,
       }, controller.signal);
       if (controller.signal.aborted) return;
-      setSummary(message.summary);
-      setDescription(message.description);
+      setSummary(message.subject);
+      setDescription(message.body);
     } catch (cause) {
       if (controller.signal.aborted || (cause instanceof DOMException && cause.name === "AbortError")) return;
       toast.add({

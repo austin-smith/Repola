@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
@@ -1068,6 +1068,30 @@ pub(super) struct SelectedCommitContext {
     pub changed_files: String,
     pub patch: String,
     pub recent_subjects: Vec<String>,
+    pub repository_instructions: String,
+}
+
+fn read_repository_instruction(worktree: &Path, filename: &str) -> Option<String> {
+    const MAX_INSTRUCTION_BYTES: u64 = 20_000;
+    let root = dunce::canonicalize(worktree).ok()?;
+    let path = dunce::canonicalize(root.join(filename)).ok()?;
+    if !path.starts_with(&root) {
+        return None;
+    }
+    let metadata = fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_INSTRUCTION_BYTES {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let mut contents = String::new();
+    // Bound the read too, in case the file grows after the metadata check.
+    file.take(MAX_INSTRUCTION_BYTES + 1)
+        .read_to_string(&mut contents)
+        .ok()?;
+    if contents.len() as u64 > MAX_INSTRUCTION_BYTES || contents.trim().is_empty() {
+        return None;
+    }
+    Some(format!("Local {filename}:\n{}", contents.trim()))
 }
 
 pub(super) fn selected_commit_context(
@@ -1197,7 +1221,7 @@ pub(super) fn selected_commit_context(
         Err(error) => return Err(error.to_string()),
     };
 
-    let mut log_args = vec!["log", "-n", "12", "--no-merges"];
+    let mut log_args = vec!["log", "-n", "20", "--no-merges"];
     if request.amend {
         log_args.push("--skip=1");
     }
@@ -1215,12 +1239,28 @@ pub(super) fn selected_commit_context(
         })
         .unwrap_or_default();
 
+    let provider = request
+        .text_generation_selection
+        .as_ref()
+        .map(|selection| selection.provider)
+        .unwrap_or_default();
+    let mut instruction_files = vec!["AGENTS.md"];
+    if provider == crate::preferences::TextGenerationProvider::Claude {
+        instruction_files.push("CLAUDE.md");
+    }
+    let repository_instructions = instruction_files
+        .into_iter()
+        .filter_map(|filename| read_repository_instruction(&worktree, filename))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
     Ok(SelectedCommitContext {
         tree_oid,
         branch: snapshot.branch,
         changed_files,
         patch,
         recent_subjects,
+        repository_instructions,
     })
 }
 
@@ -2170,6 +2210,44 @@ fn detect_operation(worktree: &Path) -> Option<RepositoryOperation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_instructions_require_a_small_readable_text_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("AGENTS.md");
+        assert!(read_repository_instruction(root.path(), "AGENTS.md").is_none());
+        fs::create_dir(&path).unwrap();
+        assert!(read_repository_instruction(root.path(), "AGENTS.md").is_none());
+        fs::remove_dir(&path).unwrap();
+        for contents in [vec![], b" \n ".to_vec(), vec![0xff], vec![b'a'; 20_001]] {
+            fs::write(&path, contents).unwrap();
+            assert!(read_repository_instruction(root.path(), "AGENTS.md").is_none());
+        }
+        fs::write(&path, "é".repeat(10_000)).unwrap();
+        assert!(read_repository_instruction(root.path(), "AGENTS.md").is_some());
+        fs::write(&path, "  Use concise subjects.\n").unwrap();
+        assert_eq!(
+            read_repository_instruction(root.path(), "AGENTS.md").as_deref(),
+            Some("Local AGENTS.md:\nUse concise subjects.")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_instructions_follow_only_links_within_the_worktree() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("rules"), "outside instructions").unwrap();
+        symlink(outside.path().join("rules"), root.path().join("AGENTS.md")).unwrap();
+        assert!(read_repository_instruction(root.path(), "AGENTS.md").is_none());
+        fs::write(root.path().join("rules"), "inside instructions").unwrap();
+        symlink(root.path().join("rules"), root.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(
+            read_repository_instruction(root.path(), "CLAUDE.md").as_deref(),
+            Some("Local CLAUDE.md:\ninside instructions")
+        );
+    }
 
     fn repository() -> tempfile::TempDir {
         let directory = tempfile::tempdir().expect("temp repository");

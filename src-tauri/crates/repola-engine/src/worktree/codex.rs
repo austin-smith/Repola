@@ -824,14 +824,14 @@ mod tests {
     #[ignore = "sends a synthetic prompt using the installed, signed-in Codex CLI"]
     fn live_codex_generation_returns_structured_output() {
         let raw = generate(
-            "Return a JSON commit message for this synthetic change: correct a spelling error in README. Use summary and description string fields. Do not use tools.",
+            "Return a JSON commit message for this synthetic change: correct a spelling error in README. Use subject and body string fields. Do not use tools.",
             None,
         ).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert!(value["summary"]
+        assert!(value["subject"]
             .as_str()
-            .is_some_and(|summary| !summary.is_empty()));
-        assert!(value["description"].is_string());
+            .is_some_and(|subject| !subject.is_empty()));
+        assert!(value["body"].is_string());
     }
 
     fn model(
