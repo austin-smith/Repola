@@ -17,7 +17,6 @@ use crate::worktree::command::{self, ManagedChild};
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const STANDARD_TIMEOUT: Duration = Duration::from_secs(120);
-const TEXT_GENERATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const EXIT_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
@@ -345,11 +344,24 @@ fn operation_timeout(request: &AgentRequest) -> Duration {
     match request {
         AgentRequest::Handshake { .. } => HANDSHAKE_TIMEOUT,
         AgentRequest::ScanWorktrees { .. } => SCAN_TIMEOUT,
-        AgentRequest::GenerateCommitMessage { .. } => TEXT_GENERATION_TIMEOUT,
+        AgentRequest::GenerateCommitMessage { request } => {
+            // Allow a normal Git-operation budget for each context pass (before
+            // and after generation), in addition to sequential provider work.
+            HANDSHAKE_TIMEOUT
+                + STANDARD_TIMEOUT * 2
+                + crate::worktree::commit_message_provider_timeout(
+                    request
+                        .text_generation_selection
+                        .as_ref()
+                        .map(|selection| selection.provider),
+                )
+        }
+        AgentRequest::TextGenerationStatus { provider } => (HANDSHAKE_TIMEOUT
+            + crate::worktree::text_generation_status_timeout(*provider))
+        .max(STANDARD_TIMEOUT),
         AgentRequest::ResolveRepository { .. }
         | AgentRequest::FetchPullRequests { .. }
         | AgentRequest::MutatePullRequest { .. }
-        | AgentRequest::TextGenerationStatus { .. }
         | AgentRequest::WorktreeChanges { .. }
         | AgentRequest::FileDiff { .. }
         | AgentRequest::WorkingCopySnapshot { .. }
@@ -568,6 +580,43 @@ mod tests {
         };
         assert_eq!(operation_timeout(&handshake), HANDSHAKE_TIMEOUT);
         assert_eq!(operation_timeout(&scan), SCAN_TIMEOUT);
+    }
+
+    #[test]
+    fn generation_deadlines_cover_provider_fallback_and_context_work() {
+        use crate::preferences::{TextGenerationProvider, TextGenerationSelection};
+        // Codex status: 4 x 20s; generation: 2 x 20s + 180s.
+        // Claude status: 3 x 20s; generation: status + 180s.
+        // Automatic discovery can check both before using the slower provider.
+        for (provider, status_seconds, generation_seconds) in [
+            (Some(TextGenerationProvider::Codex), 80, 220),
+            (Some(TextGenerationProvider::Claude), 60, 240),
+            (None, 140, 380),
+        ] {
+            let status = AgentRequest::TextGenerationStatus { provider };
+            assert_eq!(
+                operation_timeout(&status),
+                (HANDSHAKE_TIMEOUT + Duration::from_secs(status_seconds)).max(STANDARD_TIMEOUT)
+            );
+            let generate = AgentRequest::GenerateCommitMessage {
+                request: crate::worktree::GenerateCommitMessageRequest {
+                    repository_path: "repo".into(),
+                    worktree_path: "repo".into(),
+                    expected_head: None,
+                    included_changes: vec![],
+                    amend: false,
+                    text_generation_selection: provider.map(|provider| TextGenerationSelection {
+                        provider,
+                        model: None,
+                        reasoning_effort: None,
+                    }),
+                },
+            };
+            assert_eq!(
+                operation_timeout(&generate),
+                HANDSHAKE_TIMEOUT + STANDARD_TIMEOUT * 2 + Duration::from_secs(generation_seconds)
+            );
+        }
     }
 
     #[test]

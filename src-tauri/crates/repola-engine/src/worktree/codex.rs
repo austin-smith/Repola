@@ -20,6 +20,12 @@ use crate::preferences::{TextGenerationProvider, TextGenerationSelection};
 const MAX_DIAGNOSTIC_CHARS: usize = 4_000;
 const CODEX_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 const CODEX_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+// Status probes version, help, authentication, and the model catalog in sequence.
+pub(super) const STATUS_BUDGET: Duration = CODEX_DISCOVERY_TIMEOUT.saturating_mul(4);
+// Generation checks help and the model catalog before starting the model.
+pub(super) const GENERATION_BUDGET: Duration = CODEX_DISCOVERY_TIMEOUT
+    .saturating_mul(2)
+    .saturating_add(CODEX_TIMEOUT);
 const MAX_APP_SERVER_LINE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Deserialize)]

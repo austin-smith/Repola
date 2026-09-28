@@ -6,6 +6,29 @@ use super::models::{
 use super::working_copy::{selected_commit_context, SelectedCommitContext};
 use crate::preferences::{TextGenerationProvider, TextGenerationSelection};
 use serde::Deserialize;
+use std::time::Duration;
+
+/// Provider work only; transports must also allow for handshake and Git context work.
+pub(crate) fn text_generation_status_timeout(provider: Option<TextGenerationProvider>) -> Duration {
+    match provider {
+        Some(TextGenerationProvider::Codex) => super::codex::STATUS_BUDGET,
+        Some(TextGenerationProvider::Claude) => super::claude::STATUS_BUDGET,
+        None => super::codex::STATUS_BUDGET + super::claude::STATUS_BUDGET,
+    }
+}
+
+pub(crate) fn commit_message_provider_timeout(
+    provider: Option<TextGenerationProvider>,
+) -> Duration {
+    match provider {
+        Some(TextGenerationProvider::Codex) => super::codex::GENERATION_BUDGET,
+        Some(TextGenerationProvider::Claude) => super::claude::GENERATION_BUDGET,
+        None => {
+            text_generation_status_timeout(None)
+                + super::codex::GENERATION_BUDGET.max(super::claude::GENERATION_BUDGET)
+        }
+    }
+}
 
 const MAX_PROMPT_PATCH_CHARS: usize = 60_000;
 const MAX_FILE_SUMMARY_CHARS: usize = 20_000;

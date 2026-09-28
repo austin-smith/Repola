@@ -15,6 +15,9 @@ use crate::preferences::{TextGenerationProvider, TextGenerationSelection};
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 const GENERATION_TIMEOUT: Duration = Duration::from_secs(180);
+// Version, help, and authentication are checked sequentially, including before generation.
+pub(super) const STATUS_BUDGET: Duration = DISCOVERY_TIMEOUT.saturating_mul(3);
+pub(super) const GENERATION_BUDGET: Duration = STATUS_BUDGET.saturating_add(GENERATION_TIMEOUT);
 const REQUIRED_FLAGS: &[&str] = &[
     "--restricted",
     "--safe-mode",

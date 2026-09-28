@@ -59,6 +59,7 @@ pub use repository::{clone_repository, create_repository};
 pub use stash::{list_stashes, mutate_stash};
 pub use sync::synchronize;
 pub use tags::{mutate_tag, tags};
+pub(crate) use text_generation::{commit_message_provider_timeout, text_generation_status_timeout};
 pub use text_generation::{generate_commit_message, text_generation_status};
 pub use watch::{WorktreeChangeEvent, WorktreeWatcher};
 pub use working_copy::{
