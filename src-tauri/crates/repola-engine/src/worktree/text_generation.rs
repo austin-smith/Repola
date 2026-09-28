@@ -237,6 +237,249 @@ mod tests {
         assert_eq!(std::fs::read(index).unwrap(), before);
         assert_eq!(object_paths(), objects_before);
     }
+
+    #[test]
+    fn generation_omits_filtered_contents_without_running_clean_or_process_filters() {
+        use super::super::command;
+        for driver in ["clean", "process"] {
+            let (directory, request) = fixture();
+            std::fs::write(
+                directory.path().join(".gitattributes"),
+                "*.txt filter=opaque\n",
+            )
+            .unwrap();
+            command::successful_git_at(
+                directory.path(),
+                ["config", "filter.opaque.required", "true"],
+            )
+            .unwrap();
+            command::successful_git_at(
+                directory.path(),
+                [
+                    "config",
+                    &format!("filter.opaque.{driver}"),
+                    "echo called >> .git/filter-runs; cat",
+                ],
+            )
+            .unwrap();
+            let index = std::fs::read(directory.path().join(".git/index")).unwrap();
+            generate_with(&request, |prompt| {
+                assert!(prompt.contains("M\tfile.txt"));
+                assert!(prompt.contains("Contents omitted for files with Git filters"));
+                assert!(!prompt.contains("+after"));
+                assert!(!prompt.contains("-before"));
+                Ok(r#"{"subject":"change file","body":""}"#.into())
+            })
+            .unwrap();
+            assert!(
+                !directory.path().join(".git/filter-runs").exists(),
+                "{driver} must not run during either inspection"
+            );
+            assert_eq!(
+                std::fs::read(directory.path().join(".git/index")).unwrap(),
+                index
+            );
+        }
+    }
+
+    #[test]
+    fn generation_revalidates_omitted_filtered_contents() {
+        let (directory, request) = fixture();
+        std::fs::write(
+            directory.path().join(".gitattributes"),
+            "file.txt filter=opaque\n",
+        )
+        .unwrap();
+        let error = generate_with(&request, |_| {
+            // Same length: a content fingerprint, not file size, must catch it.
+            std::fs::write(directory.path().join("file.txt"), "other\n").unwrap();
+            Ok(r#"{"subject":"change file","body":""}"#.into())
+        })
+        .unwrap_err();
+        assert!(error.contains("included changes changed"));
+    }
+
+    #[test]
+    fn generation_omits_filters_named_like_git_attribute_sentinels() {
+        use super::super::command;
+        for name in ["unset", "unspecified"] {
+            let (directory, request) = fixture();
+            std::fs::write(
+                directory.path().join(".gitattributes"),
+                format!("file.txt filter={name}\n"),
+            )
+            .unwrap();
+            command::successful_git_at(
+                directory.path(),
+                ["config", &format!("filter.{name}.clean"), "cat"],
+            )
+            .unwrap();
+            generate_with(&request, |prompt| {
+                assert!(prompt.contains("Contents omitted"));
+                assert!(!prompt.contains("+after"));
+                assert!(!prompt.contains("-before"));
+                Ok(r#"{"subject":"change file","body":""}"#.into())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn generation_keeps_normal_diffs_and_omits_filtered_repository_instructions() {
+        use super::super::command;
+        let (directory, request) = fixture();
+        std::fs::write(
+            directory.path().join(".gitattributes"),
+            "AGENTS.md filter=opaque\n",
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("AGENTS.md"), "private guidance").unwrap();
+        command::successful_git_at(
+            directory.path(),
+            [
+                "config",
+                "filter.opaque.clean",
+                "echo called >> .git/filter-runs; cat",
+            ],
+        )
+        .unwrap();
+        generate_with(&request, |prompt| {
+            assert!(prompt.contains("+after"));
+            assert!(prompt.contains("-before"));
+            assert!(!prompt.contains("private guidance"));
+            Ok(r#"{"subject":"change file","body":""}"#.into())
+        })
+        .unwrap();
+        assert!(!directory.path().join(".git/filter-runs").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generation_does_not_run_fsmonitor_or_index_change_hooks() {
+        use super::super::command;
+        use std::os::unix::fs::PermissionsExt;
+        let (directory, request) = fixture();
+        for name in ["post-index-change", "fsmonitor-test"] {
+            let hook = directory.path().join(".git/hooks").join(name);
+            std::fs::write(&hook, "#!/bin/sh\necho called >> .git/hook-runs\nexit 1\n").unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        command::successful_git_at(
+            directory.path(),
+            ["config", "core.fsmonitor", ".git/hooks/fsmonitor-test"],
+        )
+        .unwrap();
+        generate_with(&request, |_| {
+            Ok(r#"{"subject":"change file","body":""}"#.into())
+        })
+        .unwrap();
+        assert!(!directory.path().join(".git/hook-runs").exists());
+    }
+
+    #[test]
+    fn generation_does_not_write_shared_indexes_into_the_repository() {
+        use super::super::command;
+        let (directory, request) = fixture();
+        command::successful_git_at(directory.path(), ["config", "core.splitIndex", "true"])
+            .unwrap();
+        let git_files = || {
+            walkdir::WalkDir::new(directory.path().join(".git"))
+                .into_iter()
+                .map(|entry| entry.unwrap().into_path())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = git_files();
+        generate_with(&request, |_| {
+            Ok(r#"{"subject":"change file","body":""}"#.into())
+        })
+        .unwrap();
+        assert_eq!(git_files(), before);
+    }
+
+    #[test]
+    fn generation_ignores_case_aliases_for_filtered_instruction_files() {
+        let (directory, request) = fixture();
+        std::fs::write(
+            directory.path().join("agents.md"),
+            "private lowercase instructions\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join(".gitattributes"),
+            "agents.md filter=opaque\n",
+        )
+        .unwrap();
+        generate_with(&request, |prompt| {
+            assert!(!prompt.contains("private lowercase instructions"));
+            Ok(r#"{"subject":"change file","body":""}"#.into())
+        })
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generation_omits_filtered_targets_of_in_repository_instruction_symlinks() {
+        let (directory, request) = fixture();
+        std::fs::write(
+            directory.path().join("private.txt"),
+            "private target instructions\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join(".gitattributes"),
+            "private.txt filter=opaque\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("private.txt", directory.path().join("AGENTS.md")).unwrap();
+        generate_with(&request, |prompt| {
+            assert!(!prompt.contains("private target instructions"));
+            Ok(r#"{"subject":"change file","body":""}"#.into())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn generation_does_not_run_filters_in_unselected_dirty_submodules() {
+        use super::super::command;
+        let (directory, request) = fixture();
+        let (child, _) = fixture();
+        std::fs::write(child.path().join(".gitattributes"), "*.txt filter=nested\n").unwrap();
+        command::successful_git_at(child.path(), ["add", "."]).unwrap();
+        command::successful_git_at(child.path(), ["commit", "-m", "add attributes"]).unwrap();
+        command::successful_git_at(
+            directory.path(),
+            [
+                std::ffi::OsStr::new("-c"),
+                std::ffi::OsStr::new("protocol.file.allow=always"),
+                std::ffi::OsStr::new("submodule"),
+                std::ffi::OsStr::new("add"),
+                child.path().as_os_str(),
+                std::ffi::OsStr::new("nested"),
+            ],
+        )
+        .unwrap();
+        command::successful_git_at(
+            directory.path(),
+            ["config", "submodule.nested.ignore", "none"],
+        )
+        .unwrap();
+        let nested = directory.path().join("nested");
+        command::successful_git_at(
+            &nested,
+            [
+                "config",
+                "filter.nested.clean",
+                "echo called >> ../filter-runs; cat",
+            ],
+        )
+        .unwrap();
+        std::fs::write(nested.join("file.txt"), "other\n").unwrap();
+        generate_with(&request, |_| {
+            Ok(r#"{"subject":"change file","body":""}"#.into())
+        })
+        .unwrap();
+        assert!(!directory.path().join("filter-runs").exists());
+    }
     #[test]
     fn prompt_matches_the_agreed_wording_with_real_context() {
         let prompt = commit_message_prompt(&SelectedCommitContext {

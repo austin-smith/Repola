@@ -22,8 +22,16 @@ const MAX_COMMIT_DESCRIPTION_BYTES: usize = 1024 * 1024;
 const MAX_FILE_PATCH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IMAGE_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CONFLICT_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_INSTRUCTION_BYTES: u64 = 20_000;
 
 pub fn working_copy_snapshot(request: WorkingCopyRequest) -> Result<WorkingCopySnapshot, String> {
+    working_copy_snapshot_with_options(request, &[])
+}
+
+fn working_copy_snapshot_with_options(
+    request: WorkingCopyRequest,
+    git_options: &[OsString],
+) -> Result<WorkingCopySnapshot, String> {
     let repository = canonical_directory(&request.repository_path, "repository")?;
     let worktree = canonical_directory(&request.worktree_path, "worktree")?;
     let common_dir = git_text(
@@ -43,17 +51,20 @@ pub fn working_copy_snapshot(request: WorkingCopyRequest) -> Result<WorkingCopyS
     let snapshot_start = std::time::SystemTime::now();
     // Ignored files are intentionally not requested; the parser still accepts
     // `!` records so the `ignored` guards below stay correct if they ever appear.
-    let output = command::git_at(
-        &worktree,
-        [
-            "status",
-            "--porcelain=v2",
-            "--branch",
-            "-z",
-            "--untracked-files=all",
-        ],
-    )
-    .map_err(|error| error.to_string())?;
+    let mut status_args = vec![
+        "status",
+        "--porcelain=v2",
+        "--branch",
+        "-z",
+        "--untracked-files=all",
+    ];
+    if !git_options.is_empty() {
+        // An explicit flag overrides per-submodule ignore settings; the global
+        // diff setting alone can still run filters inside a dirty submodule.
+        status_args.push("--ignore-submodules=dirty");
+    }
+    let output = command::git_at(&worktree, git_args(git_options, status_args))
+        .map_err(|error| error.to_string())?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -147,10 +158,20 @@ pub fn set_file_staging(request: SetFileStagingRequest) -> Result<WorkingCopySna
 }
 
 pub fn file_diff(request: FileDiffRequest) -> Result<FileDiff, String> {
-    let snapshot = working_copy_snapshot(WorkingCopyRequest {
-        repository_path: request.repository_path,
-        worktree_path: request.worktree_path,
-    })?;
+    file_diff_with_options(request, &[])
+}
+
+fn file_diff_with_options(
+    request: FileDiffRequest,
+    git_options: &[OsString],
+) -> Result<FileDiff, String> {
+    let snapshot = working_copy_snapshot_with_options(
+        WorkingCopyRequest {
+            repository_path: request.repository_path,
+            worktree_path: request.worktree_path,
+        },
+        git_options,
+    )?;
     let change = snapshot
         .changes
         .iter()
@@ -187,8 +208,8 @@ pub fn file_diff(request: FileDiffRequest) -> Result<FileDiff, String> {
         ];
         numstat_args.extend(paths.iter().cloned());
         (
-            git_diff_output(&worktree, &patch_args, true)?,
-            git_diff_output(&worktree, &numstat_args, true)?,
+            git_diff_output(&worktree, &patch_args, true, git_options)?,
+            git_diff_output(&worktree, &numstat_args, true, git_options)?,
         )
     } else {
         let base = match snapshot.head.as_deref() {
@@ -212,8 +233,8 @@ pub fn file_diff(request: FileDiffRequest) -> Result<FileDiff, String> {
         ];
         numstat_args.extend(paths.iter().cloned());
         (
-            git_diff_output(&worktree, &patch_args, false)?,
-            git_diff_output(&worktree, &numstat_args, false)?,
+            git_diff_output(&worktree, &patch_args, false, git_options)?,
+            git_diff_output(&worktree, &numstat_args, false, git_options)?,
         )
     };
 
@@ -244,6 +265,7 @@ pub fn file_diff(request: FileDiffRequest) -> Result<FileDiff, String> {
             &paths,
             &patch_output,
             snapshot.head.as_deref(),
+            git_options,
         )?;
         (split_patch_hunks(&staged), split_patch_hunks(&unstaged))
     };
@@ -491,6 +513,7 @@ fn partial_patch_outputs(
     paths: &[OsString],
     full_patch: &[u8],
     head: Option<&str>,
+    git_options: &[OsString],
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     if change.untracked {
         return Ok((Vec::new(), full_patch.to_vec()));
@@ -516,8 +539,8 @@ fn partial_patch_outputs(
     ];
     unstaged_args.extend(paths.iter().cloned());
     Ok((
-        git_diff_output(worktree, &staged_args, false)?,
-        git_diff_output(worktree, &unstaged_args, false)?,
+        git_diff_output(worktree, &staged_args, false, git_options)?,
+        git_diff_output(worktree, &unstaged_args, false, git_options)?,
     ))
 }
 
@@ -1013,8 +1036,14 @@ fn git_diff_output(
     path: &Path,
     args: &[OsString],
     differences_are_status_one: bool,
+    git_options: &[OsString],
 ) -> Result<Vec<u8>, String> {
-    let output = command::git_at(path, args).map_err(|error| error.to_string())?;
+    let mut args = args.to_vec();
+    if !git_options.is_empty() {
+        args.insert(1, OsString::from("--no-textconv"));
+    }
+    let output =
+        command::git_at(path, git_args(git_options, args)).map_err(|error| error.to_string())?;
     if output.status.success() || (differences_are_status_one && output.status.code() == Some(1)) {
         Ok(output.stdout)
     } else {
@@ -1071,18 +1100,57 @@ pub(super) struct SelectedCommitContext {
     pub repository_instructions: String,
 }
 
-fn read_repository_instruction(worktree: &Path, filename: &str) -> Option<String> {
-    const MAX_INSTRUCTION_BYTES: u64 = 20_000;
+fn open_repository_instruction(worktree: &Path, filename: &str) -> Option<(fs::File, Vec<u8>)> {
     let root = dunce::canonicalize(worktree).ok()?;
-    let path = dunce::canonicalize(root.join(filename)).ok()?;
-    if !path.starts_with(&root) {
+    // Git attributes match exact repository pathnames, even when the host
+    // filesystem accepts case aliases. Keep instruction discovery consistent
+    // across case-sensitive and case-insensitive filesystems.
+    if !fs::read_dir(&root)
+        .ok()?
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name() == std::ffi::OsStr::new(filename))
+    {
         return None;
+    }
+    let path = dunce::canonicalize(root.join(filename)).ok()?;
+    let relative = path.strip_prefix(&root).ok()?;
+    let mut parent = root.clone();
+    let mut git_path = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return None;
+        };
+        if !fs::read_dir(&parent)
+            .ok()?
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name() == name)
+        {
+            return None;
+        }
+        if !git_path.is_empty() {
+            git_path.push(b'/');
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            git_path.extend_from_slice(name.as_bytes());
+        }
+        #[cfg(windows)]
+        git_path.extend_from_slice(name.to_str()?.as_bytes());
+        parent.push(name);
     }
     let metadata = fs::metadata(&path).ok()?;
     if !metadata.is_file() || metadata.len() > MAX_INSTRUCTION_BYTES {
         return None;
     }
-    let file = fs::File::open(path).ok()?;
+    Some((fs::File::open(path).ok()?, git_path))
+}
+
+fn read_repository_instruction(file: fs::File, filename: &str) -> Option<String> {
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_INSTRUCTION_BYTES {
+        return None;
+    }
     let mut contents = String::new();
     // Bound the read too, in case the file grows after the metadata check.
     file.take(MAX_INSTRUCTION_BYTES + 1)
@@ -1094,13 +1162,191 @@ fn read_repository_instruction(worktree: &Path, filename: &str) -> Option<String
     Some(format!("Local {filename}:\n{}", contents.trim()))
 }
 
+fn git_args<I, S>(options: &[OsString], args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    options
+        .iter()
+        .cloned()
+        .chain(args.into_iter().map(|arg| arg.as_ref().to_owned()))
+        .collect()
+}
+
+/// Overrides apply only to inspection commands, never the user's configuration
+/// or the real commit path. An alternate index alone does not isolate filters,
+/// fsmonitor, or index-change hooks from the real repository.
+fn inspection_git_options(worktree: &Path, hooks: &Path) -> Result<Vec<OsString>, String> {
+    let output = command::git_at(
+        worktree,
+        [
+            "config",
+            "--null",
+            "--name-only",
+            "--get-regexp",
+            "^filter\\..*\\.(clean|process)$",
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err("Could not inspect Git filter configuration.".into());
+    }
+    let mut options = [
+        "--no-optional-locks",
+        "--literal-pathspecs",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.splitIndex=false",
+        "-c",
+        "diff.ignoreSubmodules=dirty",
+        "-c",
+        "submodule.recurse=false",
+    ]
+    .map(OsString::from)
+    .to_vec();
+    let mut hooks_option = OsString::from("core.hooksPath=");
+    hooks_option.push(hooks);
+    options.extend([OsString::from("-c"), hooks_option]);
+    for key in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|key| !key.is_empty())
+    {
+        let mut disabled = os_string_from_path_bytes(key.to_vec())?;
+        disabled.push("=");
+        let end = key
+            .iter()
+            .rposition(|byte| *byte == b'.')
+            .ok_or("Invalid Git filter key.")?;
+        let mut optional = os_string_from_path_bytes(key[..end].to_vec())?;
+        optional.push(".required=false");
+        options.extend([
+            OsString::from("-c"),
+            disabled,
+            OsString::from("-c"),
+            optional,
+        ]);
+    }
+    Ok(options)
+}
+
+fn filtered_paths(
+    worktree: &Path,
+    paths: &[u8],
+    cached: bool,
+    environment: &[(&str, &std::ffi::OsStr)],
+    git_options: &[OsString],
+) -> Result<BTreeSet<Vec<u8>>, String> {
+    let mut args = vec!["check-attr", "-z", "--stdin"];
+    if cached {
+        args.push("--cached");
+    }
+    args.push("filter");
+    let output = command::git_at_with_input_and_env(
+        worktree,
+        git_args(git_options, args),
+        paths,
+        environment.iter().copied(),
+    )
+    .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("Could not inspect Git filter attributes.".into());
+    }
+    let fields = output
+        .stdout
+        .strip_suffix(b"\0")
+        .unwrap_or(&output.stdout)
+        .split(|byte| *byte == 0)
+        .collect::<Vec<_>>();
+    let mut filtered = BTreeSet::new();
+    if output.stdout.is_empty() {
+        return Ok(filtered);
+    }
+    if !fields.len().is_multiple_of(3) {
+        return Err("Git returned invalid filter attributes.".into());
+    }
+    for entry in fields.chunks_exact(3) {
+        let absent = matches!(entry[2], b"unspecified" | b"unset");
+        // check-attr renders these sentinel states exactly like literal driver
+        // names. If such a driver was configured (and disabled above), treat
+        // the ambiguous value as opaque rather than exposing its contents.
+        let configured_sentinel = absent
+            && ["clean", "process"].iter().any(|property| {
+                git_options.contains(&OsString::from(format!(
+                    "filter.{}.{property}=",
+                    String::from_utf8_lossy(entry[2])
+                )))
+            });
+        if !absent || configured_sentinel {
+            filtered.insert(entry[0].to_vec());
+        }
+    }
+    Ok(filtered)
+}
+
+struct DiffPaths {
+    nul_separated: Vec<u8>,
+    renames: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+fn parse_diff_paths(output: &[u8]) -> Result<DiffPaths, String> {
+    let mut fields = output.split(|byte| *byte == 0);
+    let mut paths = DiffPaths {
+        nul_separated: Vec::new(),
+        renames: Vec::new(),
+    };
+    while let Some(status) = fields.next().filter(|status| !status.is_empty()) {
+        let first = fields
+            .next()
+            .filter(|path| !path.is_empty())
+            .ok_or("Git returned an incomplete changed path.")?;
+        paths.nul_separated.extend_from_slice(first);
+        paths.nul_separated.push(0);
+        if matches!(status.first(), Some(b'R' | b'C')) {
+            let second = fields
+                .next()
+                .filter(|path| !path.is_empty())
+                .ok_or("Git returned an incomplete rename.")?;
+            paths.nul_separated.extend_from_slice(second);
+            paths.nul_separated.push(0);
+            paths.renames.push((first.to_vec(), second.to_vec()));
+        }
+    }
+    Ok(paths)
+}
+
+fn include_filtered_rename_paths(filtered: &mut BTreeSet<Vec<u8>>, renames: &[(Vec<u8>, Vec<u8>)]) {
+    loop {
+        let before = filtered.len();
+        for (previous, current) in renames {
+            if filtered.contains(previous) || filtered.contains(current) {
+                filtered.extend([previous.clone(), current.clone()]);
+            }
+        }
+        if filtered.len() == before {
+            break;
+        }
+    }
+}
+
 pub(super) fn selected_commit_context(
     request: &GenerateCommitMessageRequest,
 ) -> Result<SelectedCommitContext, String> {
-    let snapshot = working_copy_snapshot(WorkingCopyRequest {
-        repository_path: request.repository_path.clone(),
-        worktree_path: request.worktree_path.clone(),
-    })?;
+    let temporary_index = tempfile::tempdir()
+        .map_err(|error| format!("Could not create a temporary Git index: {error}"))?;
+    let hooks = temporary_index.path().join("hooks");
+    fs::create_dir(&hooks).map_err(|error| error.to_string())?;
+    let worktree = canonical_directory(&request.worktree_path, "worktree")?;
+    let options = inspection_git_options(&worktree, &hooks)?;
+    let mut snapshot = working_copy_snapshot_with_options(
+        WorkingCopyRequest {
+            repository_path: request.repository_path.clone(),
+            worktree_path: request.worktree_path.clone(),
+        },
+        &options,
+    )?;
     if snapshot.head != request.expected_head {
         return Err(
             "The working-copy HEAD changed after the commit was reviewed. Refresh and try again."
@@ -1110,11 +1356,42 @@ pub(super) fn selected_commit_context(
     if request.included_changes.is_empty() && !request.amend {
         return Err("Include at least one change before generating a commit message.".into());
     }
+    let mut selected_paths = Vec::new();
+    for selection in &request.included_changes {
+        for path in std::iter::once(&selection.path).chain(selection.previous_path.iter()) {
+            selected_paths.extend(decode_path_token_bytes(&path.token)?);
+            selected_paths.push(0);
+        }
+    }
+    let mut filtered = filtered_paths(&worktree, &selected_paths, false, &[], &options)?;
+    filtered.extend(filtered_paths(
+        &worktree,
+        &selected_paths,
+        true,
+        &[],
+        &options,
+    )?);
+    // Without filters a staged, clean file can appear modified. Preserve the
+    // reviewed clean/modified distinction only for opaque filtered files;
+    // deletions, type changes, conflicts, renames, and index state still validate.
+    for selection in &request.included_changes {
+        if filtered.contains(&decode_path_token_bytes(&selection.path.token)?) {
+            if let Some(change) = snapshot
+                .changes
+                .iter_mut()
+                .find(|change| change.path.token == selection.path.token)
+            {
+                if matches!(change.worktree_status.as_str(), "." | "M")
+                    && matches!(selection.expected_worktree_status.as_str(), "." | "M")
+                {
+                    change.worktree_status = selection.expected_worktree_status.clone();
+                }
+            }
+        }
+    }
     validate_commit_selections(&snapshot, &request.included_changes)?;
 
     let worktree = PathBuf::from(&snapshot.worktree_path);
-    let temporary_index = tempfile::tempdir()
-        .map_err(|error| format!("Could not create a temporary Git index: {error}"))?;
     let index_path = temporary_index.path().join("index");
     let objects_path = temporary_index.path().join("objects");
     fs::create_dir(&objects_path).map_err(|error| error.to_string())?;
@@ -1142,16 +1419,44 @@ pub(super) fn selected_commit_context(
         ("GIT_OBJECT_DIRECTORY", objects_path.as_os_str()),
         ("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternate.as_os_str()),
     ];
-    initialize_commit_index(&worktree, snapshot.head.as_deref(), &environment)?;
-    populate_commit_index(
-        &snapshot,
-        &request.included_changes,
+    initialize_commit_index(&worktree, snapshot.head.as_deref(), &environment, &options)?;
+    filtered.extend(filtered_paths(
         &worktree,
+        &selected_paths,
+        true,
         &environment,
-    )?;
+        &options,
+    )?);
+    // Treat both names of a selected rename as opaque if either name uses a
+    // filter. A new extension must not expose the old filtered file's contents.
+    for selection in &request.included_changes {
+        if let Some(previous) = &selection.previous_path {
+            let previous = decode_path_token_bytes(&previous.token)?;
+            let current = decode_path_token_bytes(&selection.path.token)?;
+            if filtered.contains(&previous) || filtered.contains(&current) {
+                filtered.extend([previous, current]);
+            }
+        }
+    }
+    // Already-known filtered paths need no content diff for partial selections.
+    // Fingerprint the whole file without custom filters instead. For filters
+    // discovered only in the constructed index below, normal patch revalidation
+    // still compares each reviewed hunk's complete patch, including blob IDs.
+    let mut selections = request.included_changes.clone();
+    for selection in &mut selections {
+        if filtered.contains(&decode_path_token_bytes(&selection.path.token)?) {
+            selection.include_all = true;
+            selection.hunks.clear();
+        }
+    }
+    populate_commit_index(&snapshot, &selections, &worktree, &environment, &options)?;
 
-    let tree = command::git_at_with_env(&worktree, ["write-tree"], environment.iter().copied())
-        .map_err(|error| error.to_string())?;
+    let tree = command::git_at_with_env(
+        &worktree,
+        git_args(&options, ["write-tree"]),
+        environment.iter().copied(),
+    )
+    .map_err(|error| error.to_string())?;
     if !tree.status.success() {
         return Err("Could not fingerprint the selected changes.".into());
     }
@@ -1173,14 +1478,18 @@ pub(super) fn selected_commit_context(
 
     let changed_output = command::git_at_with_env(
         &worktree,
-        [
-            "diff",
-            "--cached",
-            "--name-status",
-            "--no-color",
-            &base,
-            "--",
-        ],
+        git_args(
+            &options,
+            [
+                "diff",
+                "--cached",
+                "--name-status",
+                "--no-color",
+                "--find-renames",
+                &base,
+                "--",
+            ],
+        ),
         environment.iter().copied(),
     )
     .map_err(|error| error.to_string())?;
@@ -1196,37 +1505,115 @@ pub(super) fn selected_commit_context(
         return Err("The included changes do not produce a commit.".into());
     }
 
-    let patch = match command::git_at_with_env(
+    let names = command::git_at_with_env(
         &worktree,
+        git_args(
+            &options,
+            [
+                "diff",
+                "--cached",
+                "--name-status",
+                "--find-renames",
+                "-z",
+                &base,
+                "--",
+            ],
+        ),
+        environment.iter().copied(),
+    )
+    .map_err(|error| error.to_string())?;
+    if !names.status.success() {
+        return Err("Could not inspect selected paths.".into());
+    }
+    let names = parse_diff_paths(&names.stdout)?;
+    filtered.extend(filtered_paths(
+        &worktree,
+        &names.nul_separated,
+        false,
+        &[],
+        &options,
+    )?);
+    filtered.extend(filtered_paths(
+        &worktree,
+        &names.nul_separated,
+        true,
+        &[],
+        &options,
+    )?);
+    filtered.extend(filtered_paths(
+        &worktree,
+        &names.nul_separated,
+        true,
+        &environment,
+        &options,
+    )?);
+    // Check the diff base too: removing .gitattributes must not expose contents
+    // of a formerly filtered file, including during a message-only amend.
+    let base_index = temporary_index.path().join("base-index");
+    let mut base_environment = environment.to_vec();
+    base_environment[0] = ("GIT_INDEX_FILE", base_index.as_os_str());
+    initialize_commit_index(&worktree, Some(&base), &base_environment, &options)?;
+    filtered.extend(filtered_paths(
+        &worktree,
+        &names.nul_separated,
+        true,
+        &base_environment,
+        &options,
+    )?);
+    include_filtered_rename_paths(&mut filtered, &names.renames);
+    let visible_paths = names
+        .nul_separated
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty() && !filtered.contains(*path))
+        .map(|path| os_string_from_path_bytes(path.to_vec()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut patch_args = git_args(
+        &options,
         [
             "diff",
             "--cached",
             "--patch",
             "--minimal",
             "--no-ext-diff",
+            "--no-textconv",
+            "--find-renames",
             "--no-color",
             &base,
             "--",
         ],
-        environment.iter().copied(),
-    ) {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).into_owned()
+    );
+    patch_args.extend(visible_paths.iter().cloned());
+    let mut patch = if visible_paths.is_empty() {
+        String::new()
+    } else {
+        match command::git_at_with_env(&worktree, patch_args, environment.iter().copied()) {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            }
+            Ok(output) => return Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+            Err(command::CommandError::OutputTooLarge {
+                stream: "stdout", ..
+            }) => {
+                "[Selected patch is too large to include; use the file list and repository style.]"
+                    .into()
+            }
+            Err(error) => return Err(error.to_string()),
         }
-        Ok(output) => return Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
-        Err(command::CommandError::OutputTooLarge {
-            stream: "stdout", ..
-        }) => "[Selected patch is too large to include; use the file list and repository style.]"
-            .into(),
-        Err(error) => return Err(error.to_string()),
     };
+    if names
+        .nul_separated
+        .split(|byte| *byte == 0)
+        .any(|path| filtered.contains(path))
+    {
+        patch.push_str("\n[Contents omitted for files with Git filters.]\n");
+    }
 
-    let mut log_args = vec!["log", "-n", "20", "--no-merges"];
+    let mut log_args = vec!["log", "-n", "20", "--no-merges", "--no-show-signature"];
     if request.amend {
         log_args.push("--skip=1");
     }
     log_args.push("--pretty=format:%s");
-    let recent_subjects = command::git_at(&worktree, log_args)
+    let recent_subjects = command::git_at(&worktree, git_args(&options, log_args))
         .ok()
         .filter(|output| output.status.success())
         .map(|output| {
@@ -1248,11 +1635,39 @@ pub(super) fn selected_commit_context(
     if provider == crate::preferences::TextGenerationProvider::Claude {
         instruction_files.push("CLAUDE.md");
     }
-    let repository_instructions = instruction_files
-        .into_iter()
-        .filter_map(|filename| read_repository_instruction(&worktree, filename))
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let mut repository_instructions = Vec::new();
+    for filename in instruction_files {
+        let Some((file, target)) = open_repository_instruction(&worktree, filename) else {
+            continue;
+        };
+        // Check both the instruction's name and the resolved in-repository
+        // target. Read from this same open file after checking its attributes.
+        let mut paths = filename.as_bytes().to_vec();
+        paths.push(0);
+        paths.extend_from_slice(&target);
+        paths.push(0);
+        filtered.extend(filtered_paths(&worktree, &paths, false, &[], &options)?);
+        filtered.extend(filtered_paths(&worktree, &paths, true, &[], &options)?);
+        filtered.extend(filtered_paths(
+            &worktree,
+            &paths,
+            true,
+            &environment,
+            &options,
+        )?);
+        filtered.extend(filtered_paths(
+            &worktree,
+            &paths,
+            true,
+            &base_environment,
+            &options,
+        )?);
+        if !filtered.contains(filename.as_bytes()) && !filtered.contains(&target) {
+            if let Some(contents) = read_repository_instruction(file, filename) {
+                repository_instructions.push(contents);
+            }
+        }
+    }
 
     Ok(SelectedCommitContext {
         tree_oid,
@@ -1260,7 +1675,7 @@ pub(super) fn selected_commit_context(
         changed_files,
         patch,
         recent_subjects,
-        repository_instructions,
+        repository_instructions: repository_instructions.join("\n\n"),
     })
 }
 
@@ -1318,12 +1733,13 @@ pub fn commit(request: CommitRequest) -> Result<CommitResult, String> {
         .map_err(|error| format!("Could not create a temporary Git index: {error}"))?;
     let index_path = temporary_index.path().join("index");
     let environment = [("GIT_INDEX_FILE", index_path.as_os_str())];
-    initialize_commit_index(&worktree, snapshot.head.as_deref(), &environment)?;
+    initialize_commit_index(&worktree, snapshot.head.as_deref(), &environment, &[])?;
     populate_commit_index(
         &snapshot,
         &request.included_changes,
         &worktree,
         &environment,
+        &[],
     )?;
     if !request.amend
         && commit_index_matches_base(&worktree, &index_path, snapshot.head.as_deref())?
@@ -1449,13 +1865,18 @@ fn initialize_commit_index(
     worktree: &Path,
     head: Option<&str>,
     environment: &[(&str, &std::ffi::OsStr)],
+    git_options: &[OsString],
 ) -> Result<(), String> {
     let args = match head {
         Some(head) => vec![OsString::from("read-tree"), OsString::from(head)],
         None => vec![OsString::from("read-tree"), OsString::from("--empty")],
     };
-    let output = command::git_at_with_env(worktree, args, environment.iter().copied())
-        .map_err(|error| error.to_string())?;
+    let output = command::git_at_with_env(
+        worktree,
+        git_args(git_options, args),
+        environment.iter().copied(),
+    )
+    .map_err(|error| error.to_string())?;
     ensure_success(output, "initialize the commit index")
 }
 
@@ -1464,6 +1885,7 @@ fn populate_commit_index(
     selections: &[CommitFileSelection],
     worktree: &Path,
     environment: &[(&str, &std::ffi::OsStr)],
+    git_options: &[OsString],
 ) -> Result<(), String> {
     let mut whole_paths = BTreeSet::<OsString>::new();
     for selection in selections.iter().filter(|selection| selection.include_all) {
@@ -1479,8 +1901,12 @@ fn populate_commit_index(
             OsString::from("--"),
         ];
         args.extend(whole_paths);
-        let output = command::git_at_with_env(worktree, args, environment.iter().copied())
-            .map_err(|error| error.to_string())?;
+        let output = command::git_at_with_env(
+            worktree,
+            git_args(git_options, args),
+            environment.iter().copied(),
+        )
+        .map_err(|error| error.to_string())?;
         ensure_success(output, "include the selected files in the commit")?;
     }
 
@@ -1502,18 +1928,27 @@ fn populate_commit_index(
                 change.path.display
             ));
         }
-        let diff = file_diff(FileDiffRequest {
-            repository_path: snapshot.repository_path.clone(),
-            worktree_path: snapshot.worktree_path.clone(),
-            path: selection.path.clone(),
-        })?;
+        let diff = file_diff_with_options(
+            FileDiffRequest {
+                repository_path: snapshot.repository_path.clone(),
+                worktree_path: snapshot.worktree_path.clone(),
+                path: selection.path.clone(),
+            },
+            git_options,
+        )?;
         if diff.binary || diff.truncated {
             return Err(format!(
                 "{} must be included as a whole file.",
                 change.path.display
             ));
         }
-        apply_commit_hunks(worktree, environment, &diff.hunks, &selection.hunks)?;
+        apply_commit_hunks(
+            worktree,
+            environment,
+            &diff.hunks,
+            &selection.hunks,
+            git_options,
+        )?;
     }
     Ok(())
 }
@@ -1523,6 +1958,7 @@ fn apply_commit_hunks(
     environment: &[(&str, &std::ffi::OsStr)],
     current_hunks: &[PatchHunk],
     selections: &[CommitHunkSelection],
+    git_options: &[OsString],
 ) -> Result<(), String> {
     let mut selected_patches = BTreeSet::new();
     for selection in selections {
@@ -1545,7 +1981,7 @@ fn apply_commit_hunks(
         let patch = partial_hunk_patch(&hunk.patch, &selection.selected_line_indices)?;
         let output = command::git_at_with_input_and_env(
             worktree,
-            ["apply", "--cached", "--whitespace=nowarn"],
+            git_args(git_options, ["apply", "--cached", "--whitespace=nowarn"]),
             patch.as_bytes(),
             environment.iter().copied(),
         )
@@ -2211,6 +2647,11 @@ fn detect_operation(worktree: &Path) -> Option<RepositoryOperation> {
 mod tests {
     use super::*;
 
+    fn read_repository_instruction(worktree: &Path, filename: &str) -> Option<String> {
+        let (file, _) = open_repository_instruction(worktree, filename)?;
+        super::read_repository_instruction(file, filename)
+    }
+
     #[test]
     fn repository_instructions_require_a_small_readable_text_file() {
         let root = tempfile::tempdir().unwrap();
@@ -2382,6 +2823,342 @@ mod tests {
 
         assert!(context.changed_files.contains("message.txt"));
         assert!(context.patch.contains("+committed"));
+    }
+
+    #[test]
+    fn filtered_context_handles_staged_files_and_message_only_amends() {
+        let repository = repository();
+        fs::write(
+            repository.path().join(".gitattributes"),
+            "*.txt filter=opaque\n",
+        )
+        .unwrap();
+        command::successful_git_at(
+            repository.path(),
+            ["config", "filter.opaque.clean", "git hash-object --stdin"],
+        )
+        .unwrap();
+        fs::write(repository.path().join("file.txt"), "before\n").unwrap();
+        command::successful_git_at(repository.path(), ["add", "."]).unwrap();
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).unwrap();
+        fs::write(repository.path().join("file.txt"), "secret after\n").unwrap();
+        command::successful_git_at(repository.path(), ["add", "."]).unwrap();
+        let snapshot = working_copy_snapshot(request(repository.path())).unwrap();
+        let change = snapshot
+            .changes
+            .iter()
+            .find(|change| change.path.display == "file.txt")
+            .unwrap();
+        assert_eq!(change.worktree_status, ".");
+        let mut generation = GenerateCommitMessageRequest {
+            repository_path: snapshot.repository_path,
+            worktree_path: snapshot.worktree_path,
+            expected_head: snapshot.head,
+            included_changes: vec![include_whole(change)],
+            amend: false,
+            text_generation_selection: None,
+        };
+        let context = selected_commit_context(&generation).unwrap();
+        assert!(context.changed_files.contains("file.txt"));
+        assert!(!context.patch.contains("secret after"));
+        assert!(!context.patch.contains("diff --git a/file.txt"));
+        command::successful_git_at(repository.path(), ["commit", "-m", "second"]).unwrap();
+        generation.expected_head =
+            Some(git_text(repository.path(), ["rev-parse", "HEAD"]).unwrap());
+        generation.included_changes.clear();
+        generation.amend = true;
+        let context = selected_commit_context(&generation).unwrap();
+        assert!(context.changed_files.contains("file.txt"));
+        assert!(!context.patch.contains("diff --git a/file.txt"));
+    }
+
+    #[test]
+    fn removed_filter_attributes_do_not_expose_contents_from_the_diff_base() {
+        let repository = repository();
+        fs::write(
+            repository.path().join(".gitattributes"),
+            "*.txt filter=opaque\n",
+        )
+        .unwrap();
+        fs::write(repository.path().join("private.txt"), "private base\n").unwrap();
+        command::successful_git_at(repository.path(), ["add", "."]).unwrap();
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).unwrap();
+        fs::remove_file(repository.path().join(".gitattributes")).unwrap();
+        fs::remove_file(repository.path().join("private.txt")).unwrap();
+        command::successful_git_at(repository.path(), ["add", "-A"]).unwrap();
+        command::successful_git_at(repository.path(), ["commit", "-m", "remove files"]).unwrap();
+        let snapshot = working_copy_snapshot(request(repository.path())).unwrap();
+        let context = selected_commit_context(&GenerateCommitMessageRequest {
+            repository_path: snapshot.repository_path,
+            worktree_path: snapshot.worktree_path,
+            expected_head: snapshot.head,
+            included_changes: vec![],
+            amend: true,
+            text_generation_selection: None,
+        })
+        .unwrap();
+        assert!(context.changed_files.contains("D\tprivate.txt"));
+        assert!(context.patch.contains(".gitattributes"));
+        assert!(!context.patch.contains("private base"));
+    }
+
+    #[test]
+    fn amended_renames_preserve_normal_diffs_and_omit_either_filtered_name() {
+        for filtered in [false, true] {
+            let repository = repository();
+            if filtered {
+                fs::write(
+                    repository.path().join(".gitattributes"),
+                    "*.txt filter=opaque\n",
+                )
+                .unwrap();
+            }
+            fs::write(repository.path().join("old.txt"), "private contents\n").unwrap();
+            command::successful_git_at(repository.path(), ["add", "."]).unwrap();
+            command::successful_git_at(repository.path(), ["commit", "-m", "base"]).unwrap();
+            command::successful_git_at(repository.path(), ["mv", "old.txt", "new.dat"]).unwrap();
+            command::successful_git_at(repository.path(), ["commit", "-m", "rename file"]).unwrap();
+            let snapshot = working_copy_snapshot(request(repository.path())).unwrap();
+            let context = selected_commit_context(&GenerateCommitMessageRequest {
+                repository_path: snapshot.repository_path,
+                worktree_path: snapshot.worktree_path,
+                expected_head: snapshot.head,
+                included_changes: vec![],
+                amend: true,
+                text_generation_selection: None,
+            })
+            .unwrap();
+            assert!(context.changed_files.contains("R100\told.txt\tnew.dat"));
+            assert!(!context.patch.contains("private contents"));
+            if filtered {
+                assert!(context.patch.contains("Contents omitted"));
+                assert!(!context.patch.contains("diff --git"));
+            } else {
+                assert!(context.patch.contains("rename from old.txt"));
+                assert!(context.patch.contains("rename to new.dat"));
+            }
+        }
+    }
+
+    #[test]
+    fn changed_path_records_preserve_exact_bytes_and_propagate_opaque_renames() {
+        let paths = parse_diff_paths(b"M\0space name\0R100\0old\nname\0new\xffname\0").unwrap();
+        assert_eq!(paths.nul_separated, b"space name\0old\nname\0new\xffname\0");
+        let mut filtered = BTreeSet::from([b"old\nname".to_vec()]);
+        include_filtered_rename_paths(&mut filtered, &paths.renames);
+        assert!(filtered.contains(b"new\xffname".as_slice()));
+        assert!(parse_diff_paths(b"R100\0old\0").is_err());
+    }
+
+    #[test]
+    fn amended_attribute_removal_keeps_unchanged_filtered_instructions_private() {
+        let repository = repository();
+        fs::write(
+            repository.path().join(".gitattributes"),
+            "AGENTS.md filter=opaque\n",
+        )
+        .unwrap();
+        fs::write(
+            repository.path().join("AGENTS.md"),
+            "private instructions\n",
+        )
+        .unwrap();
+        command::successful_git_at(repository.path(), ["add", "."]).unwrap();
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).unwrap();
+        fs::remove_file(repository.path().join(".gitattributes")).unwrap();
+        command::successful_git_at(repository.path(), ["add", "-A"]).unwrap();
+        command::successful_git_at(repository.path(), ["commit", "-m", "remove attributes"])
+            .unwrap();
+        let snapshot = working_copy_snapshot(request(repository.path())).unwrap();
+        let context = selected_commit_context(&GenerateCommitMessageRequest {
+            repository_path: snapshot.repository_path,
+            worktree_path: snapshot.worktree_path,
+            expected_head: snapshot.head,
+            included_changes: vec![],
+            amend: true,
+            text_generation_selection: None,
+        })
+        .unwrap();
+        assert!(!context.changed_files.contains("AGENTS.md"));
+        assert!(context.repository_instructions.is_empty());
+    }
+
+    #[test]
+    fn deleting_a_filtered_file_does_not_hide_unrelated_normal_additions() {
+        let repository = repository();
+        fs::write(
+            repository.path().join(".gitattributes"),
+            "*.txt filter=opaque\n",
+        )
+        .unwrap();
+        fs::write(repository.path().join("private.txt"), "private base\n").unwrap();
+        command::successful_git_at(repository.path(), ["add", "."]).unwrap();
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).unwrap();
+        fs::remove_file(repository.path().join("private.txt")).unwrap();
+        fs::write(
+            repository.path().join("component.ts"),
+            "export const enabled = true;\n",
+        )
+        .unwrap();
+        let snapshot = working_copy_snapshot(request(repository.path())).unwrap();
+        let selections = snapshot.changes.iter().map(include_whole).collect();
+        let context = selected_commit_context(&GenerateCommitMessageRequest {
+            repository_path: snapshot.repository_path,
+            worktree_path: snapshot.worktree_path,
+            expected_head: snapshot.head,
+            included_changes: selections,
+            amend: false,
+            text_generation_selection: None,
+        })
+        .unwrap();
+        assert!(context.patch.contains("+export const enabled = true;"));
+        assert!(!context.patch.contains("private base"));
+    }
+
+    #[test]
+    fn generation_preserves_normal_partial_selection_and_omits_filtered_partial_content() {
+        let repository = repository();
+        fs::write(repository.path().join("lines.txt"), "one\ntwo\nthree\n").unwrap();
+        command::successful_git_at(repository.path(), ["add", "."]).unwrap();
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).unwrap();
+        fs::write(repository.path().join("lines.txt"), "ONE\ntwo\nTHREE\n").unwrap();
+        let snapshot = working_copy_snapshot(request(repository.path())).unwrap();
+        let change = &snapshot.changes[0];
+        let diff = file_diff(FileDiffRequest {
+            repository_path: snapshot.repository_path.clone(),
+            worktree_path: snapshot.worktree_path.clone(),
+            path: change.path.clone(),
+        })
+        .unwrap();
+        let patch = &diff.hunks[0].patch;
+        let indices = patch[patch.find("@@ ").unwrap()..]
+            .lines()
+            .skip(1)
+            .enumerate()
+            .filter_map(|(index, line)| matches!(line, "-one" | "+ONE").then_some(index as u32))
+            .collect();
+        let mut selection = include_whole(change);
+        selection.include_all = false;
+        selection.hunks = vec![CommitHunkSelection {
+            expected_patch: patch.clone(),
+            selected_line_indices: indices,
+        }];
+        let generation = GenerateCommitMessageRequest {
+            repository_path: snapshot.repository_path,
+            worktree_path: snapshot.worktree_path,
+            expected_head: snapshot.head,
+            included_changes: vec![selection],
+            amend: false,
+            text_generation_selection: None,
+        };
+        let context = selected_commit_context(&generation).unwrap();
+        assert!(context.patch.contains("+ONE"));
+        assert!(!context.patch.contains("+THREE"));
+        fs::write(
+            repository.path().join(".gitattributes"),
+            "lines.txt filter=opaque\n",
+        )
+        .unwrap();
+        let context = selected_commit_context(&generation).unwrap();
+        assert!(context.changed_files.contains("lines.txt"));
+        assert!(!context.patch.contains("+ONE"));
+        assert!(!context.patch.contains("+THREE"));
+        fs::write(repository.path().join("lines.txt"), "ONE\ntwo\nNEWER\n").unwrap();
+        assert_ne!(
+            selected_commit_context(&generation).unwrap().tree_oid,
+            context.tree_oid
+        );
+    }
+
+    #[test]
+    fn constructed_only_filters_omit_contents_and_still_revalidate_selected_hunks() {
+        let repository = repository();
+        let middle = (0..30)
+            .map(|index| format!("# unchanged {index}\n"))
+            .collect::<String>();
+        fs::write(
+            repository.path().join(".gitattributes"),
+            format!("# first\n{middle}# last\n"),
+        )
+        .unwrap();
+        fs::write(
+            repository.path().join("file.txt"),
+            format!("before\n{middle}original\n"),
+        )
+        .unwrap();
+        command::successful_git_at(repository.path(), ["add", "."]).unwrap();
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).unwrap();
+        // The selected first hunk enables the filter; the unselected second
+        // hunk disables it in the working tree, but not the constructed index.
+        fs::write(
+            repository.path().join(".gitattributes"),
+            format!("*.txt filter=opaque\n{middle}*.txt -filter\n"),
+        )
+        .unwrap();
+        fs::write(
+            repository.path().join("file.txt"),
+            format!("selected\n{middle}unselected\n"),
+        )
+        .unwrap();
+        let snapshot = working_copy_snapshot(request(repository.path())).unwrap();
+        let selections = snapshot
+            .changes
+            .iter()
+            .map(|change| {
+                let diff = file_diff(FileDiffRequest {
+                    repository_path: snapshot.repository_path.clone(),
+                    worktree_path: snapshot.worktree_path.clone(),
+                    path: change.path.clone(),
+                })
+                .unwrap();
+                assert_eq!(diff.hunks.len(), 2);
+                let patch = &diff.hunks[0].patch;
+                let indices = patch[patch.find("@@ ").unwrap()..]
+                    .lines()
+                    .skip(1)
+                    .enumerate()
+                    .filter_map(|(index, line)| {
+                        matches!(line.as_bytes().first(), Some(b'+' | b'-')).then_some(index as u32)
+                    })
+                    .collect();
+                let mut selection = include_whole(change);
+                selection.include_all = false;
+                selection.hunks = vec![CommitHunkSelection {
+                    expected_patch: patch.clone(),
+                    selected_line_indices: indices,
+                }];
+                selection
+            })
+            .collect();
+        let generation = GenerateCommitMessageRequest {
+            repository_path: snapshot.repository_path,
+            worktree_path: snapshot.worktree_path,
+            expected_head: snapshot.head,
+            included_changes: selections,
+            amend: false,
+            text_generation_selection: None,
+        };
+        let context = selected_commit_context(&generation).unwrap();
+        assert!(context.patch.contains("Contents omitted"));
+        assert!(!context.patch.contains("+selected"));
+        fs::write(
+            repository.path().join("file.txt"),
+            format!("selected\n{middle}different unselected\n"),
+        )
+        .unwrap();
+        // Each reviewed hunk retains its file header, including the new blob
+        // ID. Even this other-hunk edit invalidates the reviewed patch.
+        assert!(selected_commit_context(&generation)
+            .unwrap_err()
+            .contains("patch hunk changed"));
+        fs::write(
+            repository.path().join("file.txt"),
+            format!("changed selection\n{middle}different unselected\n"),
+        )
+        .unwrap();
+        assert!(selected_commit_context(&generation)
+            .unwrap_err()
+            .contains("patch hunk changed"));
     }
 
     fn conflicted_repository() -> (tempfile::TempDir, WorkingCopySnapshot, GitPath) {
