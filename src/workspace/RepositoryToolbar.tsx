@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   CheckIcon,
   ChevronDownIcon,
@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Combobox, ComboboxCollection, ComboboxContent, ComboboxEmpty, ComboboxGroup, ComboboxInput, ComboboxItem, ComboboxLabel, ComboboxList, ComboboxTrigger, ComboboxValue } from "@/components/ui/combobox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Field, FieldLabel } from "@/components/ui/field";
@@ -28,6 +29,7 @@ import { fileManagerName } from "../domain/platform";
 import { ActionableGitError } from "../components/ActionableGitError";
 import type { HistoryTarget } from "../dialogs/HistoryMutationDialog";
 import { shortSha } from "../domain/format";
+import { groupWorktreesForPicker, matchesWorktreeQuery, worktreeBranchLabel, worktreeFolderName, type WorktreePickerGroup } from "../domain/worktree-picker";
 import { loadBranches, mutateBranch, revealWorktree } from "../ipc/worktrees";
 import type { BranchInfo, RepositorySummary, WorktreeRecord } from "../ipc/types";
 import { useRepositoryContext, useWorkingCopy } from "./context";
@@ -54,10 +56,6 @@ export function RepositoryToolbar({
 }) {
   const { machineKind, repository, worktree } = useRepositoryContext();
   const [pendingRepositoryRemoval, setPendingRepositoryRemoval] = useState(false);
-  const worktreeItems = Object.fromEntries(worktrees.map((item) => [
-    item.path,
-    item.branch ?? `Detached at ${shortSha(item.head)}`,
-  ]));
   return (
     <section className="flex h-16 shrink-0 items-center gap-1 border-b bg-card px-3" aria-label="Working-copy context">
       <div className="flex min-w-0 flex-1 items-center gap-1">
@@ -108,21 +106,7 @@ export function RepositoryToolbar({
             </DropdownMenuContent>
           </DropdownMenu>
           <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-          <Select items={worktreeItems} value={worktree?.path ?? null} onValueChange={(value) => { if (value) onWorktreeChange(value); }}>
-            <SelectTrigger id="current-worktree" className="w-52 border-transparent bg-transparent hover:bg-accent" aria-label="Current working copy">
-              <FolderOpenIcon aria-hidden="true" />
-              <SelectValue placeholder="Select a working copy…" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectGroup>
-                {worktrees.map((item) => (
-                  <SelectItem key={item.id} value={item.path}>
-                    {item.branch ?? `Detached at ${shortSha(item.head)}`}{item.isPrimary ? " · primary" : ""}
-                  </SelectItem>
-                ))}
-              </SelectGroup>
-            </SelectContent>
-          </Select>
+          <WorktreePicker worktrees={worktrees} onWorktreeChange={onWorktreeChange} />
           <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
         {repository && worktree ? (
           <BranchControl key={`${repository.path}\0${worktree.id}\0${worktree.head ?? ""}`} />
@@ -148,6 +132,62 @@ export function RepositoryToolbar({
         </DialogContent>
       </Dialog>
     </section>
+  );
+}
+
+function WorktreePicker({
+  worktrees,
+  onWorktreeChange,
+}: {
+  worktrees: WorktreeRecord[];
+  onWorktreeChange: (path: string) => void;
+}) {
+  const { worktree } = useRepositoryContext();
+  const groups = useMemo(() => groupWorktreesForPicker(worktrees), [worktrees]);
+  const selected = worktrees.find((item) => item.path === worktree?.path) ?? null;
+  return (
+    <Combobox
+      items={groups}
+      autoHighlight
+      value={selected}
+      itemToStringLabel={(item: WorktreeRecord) => worktreeFolderName(item.path)}
+      itemToStringValue={(item: WorktreeRecord) => item.path}
+      isItemEqualToValue={(item: WorktreeRecord, value: WorktreeRecord) => item.path === value.path}
+      filter={matchesWorktreeQuery}
+      onValueChange={(value: WorktreeRecord | null) => { if (value && value.path !== worktree?.path) onWorktreeChange(value.path); }}
+    >
+      <ComboboxTrigger
+        id="current-worktree"
+        render={<Button variant="ghost" className="w-52 justify-between" aria-label="Current worktree" />}
+      >
+        <span className="flex min-w-0 items-center gap-1.5">
+          <FolderOpenIcon data-icon="inline-start" aria-hidden="true" />
+          <span className="truncate">
+            <ComboboxValue placeholder="Select a worktree…" />
+          </span>
+        </span>
+      </ComboboxTrigger>
+      <ComboboxContent className="w-auto min-w-96 max-w-[min(36rem,var(--available-width))]">
+        <ComboboxInput showTrigger={false} placeholder="Filter worktrees" aria-label="Filter worktrees" />
+        <ComboboxEmpty>No worktrees match.</ComboboxEmpty>
+        <ComboboxList className="max-h-[min(40rem,calc(var(--available-height)---spacing(9)))]">
+          {(group: WorktreePickerGroup) => (
+            <ComboboxGroup key={group.value} items={group.items}>
+              <ComboboxLabel>{group.value}</ComboboxLabel>
+              <ComboboxCollection>
+                {(item: WorktreeRecord) => (
+                  <ComboboxItem key={item.id} value={item}>
+                    <FolderOpenIcon className="text-muted-foreground" aria-hidden="true" />
+                    <span className="min-w-0 flex-1 truncate">{worktreeFolderName(item.path)}</span>
+                    <span className="max-w-60 shrink truncate text-xs text-muted-foreground">{worktreeBranchLabel(item)}</span>
+                  </ComboboxItem>
+                )}
+              </ComboboxCollection>
+            </ComboboxGroup>
+          )}
+        </ComboboxList>
+      </ComboboxContent>
+    </Combobox>
   );
 }
 
