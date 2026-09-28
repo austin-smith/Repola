@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { fileManagerName } from "./platform";
+import { fileManagerName, machinePathSeparator } from "./platform";
+
+describe("machinePathSeparator", () => {
+  it("uses the desktop separator locally and the remote OS separator over SSH", () => {
+    expect(machinePathSeparator("local", null, "\\")).toBe("\\");
+    expect(machinePathSeparator("ssh", "linux", "\\")).toBe("/");
+    expect(machinePathSeparator("ssh", "windows", "/")).toBe("\\");
+    expect(machinePathSeparator("ssh", null, "\\")).toBe("/");
+  });
+});
 
 describe("fileManagerName", () => {
   it("names the platform file browser from the webview user agent", () => {
