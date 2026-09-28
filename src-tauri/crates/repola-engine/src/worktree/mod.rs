@@ -1,6 +1,8 @@
 mod actions;
 mod agents;
 mod branches;
+mod claude;
+mod codex;
 pub(crate) mod command;
 mod create_worktree;
 mod discovery;
@@ -9,6 +11,7 @@ mod history;
 mod history_mutations;
 mod identity;
 mod inspection;
+mod model_catalog;
 mod models;
 mod operations;
 mod providers;
@@ -16,9 +19,11 @@ mod repository;
 mod stash;
 mod sync;
 mod tags;
+mod text_generation;
 mod watch;
 mod working_copy;
 
+pub use crate::preferences::{TextGenerationProvider, TextGenerationSelection};
 pub use actions::{execute_action, prepare_action};
 pub use branches::{branches, mutate_branch};
 pub use create_worktree::create_worktree;
@@ -36,16 +41,17 @@ pub use models::{
     CloneRepositoryRequest, CommitChangedFile, CommitFileDiffRequest, CommitFilesRequest,
     CommitRequest, CommitResult, ConflictFile, ConflictFileRequest, CreateRepositoryRequest,
     CreateWorktreeRequest, CreateWorktreeResult, DiscardAllRequest, DiscardFileRequest,
-    DiscardScope, FileDiff, FileDiffRequest, HistoryMutationKind, HistoryMutationRequest,
-    HistoryMutationResult, HistoryPage, HistoryRequest, PatchHunk, PatchHunkAction,
-    PullRequestEvidence, PullRequestMutationKind, PullRequestMutationRequest,
-    PullRequestMutationResult, ReflogEntry, ReflogRequest, RepositoryOperationAction,
-    RepositoryOperationMutationResult, RepositoryOperationRequest, RepositoryOperationResult,
-    ResolveConflictRequest, ReviewedFileChange, ScanEvent, ScanRequest, ScanResult,
-    SetFileStagingRequest, StashEntry, StashMutationRequest, StashMutationResult, StashRequest,
-    SyncRequest, SyncResult, TagInfo, TagMutationKind, TagMutationRequest, TagMutationResult,
-    TagRequest, UndoCommitRequest, UndoCommitResult, WorkingCopyRequest, WorkingCopySnapshot,
-    WorktreeChanges,
+    DiscardScope, FileDiff, FileDiffRequest, GenerateCommitMessageRequest, GeneratedCommitMessage,
+    HistoryMutationKind, HistoryMutationRequest, HistoryMutationResult, HistoryPage,
+    HistoryRequest, PatchHunk, PatchHunkAction, PullRequestEvidence, PullRequestMutationKind,
+    PullRequestMutationRequest, PullRequestMutationResult, ReasoningEffort, ReflogEntry,
+    ReflogRequest, RepositoryOperationAction, RepositoryOperationMutationResult,
+    RepositoryOperationRequest, RepositoryOperationResult, ResolveConflictRequest,
+    ReviewedFileChange, ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry,
+    StashMutationRequest, StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo,
+    TagMutationKind, TagMutationRequest, TagMutationResult, TagRequest, TextGenerationModel,
+    TextGenerationStatus, TextGenerationStatusKind, UndoCommitRequest, UndoCommitResult,
+    WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges,
 };
 pub use operations::mutate_operation;
 pub use providers::{fetch_pull_requests, mutate_pull_request};
@@ -53,6 +59,8 @@ pub use repository::{clone_repository, create_repository};
 pub use stash::{list_stashes, mutate_stash};
 pub use sync::synchronize;
 pub use tags::{mutate_tag, tags};
+pub(crate) use text_generation::{commit_message_provider_timeout, text_generation_status_timeout};
+pub use text_generation::{generate_commit_message, text_generation_status};
 pub use watch::{WorktreeChangeEvent, WorktreeWatcher};
 pub use working_copy::{
     apply_patch_hunk, commit, conflict_file, discard_all, discard_file, file_diff,

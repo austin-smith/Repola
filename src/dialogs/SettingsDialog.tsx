@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowDownIcon, ArrowUpIcon, CheckCircle2Icon, LaptopIcon, PencilIcon, PlusIcon, ServerIcon, Trash2Icon, WifiIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -11,13 +11,17 @@ import { Separator } from "@/components/ui/separator";
 import { Spinner } from "@/components/ui/spinner";
 import { ThemePicker } from "@/components/theme-picker";
 import { TooltipButton } from "@/components/tooltip-button";
-import { loadAppPreferences, loadExternalTools, saveAppPreferences } from "../ipc/app-preferences";
+import { loadAppPreferences, loadExternalTools, updateAppPreferences } from "../ipc/app-preferences";
 import { UpdateSettings } from "../app/AppUpdater";
 import { resolveAvailableToolId, toolLabels } from "../domain/external-tools";
-import type { AgentInfo, AppPreferences, ExternalToolAvailability, MachineProfile, MachineProfileInput } from "../ipc/types";
+import { CommitMessageSettings } from "./CommitMessageSettings";
+import { activeGenerationSelection, rememberGenerationSelection } from "../domain/text-generation";
+import { toMessage } from "../lib/errors";
+import type { AgentInfo, AppPreferences, TextGenerationSelection, ExternalToolAvailability, MachineProfile, MachineProfileInput } from "../ipc/types";
 
 interface SettingsDialogProps {
   machines: MachineProfile[];
+  selectedMachineId: string;
   busy: boolean;
   onClose: () => void;
   onRemoveMachine: (machineId: string) => Promise<boolean>;
@@ -41,6 +45,7 @@ function inputFor(machine?: MachineProfile): MachineProfileInput {
 
 export function SettingsDialog({
   machines,
+  selectedMachineId,
   busy,
   onClose,
   onRemoveMachine,
@@ -55,6 +60,11 @@ export function SettingsDialog({
   const [externalTools, setExternalTools] = useState<ExternalToolAvailability | null>(null);
   const [preferencesBusy, setPreferencesBusy] = useState(false);
   const [preferencesError, setPreferencesError] = useState<string | null>(null);
+  const [generationSaveErrors, setGenerationSaveErrors] = useState<Record<string, string | null>>({});
+  const generationRevisions = useRef<Record<string, number>>({});
+  const confirmedGeneration = useRef<AppPreferences["textGenerationSelections"]>({});
+  const savingPreferences = useRef(false);
+  const selectedMachine = machines.find((machine) => machine.id === selectedMachineId) ?? machines[0];
 
   useEffect(() => {
     let active = true;
@@ -62,6 +72,7 @@ export function SettingsDialog({
       .then(([value, tools]) => {
         if (!active) return;
         setExternalTools(tools);
+        confirmedGeneration.current = value.textGenerationSelections;
         setPreferences({
           ...value,
           editorId: resolveAvailableToolId(value.editorId, tools.editors),
@@ -73,14 +84,21 @@ export function SettingsDialog({
   }, []);
 
   const persistPreferences = async () => {
-    if (!preferences) return;
+    if (!preferences || savingPreferences.current) return;
+    savingPreferences.current = true;
     setPreferencesBusy(true);
     setPreferencesError(null);
     try {
-      setPreferences(await saveAppPreferences(preferences));
+      await updateAppPreferences((stored) => ({
+        ...stored,
+        editorId: preferences.editorId,
+        terminalId: preferences.terminalId,
+        defaultSignCommits: preferences.defaultSignCommits,
+      }));
     } catch (cause) {
       setPreferencesError(cause instanceof Error ? cause.message : String(cause));
     } finally {
+      savingPreferences.current = false;
       setPreferencesBusy(false);
     }
   };
@@ -102,6 +120,47 @@ export function SettingsDialog({
   const terminalOptions = externalTools?.terminals ?? [];
   const editorItems = toolLabels(editorOptions);
   const terminalItems = toolLabels(terminalOptions);
+  const persistGenerationSelection = async (selection: TextGenerationSelection) => {
+    if (!preferences) return;
+    const machineId = selectedMachine.id;
+    const revision = (generationRevisions.current[machineId] ?? 0) + 1;
+    generationRevisions.current[machineId] = revision;
+    setPreferences((current) => current && ({
+      ...current,
+      textGenerationSelections: {
+        ...current.textGenerationSelections,
+        [machineId]: rememberGenerationSelection(current.textGenerationSelections[machineId], selection),
+      },
+    }));
+    setGenerationSaveErrors((current) => ({ ...current, [machineId]: null }));
+    try {
+      // Keep unsaved editor/terminal form choices out of this automatic save.
+      const saved = await updateAppPreferences((stored) => ({
+        ...stored,
+        textGenerationSelections: {
+          ...stored.textGenerationSelections,
+          [machineId]: rememberGenerationSelection(stored.textGenerationSelections[machineId], selection),
+        },
+      }));
+      confirmedGeneration.current = { ...confirmedGeneration.current, [machineId]: saved.textGenerationSelections[machineId] };
+      if (generationRevisions.current[machineId] !== revision) return;
+      setPreferences((current) => current && ({
+        ...current,
+        textGenerationSelections: { ...current.textGenerationSelections, [machineId]: saved.textGenerationSelections[machineId] },
+      }));
+    } catch (cause) {
+      if (generationRevisions.current[machineId] !== revision) return;
+      setPreferences((current) => {
+        if (!current) return current;
+        const selections = { ...current.textGenerationSelections };
+        const previous = confirmedGeneration.current[machineId];
+        if (previous) selections[machineId] = previous;
+        else delete selections[machineId];
+        return { ...current, textGenerationSelections: selections };
+      });
+      setGenerationSaveErrors((current) => ({ ...current, [machineId]: toMessage(cause) }));
+    }
+  };
 
   return (
     <Dialog open onOpenChange={(open) => { if (!open && !busy) onClose(); }}>
@@ -278,6 +337,17 @@ export function SettingsDialog({
             </form>
           ) : null}
         </section>
+
+        <Separator />
+
+        <CommitMessageSettings
+          machine={selectedMachine}
+          selection={activeGenerationSelection(preferences?.textGenerationSelections[selectedMachine.id])}
+          providerSelections={preferences?.textGenerationSelections[selectedMachine.id]?.selections}
+          saveError={generationSaveErrors[selectedMachine.id]}
+          disabled={!preferences}
+          onChange={(selection) => void persistGenerationSelection(selection)}
+        />
 
         <Separator />
 

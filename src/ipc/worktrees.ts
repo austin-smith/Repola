@@ -7,8 +7,12 @@ import type {
   ActionPlan,
   ActionResult,
   CommitRequest,
+  TextGenerationStatus,
+  TextGenerationProvider,
   CommitChangedFile,
   CommitResult,
+  GeneratedCommitMessage,
+  GenerateCommitMessageRequest,
   CreateWorktreeResult,
   ConflictResolutionKind,
   ConflictFile,
@@ -289,6 +293,21 @@ export function commitWorkingCopy(
   request: CommitRequest,
 ): Promise<CommitResult> {
   return invokeOperation<CommitResult>("commit_working_copy", { machineId, request });
+}
+
+export function generateCommitMessage(
+  machineId: string,
+  request: GenerateCommitMessageRequest,
+  signal?: AbortSignal,
+): Promise<GeneratedCommitMessage> {
+  return invokeOperation<GeneratedCommitMessage>("generate_commit_message", {
+    machineId,
+    request,
+  }, { signal });
+}
+
+export function loadTextGenerationStatus(machineId: string, provider: TextGenerationProvider | null, signal?: AbortSignal): Promise<TextGenerationStatus> {
+  return invokeOperation<TextGenerationStatus>("text_generation_status", { machineId, provider }, { signal });
 }
 
 export function undoLatestCommit(

@@ -1,9 +1,109 @@
 //! User preferences the engine acts on: which external editor and terminal to
 //! launch, and whether commits are signed by default.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-pub const APP_PREFERENCES_VERSION: u16 = 2;
+pub const APP_PREFERENCES_VERSION: u16 = 5;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextGenerationProvider {
+    #[default]
+    Codex,
+    Claude,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextGenerationSelection {
+    #[serde(default)]
+    pub provider: TextGenerationProvider,
+    /// None selects this provider's maintained default; explicit IDs never fall back.
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+/// The active provider and each provider's remembered model settings are separate.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", from = "StoredGenerationPreferences")]
+pub struct TextGenerationPreferences {
+    pub provider: TextGenerationProvider,
+    pub selections: BTreeMap<TextGenerationProvider, ModelSelection>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSelection {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredGenerationPreferences {
+    Current {
+        provider: TextGenerationProvider,
+        selections: BTreeMap<TextGenerationProvider, ModelSelection>,
+    },
+    Legacy(TextGenerationSelection),
+}
+
+impl From<StoredGenerationPreferences> for TextGenerationPreferences {
+    fn from(stored: StoredGenerationPreferences) -> Self {
+        match stored {
+            StoredGenerationPreferences::Current {
+                provider,
+                selections,
+            } => Self {
+                provider,
+                selections,
+            },
+            StoredGenerationPreferences::Legacy(selection) => selection.into(),
+        }
+    }
+}
+
+impl From<TextGenerationSelection> for TextGenerationPreferences {
+    fn from(selection: TextGenerationSelection) -> Self {
+        Self {
+            provider: selection.provider,
+            selections: BTreeMap::from([(
+                selection.provider,
+                ModelSelection {
+                    model: selection.model,
+                    reasoning_effort: selection.reasoning_effort,
+                },
+            )]),
+        }
+    }
+}
+
+impl TextGenerationPreferences {
+    pub fn selection(&self) -> TextGenerationSelection {
+        let selected = self
+            .selections
+            .get(&self.provider)
+            .cloned()
+            .unwrap_or_default();
+        TextGenerationSelection {
+            provider: self.provider,
+            model: selected.model,
+            reasoning_effort: selected.reasoning_effort,
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.selections.iter().all(|(provider, selected)| {
+            valid_text_generation_selection(&TextGenerationSelection {
+                provider: *provider,
+                model: selected.model.clone(),
+                reasoning_effort: selected.reasoning_effort.clone(),
+            })
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -14,6 +114,8 @@ pub struct AppPreferences {
     #[serde(alias = "terminal")]
     pub terminal_id: Option<String>,
     pub default_sign_commits: bool,
+    #[serde(alias = "codexSelections")]
+    pub text_generation_selections: BTreeMap<String, TextGenerationPreferences>,
 }
 
 impl Default for AppPreferences {
@@ -23,6 +125,7 @@ impl Default for AppPreferences {
             editor_id: None,
             terminal_id: None,
             default_sign_commits: false,
+            text_generation_selections: BTreeMap::new(),
         }
     }
 }
@@ -47,13 +150,43 @@ pub fn migrate_app_preferences(mut preferences: AppPreferences) -> AppPreference
             };
             preferences
         }
-        APP_PREFERENCES_VERSION => {
+        2 | 3 | 4 | APP_PREFERENCES_VERSION => {
+            preferences.version = APP_PREFERENCES_VERSION;
             preferences.editor_id = normalize_tool_id(preferences.editor_id);
             preferences.terminal_id = normalize_tool_id(preferences.terminal_id);
+            preferences
+                .text_generation_selections
+                .retain(|machine_id, selection| {
+                    valid_machine_id(machine_id) && selection.is_valid()
+                });
             preferences
         }
         _ => AppPreferences::default(),
     }
+}
+
+pub fn valid_text_generation_selection(selection: &TextGenerationSelection) -> bool {
+    selection
+        .model
+        .as_ref()
+        .is_none_or(|model| valid_preference_value(model, 128))
+        && (selection.model.is_some() || selection.reasoning_effort.is_none())
+        && selection
+            .reasoning_effort
+            .as_ref()
+            .is_none_or(|effort| valid_preference_value(effort, 32))
+}
+
+fn valid_machine_id(value: &str) -> bool {
+    valid_preference_value(value, 128)
+}
+
+fn valid_preference_value(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value
+            .chars()
+            .all(|character| !character.is_control() && !character.is_whitespace())
 }
 
 #[cfg(target_os = "macos")]
@@ -88,14 +221,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn version_four_claude_choice_and_both_provider_choices_survive_migration() {
+        let legacy: AppPreferences = serde_json::from_value(serde_json::json!({
+            "version": 4, "textGenerationSelections": {
+                "local": {"provider":"claude", "model":"saved-claude", "reasoningEffort":null}
+            }
+        }))
+        .unwrap();
+        let mut migrated = migrate_app_preferences(legacy);
+        let preferences = migrated
+            .text_generation_selections
+            .get_mut("local")
+            .unwrap();
+        assert_eq!(
+            preferences.selection().model.as_deref(),
+            Some("saved-claude")
+        );
+        preferences.selections.insert(
+            TextGenerationProvider::Codex,
+            ModelSelection {
+                model: Some("saved-codex".into()),
+                reasoning_effort: Some("high".into()),
+            },
+        );
+        preferences.provider = TextGenerationProvider::Codex;
+        let round_trip: AppPreferences =
+            serde_json::from_value(serde_json::to_value(&migrated).unwrap()).unwrap();
+        assert_eq!(migrate_app_preferences(round_trip), migrated);
+        assert_eq!(
+            migrated.text_generation_selections["local"]
+                .selections
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn version_three_codex_preferences_migrate_without_changing_the_model() {
+        let legacy: AppPreferences = serde_json::from_value(serde_json::json!({
+            "version": 3, "codexSelections": {
+                "local": {"model": "saved-model", "reasoningEffort": "high"}
+            }
+        }))
+        .unwrap();
+        let migrated = migrate_app_preferences(legacy);
+        let selection = migrated.text_generation_selections["local"].selection();
+        assert_eq!(migrated.version, APP_PREFERENCES_VERSION);
+        assert_eq!(selection.provider, TextGenerationProvider::Codex);
+        assert_eq!(selection.model.as_deref(), Some("saved-model"));
+        assert_eq!(selection.reasoning_effort.as_deref(), Some("high"));
+        let serialized = serde_json::to_value(migrated).unwrap();
+        assert!(serialized.get("codexSelections").is_none());
+        assert!(serialized.get("textGenerationSelections").is_some());
+    }
+
+    #[test]
+    fn provider_defaults_and_explicit_models_round_trip() {
+        for provider in [
+            TextGenerationProvider::Codex,
+            TextGenerationProvider::Claude,
+        ] {
+            let selection = TextGenerationSelection {
+                provider,
+                model: None,
+                reasoning_effort: None,
+            };
+            assert!(valid_text_generation_selection(&selection));
+            let raw = serde_json::to_string(&selection).unwrap();
+            assert_eq!(
+                serde_json::from_str::<TextGenerationSelection>(&raw).unwrap(),
+                selection
+            );
+        }
+    }
+
+    #[test]
     fn application_preferences_have_an_explicit_forward_safe_migration() {
         let legacy = migrate_app_preferences(AppPreferences {
             version: 0,
             editor_id: Some("cursor".into()),
             terminal_id: Some("warp".into()),
             default_sign_commits: true,
+            text_generation_selections: BTreeMap::new(),
         });
-        assert_eq!(legacy.version, 2);
+        assert_eq!(legacy.version, APP_PREFERENCES_VERSION);
         assert_eq!(legacy.editor_id.as_deref(), Some("cursor"));
         assert_eq!(legacy.terminal_id.as_deref(), Some("warp"));
         assert!(legacy.default_sign_commits);
@@ -105,6 +314,7 @@ mod tests {
             editor_id: Some("zed".into()),
             terminal_id: Some("iterm2".into()),
             default_sign_commits: true,
+            text_generation_selections: BTreeMap::new(),
         });
         assert_eq!(future, AppPreferences::default());
     }
@@ -124,5 +334,35 @@ mod tests {
             migrated.terminal_id.as_deref(),
             Some(platform_default_terminal_id())
         );
+    }
+
+    #[test]
+    fn invalid_text_generation_selections_are_removed_during_migration() {
+        let mut selections = BTreeMap::new();
+        selections.insert(
+            "local".into(),
+            TextGenerationSelection {
+                provider: TextGenerationProvider::Codex,
+                model: Some("gpt-5.6-luna".into()),
+                reasoning_effort: Some("low".into()),
+            }
+            .into(),
+        );
+        selections.insert(
+            "bad machine".into(),
+            TextGenerationSelection {
+                provider: TextGenerationProvider::Codex,
+                model: Some("gpt-5.6-luna".into()),
+                reasoning_effort: Some("low".into()),
+            }
+            .into(),
+        );
+        let migrated = migrate_app_preferences(AppPreferences {
+            version: 3,
+            text_generation_selections: selections,
+            ..AppPreferences::default()
+        });
+        assert_eq!(migrated.text_generation_selections.len(), 1);
+        assert!(migrated.text_generation_selections.contains_key("local"));
     }
 }

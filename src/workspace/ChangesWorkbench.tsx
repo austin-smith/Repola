@@ -15,6 +15,7 @@ import {
   SearchIcon,
   Settings2Icon,
   ShieldCheckIcon,
+  SparklesIcon,
   Trash2Icon,
   UnlockKeyholeIcon,
 } from "lucide-react";
@@ -27,7 +28,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
-import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
+import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from "@/components/ui/input-group";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
@@ -64,6 +65,7 @@ import {
   showFileInFileManager,
   discardFile,
   fetchWorkingCopy,
+  generateCommitMessage,
   mutateRepositoryOperation,
   onWorktreeChanged,
   synchronizeWorkingCopy,
@@ -95,20 +97,35 @@ export function ChangesWorkbench() {
   // so the cache is stored with the snapshot and replaced whenever it is.
   const [workingCopy, setWorkingCopy] = useState<{ snapshot: WorkingCopySnapshot | null; diffCache: Map<string, FileDiff>; generation: number }>(() => ({ snapshot: null, diffCache: new Map(), generation: 0 }));
   const { snapshot, diffCache, generation } = workingCopy;
+  const [generateBusy, setGenerateBusy] = useState(false);
+  const [generationCancelling, setGenerationCancelling] = useState(false);
+  const generationController = useRef<AbortController | null>(null);
+  const generationSnapshot = useRef<WorkingCopySnapshot | null>(null);
   // A snapshot that changed nothing (its content stamps prove it) is dropped
   // whole, so focus and watcher refreshes over a quiet working copy render
   // nothing new. When it did change, diff-cache entries whose content
   // identity the new change list still produces are proven current and carry
   // forward; only genuinely changed files load again.
-  const setSnapshot = useCallback((next: WorkingCopySnapshot | null) => setWorkingCopy((current) => {
-    if (next && current.snapshot && workingCopySnapshotsEqual(current.snapshot, next)) return current;
-    const generation = current.generation + 1;
-    return {
-      snapshot: next,
-      diffCache: next ? retainDiffEntries(current.diffCache, next.changes, generation) : new Map(),
-      generation,
-    };
-  }), []);
+  const setSnapshot = useCallback((next: WorkingCopySnapshot | null) => {
+    const generating = generationController.current;
+    if (generating && !generating.signal.aborted && generationSnapshot.current
+      && (!next || !workingCopySnapshotsEqual(generationSnapshot.current, next))) {
+      // Both mutations and refreshes can change the commit selection. Cancel
+      // before publishing either result, outside React's state updater.
+      generating.abort();
+      setGenerationCancelling(true);
+      toast.add({ type: "error", title: "Working copy changed during generation", description: "Review the updated changes and generate the message again." });
+    }
+    setWorkingCopy((current) => {
+      if (next && current.snapshot && workingCopySnapshotsEqual(current.snapshot, next)) return current;
+      const generation = current.generation + 1;
+      return {
+        snapshot: next,
+        diffCache: next ? retainDiffEntries(current.diffCache, next.changes, generation) : new Map(),
+        generation,
+      };
+    });
+  }, []);
   const [changeSelection, setChangeSelection] = useState(emptyChangeSelection);
   const [commitSelections, setCommitSelections] = useState<CommitSelectionMap>(() => new Map());
   const changesListRef = useRef<HTMLDivElement>(null);
@@ -160,18 +177,29 @@ export function ChangesWorkbench() {
     return () => controller.abort();
   }, [machineId, repository.path, setSnapshot, worktree.id, worktree.path]);
 
+  useEffect(() => () => {
+    const controller = generationController.current;
+    controller?.abort();
+    if (generationController.current === controller) {
+      generationController.current = null;
+      setGenerateBusy(false);
+      setGenerationCancelling(false);
+    }
+  }, [machineId, repository.path, worktree.id, worktree.path]);
+
   // Mutations replace the snapshot with their own result, so a disk-triggered reload
   // while one is running would only race it.
   const mutating = busyPath !== null || commitBusy || syncBusy || operationBusy;
   const mutatingRef = useRef(mutating);
   useEffect(() => { mutatingRef.current = mutating; }, [mutating]);
   const reloadController = useRef<AbortController | null>(null);
+  const pendingReload = useRef<Promise<void> | null>(null);
   const reloadSnapshot = useCallback(() => {
     if (mutatingRef.current) return;
     reloadController.current?.abort();
     const controller = new AbortController();
     reloadController.current = controller;
-    void fetchWorkingCopy(machineId, repository.path, worktree.path, controller.signal)
+    pendingReload.current = fetchWorkingCopy(machineId, repository.path, worktree.path, controller.signal)
       .then((next) => {
         if (controller.signal.aborted || mutatingRef.current) return;
         setSnapshot(next);
@@ -183,10 +211,20 @@ export function ChangesWorkbench() {
         });
       })
       .catch((cause: unknown) => {
-        if (!controller.signal.aborted) setError(toMessage(cause));
+        if (!controller.signal.aborted) {
+          const generating = generationController.current;
+          if (generating) {
+            generating.abort();
+            setGenerationCancelling(true);
+          }
+          setError(toMessage(cause));
+        }
       })
       .finally(() => {
-        if (reloadController.current === controller) reloadController.current = null;
+        if (reloadController.current === controller) {
+          reloadController.current = null;
+          pendingReload.current = null;
+        }
       });
   }, [machineId, repository.path, setSnapshot, worktree.path]);
   useEffect(() => () => reloadController.current?.abort(), []);
@@ -275,7 +313,7 @@ export function ChangesWorkbench() {
   }, [snapshot]);
 
   const toggleSelectedCommitInclusion = () => {
-    if (busyPath !== null || commitBusy) return;
+    if (busyPath !== null || commitBusy || generateBusy) return;
     const selectedChanges = visibleChanges.filter((change) => (
       changeSelection.selectedIds.has(change.id) && !change.conflicted
     ));
@@ -288,6 +326,53 @@ export function ChangesWorkbench() {
       new Set(selectedChanges.map((change) => change.id)),
       include,
     ));
+  };
+
+  const generateMessage = async () => {
+    if (!snapshot || (!amend && includedCount === 0) || generationController.current) return;
+    const controller = new AbortController();
+    generationController.current = controller;
+    generationSnapshot.current = snapshot;
+    setGenerateBusy(true);
+    setGenerationCancelling(false);
+    try {
+      const message = await generateCommitMessage(machineId, {
+        repositoryPath: repository.path,
+        worktreePath: worktree.path,
+        expectedHead: snapshot.head,
+        includedChanges: commitSelectionRequest(visibleChanges, commitSelections),
+        amend,
+      }, controller.signal);
+      // A refresh started before the provider finished may still discover a
+      // changed selection. Let it validate/cancel this result before applying it.
+      while (pendingReload.current && !controller.signal.aborted) {
+        const pending = pendingReload.current;
+        await new Promise<void>((resolve) => {
+          const finish = () => {
+            controller.signal.removeEventListener("abort", finish);
+            resolve();
+          };
+          controller.signal.addEventListener("abort", finish, { once: true });
+          void pending.then(finish, finish);
+        });
+      }
+      if (controller.signal.aborted) return;
+      setSummary(message.subject);
+      setDescription(message.body);
+    } catch (cause) {
+      if (controller.signal.aborted || (cause instanceof DOMException && cause.name === "AbortError")) return;
+      toast.add({
+        type: "error",
+        title: "Could not generate a commit message",
+        description: toMessage(cause),
+      });
+    } finally {
+      if (generationController.current === controller) {
+        generationController.current = null;
+        setGenerateBusy(false);
+        setGenerationCancelling(false);
+      }
+    }
   };
 
   // Clipboard text only. Real file operations pass the exact Git path token to
@@ -483,7 +568,7 @@ export function ChangesWorkbench() {
           <Checkbox
             checked={allChangesIncluded}
             indeterminate={includedCount > 0 && !allChangesIncluded}
-            disabled={visibleChanges.length === 0 || commitBusy || busyPath !== null}
+            disabled={visibleChanges.length === 0 || commitBusy || generateBusy || busyPath !== null}
             onCheckedChange={(checked) => setCommitSelections((current) => setChangesIncluded(
               current,
               new Set(visibleChanges.filter((change) => !change.conflicted).map((change) => change.id)),
@@ -597,7 +682,7 @@ export function ChangesWorkbench() {
                   checked={isIncludedInCommit(commitSelectionFor(commitSelections, change.id))}
                   indeterminate={commitSelectionFor(commitSelections, change.id).kind === "partial"}
                   aria-label={`${isIncludedInCommit(commitSelectionFor(commitSelections, change.id)) ? "Exclude" : "Include"} ${change.path.display} ${isIncludedInCommit(commitSelectionFor(commitSelections, change.id)) ? "from" : "in"} commit`}
-                  disabled={busyPath !== null || commitBusy || change.conflicted}
+                  disabled={busyPath !== null || commitBusy || generateBusy || change.conflicted}
                   onCheckedChange={(checked) => setCommitSelections((current) => setChangesIncluded(
                     current,
                     new Set([change.id]),
@@ -642,7 +727,7 @@ export function ChangesWorkbench() {
               <ContextMenuContent className="min-w-52">
                 <ContextMenuItem
                   variant="destructive"
-                  disabled={busyPath !== null || commitBusy || change.conflicted || snapshot?.operation !== null}
+                  disabled={busyPath !== null || commitBusy || generateBusy || change.conflicted || snapshot?.operation !== null}
                   onClick={() => setPendingDiscard({ change, scope: change.unstaged || change.untracked ? "unstaged" : "all" })}
                 >
                   <Trash2Icon aria-hidden="true" />
@@ -683,8 +768,25 @@ export function ChangesWorkbench() {
           ) : null}
         </div>
         <form className="flex max-h-[58%] shrink-0 flex-col gap-2 overflow-y-auto border-t bg-card p-3" onSubmit={(event) => void submitCommit(event)}>
-          <Input value={summary} onChange={(event) => setSummary(event.currentTarget.value)} placeholder="Summary (required)" maxLength={998} disabled={commitBusy} />
-          <Textarea value={description} onChange={(event) => setDescription(event.currentTarget.value)} placeholder="Description" className="min-h-16 resize-none" disabled={commitBusy} />
+          <InputGroup>
+            <InputGroupInput value={summary} onChange={(event) => setSummary(event.currentTarget.value)} placeholder="Summary (required)" maxLength={998} disabled={commitBusy || generateBusy} />
+            <InputGroupAddon align="inline-end">
+              <InputGroupButton
+                aria-label={generateBusy ? "Cancel commit message generation" : `${summary.trim() || description.trim() ? "Regenerate" : "Generate"} commit message`}
+                disabled={generationCancelling || (!generateBusy && (commitBusy || snapshot?.operation !== null || (!amend && includedCount === 0)))}
+                onClick={() => {
+                  if (generateBusy) {
+                    setGenerationCancelling(true);
+                    generationController.current?.abort();
+                  } else void generateMessage();
+                }}
+              >
+                {generateBusy ? <Spinner aria-hidden="true" /> : <SparklesIcon aria-hidden="true" />}
+                {generationCancelling ? "Cancelling…" : generateBusy ? "Cancel" : summary.trim() || description.trim() ? "Regenerate" : "Generate"}
+              </InputGroupButton>
+            </InputGroupAddon>
+          </InputGroup>
+          <Textarea value={description} onChange={(event) => setDescription(event.currentTarget.value)} placeholder="Description" className="min-h-16 resize-none" disabled={commitBusy || generateBusy} />
           <Button type="button" variant="ghost" size="sm" className="justify-start" disabled={commitBusy} onClick={() => setCommitOptionsOpen((open) => !open)}>
             <Settings2Icon data-icon="inline-start" aria-hidden="true" />
             {commitOptionsOpen ? "Hide commit options" : "Author, co-authors, trailers, and signing…"}
@@ -713,13 +815,13 @@ export function ChangesWorkbench() {
             </div>
           ) : null}
           <label className="flex items-center gap-2 text-xs text-muted-foreground">
-            <Checkbox checked={amend} disabled={commitBusy || snapshot?.head === null} onCheckedChange={(value) => setAmend(value === true)} />
+            <Checkbox checked={amend} disabled={commitBusy || generateBusy || snapshot?.head === null} onCheckedChange={(value) => setAmend(value === true)} />
             Amend latest commit
           </label>
           {snapshot?.head && snapshot.branch && !snapshot.operation && (!snapshot.upstream || snapshot.ahead > 0) ? (
             <Button type="button" variant="ghost" size="sm" disabled={commitBusy} onClick={() => setPendingUndo(true)}>Undo latest commit…</Button>
           ) : null}
-          <Button type="submit" disabled={commitBusy || snapshot?.operation !== null || summary.trim() === "" || (!amend && includedCount === 0)}>
+          <Button type="submit" disabled={commitBusy || generateBusy || snapshot?.operation !== null || summary.trim() === "" || (!amend && includedCount === 0)}>
             {commitBusy ? <Spinner data-icon="inline-start" /> : <GitCommitIcon data-icon="inline-start" aria-hidden="true" />}
             {commitBusy ? "Committing…" : amend ? "Amend Commit" : `Commit ${includedCount} file${includedCount === 1 ? "" : "s"} to ${snapshot?.branch ?? "detached HEAD"}`}
           </Button>
@@ -759,6 +861,7 @@ export function ChangesWorkbench() {
                 cache={diffCache}
                 scrollElement={diffScroller}
                 selection={commitSelectionFor(commitSelections, diffChange.id)}
+                selectionDisabled={generateBusy || commitBusy || busyPath !== null}
                 onSelectionChange={(selection: FileCommitSelection) => setCommitSelections((current) => {
                   const next = new Map(current);
                   next.set(diffChange.id, selection);

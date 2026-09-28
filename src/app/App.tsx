@@ -851,6 +851,7 @@ function App() {
   const settingsDialog = settingsOpen && machines !== null && (
     <SettingsDialog
       machines={machines}
+      selectedMachineId={selectedMachineId}
       busy={machinesBusy}
       onClose={() => setSettingsOpen(false)}
       onRemoveMachine={removeSshMachine}

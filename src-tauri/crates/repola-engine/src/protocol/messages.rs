@@ -6,16 +6,17 @@ use crate::worktree::{
     CommitChangedFile, CommitFileDiffRequest, CommitFilesRequest, CommitRequest, CommitResult,
     ConflictFile, ConflictFileRequest, CreateRepositoryRequest, CreateWorktreeRequest,
     CreateWorktreeResult, DiscardAllRequest, DiscardFileRequest, FileDiff, FileDiffRequest,
-    HistoryMutationRequest, HistoryMutationResult, HistoryPage, HistoryRequest,
-    PullRequestEvidence, PullRequestMutationRequest, PullRequestMutationResult, ReflogEntry,
-    ReflogRequest, RepositoryOperationMutationResult, RepositoryOperationRequest,
-    RepositoryOperationResult, ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult,
-    SetFileStagingRequest, StashEntry, StashMutationRequest, StashMutationResult, StashRequest,
-    SyncRequest, SyncResult, TagInfo, TagMutationRequest, TagMutationResult, TagRequest,
-    UndoCommitRequest, UndoCommitResult, WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges,
+    GenerateCommitMessageRequest, GeneratedCommitMessage, HistoryMutationRequest,
+    HistoryMutationResult, HistoryPage, HistoryRequest, PullRequestEvidence,
+    PullRequestMutationRequest, PullRequestMutationResult, ReflogEntry, ReflogRequest,
+    RepositoryOperationMutationResult, RepositoryOperationRequest, RepositoryOperationResult,
+    ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry,
+    StashMutationRequest, StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo,
+    TagMutationRequest, TagMutationResult, TagRequest, TextGenerationStatus, UndoCommitRequest,
+    UndoCommitResult, WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges,
 };
 
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 18;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,6 +76,12 @@ pub enum AgentRequest {
     },
     Commit {
         request: CommitRequest,
+    },
+    GenerateCommitMessage {
+        request: GenerateCommitMessageRequest,
+    },
+    TextGenerationStatus {
+        provider: Option<crate::preferences::TextGenerationProvider>,
     },
     UndoCommit {
         request: UndoCommitRequest,
@@ -223,6 +230,12 @@ pub enum AgentResult {
     Commit {
         result: CommitResult,
     },
+    GeneratedCommitMessage {
+        message: GeneratedCommitMessage,
+    },
+    TextGenerationStatus {
+        status: TextGenerationStatus,
+    },
     CommitUndone {
         result: Box<UndoCommitResult>,
     },
@@ -304,6 +317,7 @@ pub enum AgentCapability {
     WorktreeManagement,
     Stashes,
     ProviderIntegration,
+    TextGeneration,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -358,6 +372,34 @@ pub enum AgentErrorKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preferences::TextGenerationProvider;
+
+    #[test]
+    fn provider_discovery_supports_automatic_and_explicit_remote_requests() {
+        for (provider, expected) in [
+            (None, serde_json::Value::Null),
+            (
+                Some(TextGenerationProvider::Codex),
+                serde_json::json!("codex"),
+            ),
+            (
+                Some(TextGenerationProvider::Claude),
+                serde_json::json!("claude"),
+            ),
+        ] {
+            let value =
+                serde_json::to_value(AgentRequest::TextGenerationStatus { provider }).unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({ "type": "textGenerationStatus", "provider": expected })
+            );
+            let decoded: AgentRequest = serde_json::from_value(value).unwrap();
+            let AgentRequest::TextGenerationStatus { provider: actual } = decoded else {
+                panic!("wrong request type")
+            };
+            assert_eq!(actual, provider);
+        }
+    }
 
     #[test]
     fn handshake_request_has_a_stable_golden_json_contract() {
@@ -365,14 +407,14 @@ mod tests {
             "golden-1",
             AgentRequest::Handshake {
                 client_version: "0.1.0".into(),
-                minimum_protocol_version: 13,
-                maximum_protocol_version: 13,
+                minimum_protocol_version: PROTOCOL_VERSION,
+                maximum_protocol_version: PROTOCOL_VERSION,
             },
         );
         let json = serde_json::to_string(&request).expect("serialize request");
         assert_eq!(
             json,
-            r#"{"protocolVersion":13,"requestId":"golden-1","request":{"type":"handshake","clientVersion":"0.1.0","minimumProtocolVersion":13,"maximumProtocolVersion":13}}"#
+            r#"{"protocolVersion":18,"requestId":"golden-1","request":{"type":"handshake","clientVersion":"0.1.0","minimumProtocolVersion":18,"maximumProtocolVersion":18}}"#
         );
 
         let with_future_field = json.replace(

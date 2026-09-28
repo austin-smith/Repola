@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::io::Read;
-use std::process::{Child, ExitStatus};
+use std::process::ExitStatus;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,10 +9,10 @@ use crate::host::HostError;
 use crate::machines::MachineProfile;
 use crate::operation::OperationToken;
 use crate::protocol::{
-    read_frame, write_frame, AgentCapability, AgentInfo, AgentRequest, AgentResult,
+    read_frame, write_frame, AgentCapability, AgentErrorKind, AgentInfo, AgentRequest, AgentResult,
     RequestEnvelope, ResponseBody, ResponseEnvelope, PROTOCOL_VERSION,
 };
-use crate::worktree::command;
+use crate::worktree::command::{self, ManagedChild};
 
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -85,7 +85,7 @@ where
     let request_id = request.request_id.clone();
 
     let mut input = child
-        .stdin
+        .stdin()
         .take()
         .ok_or_else(|| HostError::Transport("OpenSSH stdin was not available".into()))?;
     let handshake_id = format!("{}:handshake", request.request_id);
@@ -111,11 +111,11 @@ where
     drop(input);
 
     let mut output = child
-        .stdout
+        .stdout()
         .take()
         .ok_or_else(|| HostError::Transport("OpenSSH stdout was not available".into()))?;
     let stderr = child
-        .stderr
+        .stderr()
         .take()
         .ok_or_else(|| HostError::Transport("OpenSSH stderr was not available".into()))?;
     let diagnostic_reader = thread::spawn(move || bounded_diagnostics(stderr));
@@ -163,10 +163,15 @@ where
             }
         };
         if response.protocol_version != PROTOCOL_VERSION {
-            break Err(HostError::Protocol(format!(
+            let detail = format!(
                 "agent responded with protocol version {}; expected {}",
                 response.protocol_version, PROTOCOL_VERSION
-            )));
+            );
+            break Err(if awaiting_handshake {
+                preflight_protocol_error(machine, detail)
+            } else {
+                HostError::Protocol(detail)
+            });
         }
         let expected_id = if awaiting_handshake {
             &handshake_id
@@ -196,7 +201,11 @@ where
                     ));
                 }
                 ResponseBody::Failure { error } => {
-                    break Err(HostError::Remote(error.summary.clone()));
+                    break Err(if error.kind == AgentErrorKind::Protocol {
+                        preflight_protocol_error(machine, error.summary.clone())
+                    } else {
+                        HostError::Remote(error.summary.clone())
+                    });
                 }
             }
         }
@@ -239,6 +248,13 @@ fn agent_recovery_allowed(error: &HostError) -> bool {
         error,
         HostError::AgentUnavailable { .. } | HostError::AgentVersionMismatch { .. }
     )
+}
+
+fn preflight_protocol_error(machine: &MachineProfile, detail: String) -> HostError {
+    HostError::AgentUnavailable {
+        machine: machine.name.clone(),
+        detail,
+    }
 }
 
 fn validate_handshake(
@@ -289,6 +305,9 @@ fn validate_handshake(
         | AgentRequest::MutateRepositoryOperation { .. }
         | AgentRequest::Commit { .. }
         | AgentRequest::UndoCommit { .. } => &[AgentCapability::WorkingCopy],
+        AgentRequest::GenerateCommitMessage { .. } | AgentRequest::TextGenerationStatus { .. } => {
+            &[AgentCapability::TextGeneration]
+        }
         AgentRequest::History { .. }
         | AgentRequest::Reflog { .. }
         | AgentRequest::CommitFiles { .. }
@@ -325,6 +344,21 @@ fn operation_timeout(request: &AgentRequest) -> Duration {
     match request {
         AgentRequest::Handshake { .. } => HANDSHAKE_TIMEOUT,
         AgentRequest::ScanWorktrees { .. } => SCAN_TIMEOUT,
+        AgentRequest::GenerateCommitMessage { request } => {
+            // Allow a normal Git-operation budget for each context pass (before
+            // and after generation), in addition to sequential provider work.
+            HANDSHAKE_TIMEOUT
+                + STANDARD_TIMEOUT * 2
+                + crate::worktree::commit_message_provider_timeout(
+                    request
+                        .text_generation_selection
+                        .as_ref()
+                        .map(|selection| selection.provider),
+                )
+        }
+        AgentRequest::TextGenerationStatus { provider } => (HANDSHAKE_TIMEOUT
+            + crate::worktree::text_generation_status_timeout(*provider))
+        .max(STANDARD_TIMEOUT),
         AgentRequest::ResolveRepository { .. }
         | AgentRequest::FetchPullRequests { .. }
         | AgentRequest::MutatePullRequest { .. }
@@ -360,7 +394,10 @@ fn operation_timeout(request: &AgentRequest) -> Duration {
     }
 }
 
-fn wait_for_exit(child: &mut Child, grace_period: Duration) -> Result<ExitStatus, HostError> {
+fn wait_for_exit(
+    child: &mut ManagedChild,
+    grace_period: Duration,
+) -> Result<ExitStatus, HostError> {
     let deadline = Instant::now() + grace_period;
     loop {
         match child.try_wait() {
@@ -462,7 +499,7 @@ fn ssh_exit_error(machine: &MachineProfile, status: ExitStatus, diagnostics: Str
     HostError::Transport(detail)
 }
 
-fn terminate(child: &mut Child) {
+fn terminate(child: &mut ManagedChild) {
     let _ = child.kill();
 }
 
@@ -512,6 +549,17 @@ mod tests {
     }
 
     #[test]
+    fn preflight_protocol_errors_allow_the_managed_agent_to_be_refreshed() {
+        let error = preflight_protocol_error(&profile(), "protocol 13 is too old".into());
+        assert!(agent_recovery_allowed(&error));
+        assert!(matches!(
+            error,
+            HostError::AgentUnavailable { machine, detail }
+                if machine == "Build server" && detail == "protocol 13 is too old"
+        ));
+    }
+
+    #[test]
     fn diagnostic_capture_is_bounded_but_drains_the_reader() {
         let input = vec![b'x'; MAX_DIAGNOSTIC_BYTES + 10_000];
         let result = bounded_diagnostics(input.as_slice());
@@ -532,6 +580,43 @@ mod tests {
         };
         assert_eq!(operation_timeout(&handshake), HANDSHAKE_TIMEOUT);
         assert_eq!(operation_timeout(&scan), SCAN_TIMEOUT);
+    }
+
+    #[test]
+    fn generation_deadlines_cover_provider_fallback_and_context_work() {
+        use crate::preferences::{TextGenerationProvider, TextGenerationSelection};
+        // Codex status: 4 x 20s; generation: 2 x 20s + 180s.
+        // Claude status: 3 x 20s; generation: status + 180s.
+        // Automatic discovery can check both before using the slower provider.
+        for (provider, status_seconds, generation_seconds) in [
+            (Some(TextGenerationProvider::Codex), 80, 220),
+            (Some(TextGenerationProvider::Claude), 60, 240),
+            (None, 140, 380),
+        ] {
+            let status = AgentRequest::TextGenerationStatus { provider };
+            assert_eq!(
+                operation_timeout(&status),
+                (HANDSHAKE_TIMEOUT + Duration::from_secs(status_seconds)).max(STANDARD_TIMEOUT)
+            );
+            let generate = AgentRequest::GenerateCommitMessage {
+                request: crate::worktree::GenerateCommitMessageRequest {
+                    repository_path: "repo".into(),
+                    worktree_path: "repo".into(),
+                    expected_head: None,
+                    included_changes: vec![],
+                    amend: false,
+                    text_generation_selection: provider.map(|provider| TextGenerationSelection {
+                        provider,
+                        model: None,
+                        reasoning_effort: None,
+                    }),
+                },
+            };
+            assert_eq!(
+                operation_timeout(&generate),
+                HANDSHAKE_TIMEOUT + STANDARD_TIMEOUT * 2 + Duration::from_secs(generation_seconds)
+            );
+        }
     }
 
     #[test]

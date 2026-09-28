@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+#[cfg(not(windows))]
+use std::process::Child;
+use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -44,6 +46,114 @@ pub enum CommandError {
 /// process spawned from the GUI app flashes a console window.
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// A supervised child owns its Windows job for its entire lifetime. Detached
+/// editor/terminal launches deliberately do not use this wrapper.
+pub(crate) struct ManagedChild {
+    #[cfg(windows)]
+    inner: Box<dyn process_wrap::std::ChildWrapper>,
+    #[cfg(not(windows))]
+    inner: Child,
+}
+
+impl ManagedChild {
+    pub(crate) fn stdin(&mut self) -> &mut Option<ChildStdin> {
+        #[cfg(windows)]
+        {
+            self.inner.stdin()
+        }
+        #[cfg(not(windows))]
+        {
+            &mut self.inner.stdin
+        }
+    }
+
+    pub(crate) fn stdout(&mut self) -> &mut Option<ChildStdout> {
+        #[cfg(windows)]
+        {
+            self.inner.stdout()
+        }
+        #[cfg(not(windows))]
+        {
+            &mut self.inner.stdout
+        }
+    }
+
+    pub(crate) fn stderr(&mut self) -> &mut Option<ChildStderr> {
+        #[cfg(windows)]
+        {
+            self.inner.stderr()
+        }
+        #[cfg(not(windows))]
+        {
+            &mut self.inner.stderr
+        }
+    }
+
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        #[cfg(windows)]
+        {
+            // JobObject is our sole child wrapper. Observe the direct child;
+            // Drop terminates remaining descendants before readers are joined.
+            self.inner.inner_mut().try_wait()
+        }
+        #[cfg(not(windows))]
+        {
+            self.inner.try_wait()
+        }
+    }
+
+    pub(crate) fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        #[cfg(windows)]
+        {
+            self.inner.inner_mut().wait()
+        }
+        #[cfg(not(windows))]
+        {
+            self.inner.wait()
+        }
+    }
+
+    pub(crate) fn kill(&mut self) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            self.inner.start_kill()
+        }
+        #[cfg(not(windows))]
+        {
+            self.inner.kill()
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        // Also end descendants when the shim exits first or an error path
+        // drops the owner, before joining readers of their inherited pipes.
+        let _ = self.kill();
+        let _ = self.wait();
+    }
+}
+
+fn spawn_managed(command: Command) -> std::io::Result<ManagedChild> {
+    #[cfg(windows)]
+    {
+        use process_wrap::std::{CommandWrap, CreationFlags, JobObject};
+        let mut command = CommandWrap::from(command);
+        let mut flags = CreationFlags(Default::default());
+        flags.0 .0 = CREATE_NO_WINDOW;
+        // JobObject suspends the child before assigning it, then resumes it.
+        // A .cmd shim cannot spawn an uncontained provider in between.
+        let inner = command.wrap(flags).wrap(JobObject).spawn()?;
+        Ok(ManagedChild { inner })
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = command;
+        command.spawn().map(|inner| ManagedChild { inner })
+    }
+}
 
 /// Resolved executable locations, keyed by the program name we were asked for.
 /// Only successful lookups are cached so a tool installed mid-session is found
@@ -127,10 +237,15 @@ fn command(program: &str) -> Result<Command, CommandError> {
     Ok(command)
 }
 
-fn launch(
+fn launch(program: &str, command: Command, input: Option<&[u8]>) -> Result<Output, CommandError> {
+    launch_with_timeout(program, command, input, COMMAND_TIMEOUT)
+}
+
+fn launch_with_timeout(
     program: &str,
-    command: &mut Command,
+    mut command: Command,
     input: Option<&[u8]>,
+    timeout: Duration,
 ) -> Result<Output, CommandError> {
     let token = operation::current_operation();
     if token.is_cancelled() {
@@ -147,16 +262,16 @@ fn launch(
         // prompt; authentication must go through configured Git/SSH helpers.
         command.stdin(Stdio::null());
     }
-    let mut child = command.spawn().map_err(|source| CommandError::Launch {
+    let mut child = spawn_managed(command).map_err(|source| CommandError::Launch {
         program: program.to_string(),
         source,
     })?;
-    let stdout = child.stdout.take().expect("captured stdout must exist");
-    let stderr = child.stderr.take().expect("captured stderr must exist");
+    let stdout = child.stdout().take().expect("captured stdout must exist");
+    let stderr = child.stderr().take().expect("captured stderr must exist");
     let stdout_reader = thread::spawn(move || read_bounded(stdout));
     let stderr_reader = thread::spawn(move || read_bounded(stderr));
     let mut input_writer = input.map(|input| {
-        let mut stdin = child.stdin.take().expect("piped stdin must exist");
+        let mut stdin = child.stdin().take().expect("piped stdin must exist");
         let input = input.to_vec();
         thread::spawn(move || stdin.write_all(&input))
     });
@@ -179,14 +294,14 @@ fn launch(
                 program: program.to_string(),
             });
         }
-        if started.elapsed() >= COMMAND_TIMEOUT {
+        if started.elapsed() >= timeout {
             terminate_and_reap(&mut child);
             let _ = finish_input();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(CommandError::Timeout {
                 program: program.to_string(),
-                seconds: COMMAND_TIMEOUT.as_secs(),
+                seconds: timeout.as_secs(),
             });
         }
         match child.try_wait() {
@@ -204,6 +319,7 @@ fn launch(
             }
         }
     };
+    drop(child);
     if let Err(source) = finish_input() {
         let _ = stdout_reader.join();
         let _ = stderr_reader.join();
@@ -252,7 +368,7 @@ fn read_bounded<R: Read>(mut reader: R) -> (Vec<u8>, bool) {
     (captured, truncated)
 }
 
-fn terminate_and_reap(child: &mut Child) {
+fn terminate_and_reap(child: &mut ManagedChild) {
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -264,7 +380,7 @@ where
 {
     let mut command = command(program)?;
     command.args(args);
-    launch(program, &mut command, None)
+    launch(program, command, None)
 }
 
 pub(crate) fn output_with_input<I, S>(
@@ -278,25 +394,51 @@ where
 {
     let mut command = command(program)?;
     command.args(args);
-    launch(program, &mut command, Some(input))
+    launch(program, command, Some(input))
 }
 
-pub(crate) fn spawn_piped<I, S>(program: &str, args: I) -> Result<Child, CommandError>
+pub(crate) fn spawn_piped<I, S>(program: &str, args: I) -> Result<ManagedChild, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    spawn_piped_in(None, program, args)
+}
+
+pub(crate) fn spawn_piped_at<I, S>(
+    directory: &Path,
+    program: &str,
+    args: I,
+) -> Result<ManagedChild, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    spawn_piped_in(Some(directory), program, args)
+}
+
+fn spawn_piped_in<I, S>(
+    directory: Option<&Path>,
+    program: &str,
+    args: I,
+) -> Result<ManagedChild, CommandError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
     let mut command = command(program)?;
+    if let Some(directory) = directory {
+        command.current_dir(directory);
+    }
     command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| CommandError::Launch {
-            program: program.to_string(),
-            source,
-        })
+        .stderr(Stdio::piped());
+    spawn_managed(command).map_err(|source| CommandError::Launch {
+        program: program.to_string(),
+        source,
+    })
 }
 
 pub fn output_at<I, S>(directory: &Path, program: &str, args: I) -> Result<Output, CommandError>
@@ -306,7 +448,23 @@ where
 {
     let mut command = command(program)?;
     command.current_dir(directory).args(args);
-    launch(program, &mut command, None)
+    launch(program, command, None)
+}
+
+pub(crate) fn output_at_with_input_timeout<I, S>(
+    directory: &Path,
+    program: &str,
+    args: I,
+    input: &[u8],
+    timeout: Duration,
+) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = command(program)?;
+    command.current_dir(directory).args(args);
+    launch_with_timeout(program, command, Some(input), timeout)
 }
 
 pub fn git_at<I, S>(path: &Path, args: I) -> Result<Output, CommandError>
@@ -316,7 +474,7 @@ where
 {
     let mut command = command("git")?;
     command.arg("-C").arg(path).args(args);
-    launch("git", &mut command, None)
+    launch("git", command, None)
 }
 
 pub fn git_at_with_input<I, S>(path: &Path, args: I, input: &[u8]) -> Result<Output, CommandError>
@@ -326,7 +484,7 @@ where
 {
     let mut command = command("git")?;
     command.arg("-C").arg(path).args(args);
-    launch("git", &mut command, Some(input))
+    launch("git", command, Some(input))
 }
 
 pub fn git_at_with_env<I, S, E, K, V>(
@@ -343,7 +501,7 @@ where
 {
     let mut command = command("git")?;
     command.arg("-C").arg(path).args(args).envs(environment);
-    launch("git", &mut command, None)
+    launch("git", command, None)
 }
 
 pub fn git_at_with_input_and_env<I, S, E, K, V>(
@@ -361,7 +519,7 @@ where
 {
     let mut command = command("git")?;
     command.arg("-C").arg(path).args(args).envs(environment);
-    launch("git", &mut command, Some(input))
+    launch("git", command, Some(input))
 }
 
 pub fn successful_git_at<I, S>(path: &Path, args: I) -> Result<Output, CommandError>
@@ -413,5 +571,117 @@ mod tests {
         let error = crate::operation::with_operation(token, || output("git", ["--version"]))
             .expect_err("cancelled command");
         assert!(matches!(error, CommandError::Cancelled { .. }));
+    }
+
+    // Re-execute this test binary through a .cmd shim, then spawn a descendant
+    // that holds all three inherited pipes open. No installed provider needed.
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_fixture() {
+        let Ok(role) = std::env::var("REPOLA_TEST_PROCESS_ROLE") else {
+            return;
+        };
+        if role == "descendant" {
+            std::fs::write(std::env::var_os("REPOLA_TEST_READY").unwrap(), "ready").unwrap();
+        } else {
+            let executable = std::env::current_exe().unwrap();
+            let mut descendant = command(executable.to_str().unwrap()).unwrap();
+            descendant
+                .args([
+                    "--exact",
+                    "worktree::command::tests::windows_process_fixture",
+                    "--nocapture",
+                ])
+                .env("REPOLA_TEST_PROCESS_ROLE", "descendant");
+            // Deliberately leave this child running: the outer test must
+            // prove that job termination cleans up an unwaited descendant.
+            #[allow(clippy::zombie_processes)]
+            let _child = descendant.spawn().unwrap();
+            if role == "exit-first" {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_secs(60));
+    }
+
+    #[cfg(windows)]
+    fn windows_shim_fixture(role: &str) -> (tempfile::TempDir, Command) {
+        let directory = tempfile::Builder::new()
+            .prefix("repola process tree ")
+            .tempdir()
+            .unwrap();
+        let shim = directory.path().join("provider.cmd");
+        std::fs::write(&shim, "@\"%REPOLA_TEST_EXE%\" --exact worktree::command::tests::windows_process_fixture --nocapture\r\n").unwrap();
+        let mut command = command(shim.to_str().unwrap()).unwrap();
+        command
+            .env("REPOLA_TEST_EXE", std::env::current_exe().unwrap())
+            .env("REPOLA_TEST_PROCESS_ROLE", role)
+            .env("REPOLA_TEST_READY", directory.path().join("ready"));
+        (directory, command)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_timeout_terminates_shim_descendants_and_releases_pipes() {
+        let (directory, command) = windows_shim_fixture("parent");
+        let started = Instant::now();
+        // Enough input to block the writer while the fixture holds stdin open.
+        let error = launch_with_timeout(
+            "fixture",
+            command,
+            Some(&vec![b'x'; 1024 * 1024]),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CommandError::Timeout { .. }));
+        assert!(
+            directory.path().join("ready").exists(),
+            "descendant must have started"
+        );
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cancellation_terminates_shim_descendants_and_releases_pipes() {
+        let (directory, command) = windows_shim_fixture("parent");
+        let ready = directory.path().join("ready");
+        let token = operation::OperationToken::new();
+        let canceller = token.clone();
+        let cancel = thread::spawn(move || {
+            let started = Instant::now();
+            while !ready.exists() && started.elapsed() < Duration::from_secs(10) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let ready = ready.exists();
+            canceller.cancel();
+            ready
+        });
+        let started = Instant::now();
+        let result = operation::with_operation(token, || {
+            launch_with_timeout(
+                "fixture",
+                command,
+                Some(&vec![b'x'; 1024 * 1024]),
+                Duration::from_secs(30),
+            )
+        });
+        assert!(
+            cancel.join().unwrap(),
+            "descendant must have started before cancellation"
+        );
+        assert!(matches!(result, Err(CommandError::Cancelled { .. })));
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shim_exit_cleans_up_descendants_before_reading_output() {
+        let (_directory, command) = windows_shim_fixture("exit-first");
+        let started = Instant::now();
+        let output =
+            launch_with_timeout("fixture", command, None, Duration::from_secs(10)).unwrap();
+        assert!(output.status.success());
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 }

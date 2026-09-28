@@ -22,6 +22,7 @@ export function InlineFileDiff({
   cache,
   scrollElement,
   selection,
+  selectionDisabled = false,
   onSelectionChange,
 }: {
   machineId: string;
@@ -43,6 +44,7 @@ export function InlineFileDiff({
   /** The ancestor that scrolls this diff; large diffs window their rows against it. */
   scrollElement: HTMLElement | null;
   selection: FileCommitSelection;
+  selectionDisabled?: boolean;
   onSelectionChange: (selection: FileCommitSelection) => void;
 }) {
   const cached = cache.get(diffKey) ?? null;
@@ -83,7 +85,7 @@ export function InlineFileDiff({
   }, [cache, change.path, diffKey, machineId, repositoryPath, worktreePath]);
 
   const updateHunkSelection = (target: PatchHunk, lineIndices: readonly number[]) => {
-    if (!diff) return;
+    if (!diff || selectionDisabled) return;
     const selections = diff.hunks.flatMap((hunk) => {
       const selected = hunk.patch === target.patch
         ? lineIndices
@@ -134,6 +136,7 @@ export function InlineFileDiff({
         <SelectableHunkList
           hunks={diff.hunks}
           selection={selection}
+          disabled={selectionDisabled}
           scrollElement={scrollElement}
           onHunkSelectionChange={updateHunkSelection}
         />

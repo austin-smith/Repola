@@ -35,7 +35,7 @@ export interface AgentInfo {
   architecture: string;
   gitVersion: string | null;
   maximumFrameBytes: number;
-  capabilities: ("repositoryDiscovery" | "worktreeInventory" | "workingCopy" | "history" | "synchronization" | "branches" | "repositoryManagement" | "worktreeManagement" | "stashes" | "providerIntegration")[];
+  capabilities: ("repositoryDiscovery" | "worktreeInventory" | "workingCopy" | "history" | "synchronization" | "branches" | "repositoryManagement" | "worktreeManagement" | "stashes" | "providerIntegration" | "textGeneration")[];
 }
 
 export type WorkspaceView = "changes" | "history" | "worktrees";
@@ -45,6 +45,12 @@ export interface AppPreferences {
   editorId: string | null;
   terminalId: string | null;
   defaultSignCommits: boolean;
+  textGenerationSelections: Record<string, TextGenerationPreferences>;
+}
+
+export interface TextGenerationPreferences {
+  provider: TextGenerationProvider;
+  selections: Partial<Record<TextGenerationProvider, Omit<TextGenerationSelection, "provider">>>;
 }
 
 export interface ExternalTool {
@@ -402,6 +408,53 @@ export interface CommitRequest {
   coAuthors: CommitPerson[];
   trailers: CommitTrailer[];
   signing: CommitSigning;
+}
+
+export interface GenerateCommitMessageRequest {
+  repositoryPath: string;
+  worktreePath: string;
+  expectedHead: string | null;
+  includedChanges: CommitFileSelectionRequest[];
+  amend: boolean;
+}
+
+export interface GeneratedCommitMessage {
+  subject: string;
+  body: string;
+}
+
+export type TextGenerationStatusKind = "ready" | "notInstalled" | "signedOut" | "updateRequired" | "unavailable";
+
+export interface TextGenerationStatus {
+  status: TextGenerationStatusKind;
+  detail?: string | null;
+  version: string | null;
+  models: TextGenerationModel[];
+  recommendedSelection: TextGenerationSelection | null;
+}
+
+export interface TextGenerationSelection {
+  provider: TextGenerationProvider;
+  model: string | null;
+  reasoningEffort: string | null;
+}
+
+export type TextGenerationProvider = "codex" | "claude";
+
+export interface TextGenerationModel {
+  model: string;
+  displayName: string;
+  description: string;
+  isDefault: boolean;
+  recommendedForCommitMessages: boolean;
+  upgrade: string | null;
+  defaultReasoningEffort: string | null;
+  supportedReasoningEfforts: ReasoningEffort[];
+}
+
+export interface ReasoningEffort {
+  reasoningEffort: string;
+  description: string;
 }
 
 export interface CommitFileSelectionRequest {

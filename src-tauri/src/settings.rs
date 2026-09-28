@@ -274,16 +274,48 @@ pub fn set_app_preferences<R: Runtime>(
     preferences.version = APP_PREFERENCES_VERSION;
     preferences.editor_id = normalize_tool_id(preferences.editor_id);
     preferences.terminal_id = normalize_tool_id(preferences.terminal_id);
+    if !preferences
+        .text_generation_selections
+        .iter()
+        .all(|(machine_id, selection)| {
+            !machine_id.is_empty()
+                && machine_id.len() <= 128
+                && machine_id
+                    .chars()
+                    .all(|character| !character.is_control() && !character.is_whitespace())
+                && selection.is_valid()
+        })
+    {
+        return Err(SettingsError::Invalid(
+            "invalid commit-message provider or model selection".into(),
+        ));
+    }
     let store = open_store(app)?;
+    write_app_preferences(&store, &preferences)?;
+    Ok(preferences)
+}
+
+fn write_app_preferences<R: Runtime>(
+    store: &Store<R>,
+    preferences: &AppPreferences,
+) -> Result<(), SettingsError> {
+    let previous = store.get(APP_PREFERENCES_KEY);
     store.set(
         APP_PREFERENCES_KEY,
-        serde_json::to_value(&preferences)
+        serde_json::to_value(preferences)
             .map_err(|error| SettingsError::Store(error.to_string()))?,
     );
-    store
-        .save()
-        .map_err(|error| SettingsError::Store(error.to_string()))?;
-    Ok(preferences)
+    if let Err(error) = store.save() {
+        // Store::set changes the in-memory cache before save can fail. Restore
+        // that cache too, so later loads/generation cannot use an unsaved choice.
+        if let Some(previous) = previous {
+            store.set(APP_PREFERENCES_KEY, previous);
+        } else {
+            store.delete(APP_PREFERENCES_KEY);
+        }
+        return Err(SettingsError::Store(error.to_string()));
+    }
+    Ok(())
 }
 
 pub fn window_state<R: Runtime>(app: &AppHandle<R>) -> Result<Option<WindowState>, SettingsError> {
@@ -361,29 +393,67 @@ pub fn remove_machine<R: Runtime>(
     app: &AppHandle<R>,
     machine_id: String,
 ) -> Result<Vec<MachineProfile>, SettingsError> {
+    let store = open_store(app)?;
+    remove_machine_from_store(&store, &machine_id)
+}
+
+fn remove_machine_from_store<R: Runtime>(
+    store: &Store<R>,
+    machine_id: &str,
+) -> Result<Vec<MachineProfile>, SettingsError> {
     if machine_id == LOCAL_MACHINE_ID {
         return Err(
             MachineError::Invalid("the built-in local machine cannot be removed".into()).into(),
         );
     }
-    let store = open_store(app)?;
-    let mut stored = read_stored_machines(&store);
+    let mut stored = read_stored_machines(store);
     let original_length = stored.len();
     stored.retain(|machine| machine.id != machine_id);
     if stored.len() == original_length {
-        return Err(MachineError::NotFound(machine_id).into());
+        return Err(MachineError::NotFound(machine_id.to_string()).into());
     }
-    write_machines(&store, &stored)?;
-    let mut repositories = registered_repositories_by_machine(&store);
-    if repositories.remove(&machine_id).is_some() {
-        store.set(
+    // Prepare every value before touching the cache; removal and its cleanup
+    // must have one durable save, not a successful deletion followed by an error.
+    let mut updates = vec![(
+        MACHINES_KEY,
+        serde_json::to_value(&stored).map_err(|error| SettingsError::Store(error.to_string()))?,
+    )];
+    let mut repositories = registered_repositories_by_machine(store);
+    if repositories.remove(machine_id).is_some() {
+        updates.push((
             REGISTERED_REPOSITORIES_BY_MACHINE_KEY,
             serde_json::to_value(repositories)
                 .map_err(|error| SettingsError::Store(error.to_string()))?,
-        );
-        store
-            .save()
-            .map_err(|error| SettingsError::Store(error.to_string()))?;
+        ));
+    }
+    let mut preferences = read_app_preferences(store);
+    if preferences
+        .text_generation_selections
+        .remove(machine_id)
+        .is_some()
+    {
+        updates.push((
+            APP_PREFERENCES_KEY,
+            serde_json::to_value(preferences)
+                .map_err(|error| SettingsError::Store(error.to_string()))?,
+        ));
+    }
+    let previous: Vec<_> = updates
+        .iter()
+        .map(|(key, _)| (*key, store.get(key)))
+        .collect();
+    for (key, value) in updates {
+        store.set(key, value);
+    }
+    if let Err(error) = store.save() {
+        for (key, value) in previous {
+            if let Some(value) = value {
+                store.set(key, value);
+            } else {
+                store.delete(key);
+            }
+        }
+        return Err(SettingsError::Store(error.to_string()));
     }
     Ok(with_local_machine(stored))
 }
@@ -407,7 +477,11 @@ pub fn move_machine<R: Runtime>(
 }
 
 fn open_store<R: Runtime>(app: &AppHandle<R>) -> Result<Arc<Store<R>>, SettingsError> {
-    app.store(STORE_FILE)
+    // Writers explicitly save complete updates and handle failures themselves.
+    // Debounced autosave could otherwise persist a partially staged update.
+    app.store_builder(STORE_FILE)
+        .disable_auto_save()
+        .build()
         .map_err(|error| SettingsError::Store(error.to_string()))
 }
 
@@ -633,9 +707,36 @@ mod tests {
         let store = app
             .handle()
             .store_builder(store_path)
+            .disable_auto_save()
             .build()
             .expect("store at temp path");
         (app, store)
+    }
+
+    #[test]
+    fn failed_preference_saves_restore_the_in_memory_value() {
+        for had_previous in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("settings.json");
+            let (_app, store) = mock_store(&path);
+            let previous = AppPreferences::default();
+            if had_previous {
+                store.set(
+                    APP_PREFERENCES_KEY,
+                    serde_json::to_value(&previous).unwrap(),
+                );
+            }
+            // A directory at the destination deterministically makes save fail
+            // on every platform, without changing permissions or user data.
+            std::fs::create_dir(&path).unwrap();
+            let changed = AppPreferences {
+                default_sign_commits: true,
+                ..previous.clone()
+            };
+            assert!(write_app_preferences(&store, &changed).is_err());
+            assert_eq!(read_app_preferences(&store), previous);
+            assert_eq!(store.get(APP_PREFERENCES_KEY).is_some(), had_previous);
+        }
     }
 
     #[test]
@@ -669,6 +770,104 @@ mod tests {
             read_registered_repositories(&reloaded, LOCAL_MACHINE_ID),
             saved
         );
+    }
+
+    fn seed_machine_removal(store: &Store<tauri::test::MockRuntime>) {
+        let machines: Vec<_> = ["remote", "other"]
+            .into_iter()
+            .map(|id| MachineProfile {
+                id: id.into(),
+                name: id.into(),
+                kind: MachineKind::Ssh,
+                enabled: true,
+                ssh: Some(SshProfile {
+                    host: id.into(),
+                    user: None,
+                    port: None,
+                }),
+            })
+            .collect();
+        store.set(MACHINES_KEY, serde_json::to_value(machines).unwrap());
+        store.set(
+            REGISTERED_REPOSITORIES_BY_MACHINE_KEY,
+            serde_json::json!({
+                "remote": ["/srv/remote"], "other": ["/srv/other"]
+            }),
+        );
+        let mut preferences = AppPreferences::default();
+        for id in ["remote", "other"] {
+            preferences
+                .text_generation_selections
+                .insert(id.into(), Default::default());
+        }
+        store.set(
+            APP_PREFERENCES_KEY,
+            serde_json::to_value(preferences).unwrap(),
+        );
+        store.set("unrelated", serde_json::json!("keep"));
+    }
+
+    #[test]
+    fn machine_removal_persists_profile_and_associated_cleanup_together() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let (_app, store) = mock_store(&path);
+        seed_machine_removal(&store);
+        store.save().unwrap();
+        let remaining = remove_machine_from_store(&store, "remote").unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|machine| machine.id.as_str())
+                .collect::<Vec<_>>(),
+            ["local", "other"]
+        );
+        store.reload_ignore_defaults().unwrap();
+        assert!(machine_by_id(&store, "remote").is_err());
+        assert!(machine_by_id(&store, "other").is_ok());
+        assert!(read_registered_repositories(&store, "remote").is_empty());
+        assert_eq!(
+            read_registered_repositories(&store, "other"),
+            ["/srv/other"]
+        );
+        assert!(!read_app_preferences(&store)
+            .text_generation_selections
+            .contains_key("remote"));
+        assert!(read_app_preferences(&store)
+            .text_generation_selections
+            .contains_key("other"));
+        assert_eq!(store.get("unrelated"), Some(serde_json::json!("keep")));
+    }
+
+    #[test]
+    fn failed_machine_removal_restores_all_values_and_can_be_retried() {
+        for has_associated_settings in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("settings.json");
+            let (_app, store) = mock_store(&path);
+            seed_machine_removal(&store);
+            if !has_associated_settings {
+                store.delete(APP_PREFERENCES_KEY);
+                store.delete(REGISTERED_REPOSITORIES_BY_MACHINE_KEY);
+            }
+            let previous: BTreeMap<_, _> = store.entries().into_iter().collect();
+            // Force a save failure without depending on platform permissions.
+            std::fs::create_dir(&path).unwrap();
+            assert!(remove_machine_from_store(&store, "remote").is_err());
+            assert_eq!(
+                store.entries().into_iter().collect::<BTreeMap<_, _>>(),
+                previous
+            );
+            std::fs::remove_dir(&path).unwrap();
+            assert!(remove_machine_from_store(&store, "remote").is_ok());
+            store.reload_ignore_defaults().unwrap();
+            assert!(machine_by_id(&store, "remote").is_err());
+            assert!(machine_by_id(&store, "other").is_ok());
+            if !has_associated_settings {
+                assert!(!store.has(APP_PREFERENCES_KEY));
+                assert!(!store.has(REGISTERED_REPOSITORIES_BY_MACHINE_KEY));
+            }
+        }
     }
 
     #[test]
