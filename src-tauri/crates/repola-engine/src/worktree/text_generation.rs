@@ -188,16 +188,29 @@ fn resolve_provider_selection(
 pub fn generate_commit_message(
     request: GenerateCommitMessageRequest,
 ) -> Result<GeneratedCommitMessage, String> {
-    generate_with(&request, |prompt| {
-        let selection = resolve_provider_selection(
-            request.text_generation_selection.as_ref(),
-            provider_status,
-        )?;
-        match selection.provider {
-            TextGenerationProvider::Codex => super::codex::generate(prompt, Some(&selection)),
-            TextGenerationProvider::Claude => super::claude::generate(prompt, Some(&selection)),
-        }
-    })
+    generate_with_provider(
+        request,
+        provider_status,
+        |prompt, selection| match selection.provider {
+            TextGenerationProvider::Codex => super::codex::generate(prompt, Some(selection)),
+            TextGenerationProvider::Claude => super::claude::generate(prompt, Some(selection)),
+        },
+    )
+}
+
+fn generate_with_provider(
+    mut request: GenerateCommitMessageRequest,
+    probe: impl FnMut(TextGenerationProvider) -> TextGenerationStatus,
+    generate: impl FnOnce(&str, &TextGenerationSelection) -> Result<String, String>,
+) -> Result<GeneratedCommitMessage, String> {
+    if crate::operation::current_operation().is_cancelled() {
+        return Err("Commit-message generation was cancelled.".into());
+    }
+    let selection = resolve_provider_selection(request.text_generation_selection.as_ref(), probe)?;
+    // Instruction discovery and both context checks must use the provider that
+    // will actually generate the message, including automatic Claude selection.
+    request.text_generation_selection = Some(selection.clone());
+    generate_with(&request, |prompt| generate(prompt, &selection))
 }
 
 fn generate_with(
@@ -789,6 +802,42 @@ Selected patch:
             Ok(r#"{"subject":"change file","body":""}"#.into())
         });
         assert!(result.unwrap_err().contains("changed while writing"));
+    }
+
+    #[test]
+    fn automatic_claude_generation_loads_and_revalidates_claude_guidance() {
+        for change_guidance in [false, true] {
+            let (directory, request) = fixture();
+            assert!(request.text_generation_selection.is_none());
+            let guidance = directory.path().join("CLAUDE.md");
+            std::fs::write(&guidance, "Use short bodies.").unwrap();
+            let result = generate_with_provider(
+                request,
+                |provider| {
+                    discovery(
+                        provider,
+                        if provider == TextGenerationProvider::Codex {
+                            TextGenerationStatusKind::NotInstalled
+                        } else {
+                            TextGenerationStatusKind::Ready
+                        },
+                    )
+                },
+                |prompt, selection| {
+                    assert_eq!(selection.provider, TextGenerationProvider::Claude);
+                    assert!(prompt.contains("Local CLAUDE.md:\nUse short bodies."));
+                    if change_guidance {
+                        std::fs::write(&guidance, "Use detailed bodies.").unwrap();
+                    }
+                    Ok(r#"{"subject":"change file","body":""}"#.into())
+                },
+            );
+            if change_guidance {
+                assert!(result.unwrap_err().contains("changed while writing"));
+            } else {
+                assert_eq!(result.unwrap().subject, "change file");
+            }
+        }
     }
 
     #[test]
