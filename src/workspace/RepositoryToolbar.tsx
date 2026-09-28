@@ -25,7 +25,8 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrig
 import { Spinner } from "@/components/ui/spinner";
 import { toast } from "@/components/ui/toast";
 import { toMessage } from "@/lib/errors";
-import { fileManagerName } from "../domain/platform";
+import { fileManagerName, machinePathSeparator } from "../domain/platform";
+import { usePathSeparator } from "../app/environment";
 import { ActionableGitError } from "../components/ActionableGitError";
 import type { HistoryTarget } from "../dialogs/HistoryMutationDialog";
 import { shortSha } from "../domain/format";
@@ -142,7 +143,8 @@ function WorktreePicker({
   worktrees: WorktreeRecord[];
   onWorktreeChange: (path: string) => void;
 }) {
-  const { worktree } = useRepositoryContext();
+  const { machineKind, machineOs, worktree } = useRepositoryContext();
+  const separator = machinePathSeparator(machineKind, machineOs, usePathSeparator());
   const groups = useMemo(() => groupWorktreesForPicker(worktrees), [worktrees]);
   const selected = worktrees.find((item) => item.path === worktree?.path) ?? null;
   return (
@@ -150,10 +152,10 @@ function WorktreePicker({
       items={groups}
       autoHighlight
       value={selected}
-      itemToStringLabel={(item: WorktreeRecord) => worktreeFolderName(item.path)}
+      itemToStringLabel={(item: WorktreeRecord) => worktreeFolderName(item.path, separator)}
       itemToStringValue={(item: WorktreeRecord) => item.path}
       isItemEqualToValue={(item: WorktreeRecord, value: WorktreeRecord) => item.path === value.path}
-      filter={matchesWorktreeQuery}
+      filter={(item: WorktreeRecord, query: string) => matchesWorktreeQuery(item, query, separator)}
       onValueChange={(value: WorktreeRecord | null) => { if (value && value.path !== worktree?.path) onWorktreeChange(value.path); }}
     >
       <ComboboxTrigger
@@ -178,7 +180,7 @@ function WorktreePicker({
                 {(item: WorktreeRecord) => (
                   <ComboboxItem key={item.id} value={item}>
                     <FolderOpenIcon className="text-muted-foreground" aria-hidden="true" />
-                    <span className="min-w-0 flex-1 truncate">{worktreeFolderName(item.path)}</span>
+                    <span className="min-w-0 flex-1 truncate">{worktreeFolderName(item.path, separator)}</span>
                     <span className="max-w-60 shrink truncate text-xs text-muted-foreground">{worktreeBranchLabel(item)}</span>
                   </ComboboxItem>
                 )}

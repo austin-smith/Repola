@@ -30,10 +30,11 @@ function worktree(overrides: Partial<WorktreeRecord> = {}): WorktreeRecord {
 }
 
 describe("worktree picker", () => {
-  it("names worktrees by their folder on every platform", () => {
-    expect(worktreeFolderName("/Users/me/.t3/worktrees/repola/t3code-30dacb81")).toBe("t3code-30dacb81");
-    expect(worktreeFolderName("C:\\Users\\me\\repola\\")).toBe("repola");
-    expect(worktreeFolderName("C:/Users/me/repola")).toBe("repola");
+  it("names worktrees by their folder using the owning machine's separator", () => {
+    expect(worktreeFolderName("/Users/me/.t3/worktrees/repola/t3code-30dacb81", "/")).toBe("t3code-30dacb81");
+    expect(worktreeFolderName("/repos/feature\\one/", "/")).toBe("feature\\one");
+    expect(worktreeFolderName("C:\\Users\\me\\repola\\", "\\")).toBe("repola");
+    expect(worktreeFolderName("C:/Users/me/repola", "\\")).toBe("repola");
   });
 
   it("labels detached worktrees by their short HEAD", () => {
@@ -42,11 +43,11 @@ describe("worktree picker", () => {
 
   it("searches both the folder name and the branch, ignoring case", () => {
     const item = worktree();
-    expect(matchesWorktreeQuery(item, "30DACB")).toBe(true);
-    expect(matchesWorktreeQuery(item, "contents-pane")).toBe(true);
-    expect(matchesWorktreeQuery(item, "  ")).toBe(true);
-    expect(matchesWorktreeQuery(item, "tmp")).toBe(false);
-    expect(matchesWorktreeQuery(worktree({ branch: null }), "detached at 1234")).toBe(true);
+    expect(matchesWorktreeQuery(item, "30DACB", "/")).toBe(true);
+    expect(matchesWorktreeQuery(item, "contents-pane", "/")).toBe(true);
+    expect(matchesWorktreeQuery(item, "  ", "/")).toBe(true);
+    expect(matchesWorktreeQuery(item, "tmp", "/")).toBe(false);
+    expect(matchesWorktreeQuery(worktree({ branch: null }), "detached at 1234", "/")).toBe(true);
   });
 
   it("groups the main worktree ahead of linked worktrees and drops empty groups", () => {

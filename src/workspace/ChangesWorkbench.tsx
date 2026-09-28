@@ -54,7 +54,7 @@ import {
 } from "../domain/commit-selection";
 import { changeDiffKey, retainDiffEntries, workingCopySnapshotsEqual } from "../domain/diff-cache";
 import { resolveAvailableToolId } from "../domain/external-tools";
-import { fileManagerName } from "../domain/platform";
+import { fileManagerName, machinePathSeparator } from "../domain/platform";
 import { shortSha } from "../domain/format";
 import { SELECT_ALL_EVENT } from "../domain/select-all";
 import { usePathSeparator } from "../app/environment";
@@ -379,7 +379,7 @@ export function ChangesWorkbench() {
   // the backend, which joins it on the owning machine; SSH machines use POSIX
   // separators regardless of the desktop platform.
   const clipboardPath = (change: FileChange) => {
-    const machineSeparator = machineKind === "local" ? separator : machineOs === "windows" ? "\\" : "/";
+    const machineSeparator = machinePathSeparator(machineKind, machineOs, separator);
     return `${worktree.path.replace(/[\\/]+$/, "")}${machineSeparator}${change.path.display.split("/").join(machineSeparator)}`;
   };
   const copyText = (text: string) => {

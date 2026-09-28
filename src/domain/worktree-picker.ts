@@ -6,9 +6,12 @@ export interface WorktreePickerGroup {
   items: WorktreeRecord[];
 }
 
-/** The worktree's folder name, accepting either separator because Git prints `/` on Windows. */
-export function worktreeFolderName(path: string): string {
-  const segments = path.split(/[\\/]/).filter((segment) => segment.length > 0);
+/**
+ * The worktree's folder name, split on the owning machine's separator. Windows
+ * also accepts `/`, which Git prints there; POSIX names may contain `\`.
+ */
+export function worktreeFolderName(path: string, separator: string): string {
+  const segments = path.split(separator === "\\" ? /[\\/]/ : "/").filter((segment) => segment.length > 0);
   return segments[segments.length - 1] ?? path;
 }
 
@@ -17,10 +20,10 @@ export function worktreeBranchLabel(worktree: WorktreeRecord): string {
 }
 
 /** Matches the query against both values the picker shows: the folder name and the branch. */
-export function matchesWorktreeQuery(worktree: WorktreeRecord, query: string): boolean {
+export function matchesWorktreeQuery(worktree: WorktreeRecord, query: string, separator: string): boolean {
   const normalized = query.trim().toLowerCase();
   if (!normalized) return true;
-  return [worktreeFolderName(worktree.path), worktreeBranchLabel(worktree)]
+  return [worktreeFolderName(worktree.path, separator), worktreeBranchLabel(worktree)]
     .some((value) => value.toLowerCase().includes(normalized));
 }
 
