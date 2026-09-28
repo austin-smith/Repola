@@ -730,7 +730,7 @@ async fn text_generation_status(
     app: tauri::AppHandle,
     operations: tauri::State<'_, OperationRegistry>,
     machine_id: String,
-    provider: repola_engine::preferences::TextGenerationProvider,
+    provider: Option<repola_engine::preferences::TextGenerationProvider>,
     operation_id: String,
 ) -> Result<TextGenerationStatus, String> {
     let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;

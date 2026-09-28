@@ -16,7 +16,7 @@ use crate::worktree::{
     UndoCommitResult, WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges,
 };
 
-pub const PROTOCOL_VERSION: u16 = 17;
+pub const PROTOCOL_VERSION: u16 = 18;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,7 +81,7 @@ pub enum AgentRequest {
         request: GenerateCommitMessageRequest,
     },
     TextGenerationStatus {
-        provider: crate::preferences::TextGenerationProvider,
+        provider: Option<crate::preferences::TextGenerationProvider>,
     },
     UndoCommit {
         request: UndoCommitRequest,
@@ -372,6 +372,34 @@ pub enum AgentErrorKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preferences::TextGenerationProvider;
+
+    #[test]
+    fn provider_discovery_supports_automatic_and_explicit_remote_requests() {
+        for (provider, expected) in [
+            (None, serde_json::Value::Null),
+            (
+                Some(TextGenerationProvider::Codex),
+                serde_json::json!("codex"),
+            ),
+            (
+                Some(TextGenerationProvider::Claude),
+                serde_json::json!("claude"),
+            ),
+        ] {
+            let value =
+                serde_json::to_value(AgentRequest::TextGenerationStatus { provider }).unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({ "type": "textGenerationStatus", "provider": expected })
+            );
+            let decoded: AgentRequest = serde_json::from_value(value).unwrap();
+            let AgentRequest::TextGenerationStatus { provider: actual } = decoded else {
+                panic!("wrong request type")
+            };
+            assert_eq!(actual, provider);
+        }
+    }
 
     #[test]
     fn handshake_request_has_a_stable_golden_json_contract() {
@@ -386,7 +414,7 @@ mod tests {
         let json = serde_json::to_string(&request).expect("serialize request");
         assert_eq!(
             json,
-            r#"{"protocolVersion":17,"requestId":"golden-1","request":{"type":"handshake","clientVersion":"0.1.0","minimumProtocolVersion":17,"maximumProtocolVersion":17}}"#
+            r#"{"protocolVersion":18,"requestId":"golden-1","request":{"type":"handshake","clientVersion":"0.1.0","minimumProtocolVersion":18,"maximumProtocolVersion":18}}"#
         );
 
         let with_future_field = json.replace(

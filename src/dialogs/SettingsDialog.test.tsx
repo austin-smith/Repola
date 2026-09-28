@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/components/theme-provider";
 import { SettingsDialog } from "./SettingsDialog";
+import type { AppPreferences } from "../ipc/types";
 
 const preferenceMocks = vi.hoisted(() => ({
   loadAppPreferences: vi.fn(),
@@ -15,6 +16,8 @@ const codexMocks = vi.hoisted(() => ({
 
 vi.mock("../ipc/app-preferences", () => ({
   ...preferenceMocks,
+  updateAppPreferences: async (update: (current: AppPreferences) => AppPreferences) =>
+    preferenceMocks.saveAppPreferences(update(await preferenceMocks.loadAppPreferences())),
   launchWorktreeTool: vi.fn(),
 }));
 
@@ -131,6 +134,49 @@ describe("SettingsDialog", () => {
     })));
   });
 
+  it("keeps controls enabled during rapid switches and rolls back to the last successful save", async () => {
+    let resolveFirst!: () => void;
+    let rejectSecond!: (error: Error) => void;
+    preferenceMocks.saveAppPreferences
+      .mockImplementationOnce((preferences) => new Promise((resolve) => { resolveFirst = () => resolve(preferences); }))
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectSecond = reject; }));
+    await act(async () => { renderSettings(); });
+    const codex = screen.getByRole("button", { name: "Codex" });
+    const claude = screen.getByRole("button", { name: "Claude" });
+    const model = screen.getByRole("button", { name: /^Model / });
+    await act(async () => fireEvent.click(claude));
+    expect(codex).toBeEnabled();
+    expect(claude).toBeEnabled();
+    expect(model).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Save preferences" })).toBeEnabled();
+    await act(async () => fireEvent.click(codex));
+    expect(preferenceMocks.saveAppPreferences).toHaveBeenCalledTimes(2);
+    expect(codex).toHaveAttribute("aria-pressed", "true");
+    await act(async () => resolveFirst());
+    // An older response must not change the latest visible choice.
+    expect(codex).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: /^Model / })).toBe(model);
+    await act(async () => rejectSecond(new Error("Cannot save latest choice")));
+    expect(claude).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("alert")).toHaveTextContent("Cannot save latest choice");
+  });
+
+  it("ignores a superseded failure without reverting or flashing the latest choice", async () => {
+    let rejectFirst!: (error: Error) => void;
+    let resolveSecond!: () => void;
+    preferenceMocks.saveAppPreferences
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectFirst = reject; }))
+      .mockImplementationOnce((preferences) => new Promise((resolve) => { resolveSecond = () => resolve(preferences); }));
+    await act(async () => { renderSettings(); });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Claude" })));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Codex" })));
+    await act(async () => rejectFirst(new Error("Old save failed")));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Codex" })).toHaveAttribute("aria-pressed", "true");
+    await act(async () => resolveSecond());
+    expect(screen.getByRole("button", { name: "Codex" })).toBeEnabled();
+  });
+
   it("restores saved per-provider choices after switching and reopening settings", async () => {
     let stored = { version: 5, editorId: "cursor", terminalId: "ghostty", defaultSignCommits: false,
       textGenerationSelections: { local: { provider: "codex", selections: {
@@ -201,7 +247,8 @@ describe("SettingsDialog", () => {
     expect(screen.queryByText(/Ready on/)).not.toBeInTheDocument();
     expect(screen.getByText("Low")).toBeInTheDocument();
     expect(screen.queryByText("Fast and affordable agentic coding model.")).not.toBeInTheDocument();
-    expect(codexMocks.loadTextGenerationStatus).toHaveBeenCalledWith("local", "codex", expect.any(AbortSignal));
+    expect(codexMocks.loadTextGenerationStatus).toHaveBeenCalledWith("local", null, expect.any(AbortSignal));
+    expect(preferenceMocks.saveAppPreferences).not.toHaveBeenCalled();
   });
 
   it("persists an explicit commit-message model for the selected machine", async () => {

@@ -1,7 +1,10 @@
 //! Provider-independent selected-change preparation and response validation.
-use super::models::{GenerateCommitMessageRequest, GeneratedCommitMessage, TextGenerationStatus};
+use super::models::{
+    GenerateCommitMessageRequest, GeneratedCommitMessage, TextGenerationStatus,
+    TextGenerationStatusKind,
+};
 use super::working_copy::{selected_commit_context, SelectedCommitContext};
-use crate::preferences::TextGenerationProvider;
+use crate::preferences::{TextGenerationProvider, TextGenerationSelection};
 use serde::Deserialize;
 
 const MAX_PROMPT_PATCH_CHARS: usize = 60_000;
@@ -102,21 +105,97 @@ fn parse_generated_message(raw: &str) -> Result<GeneratedCommitMessage, String> 
     Ok(GeneratedCommitMessage { subject, body })
 }
 
-pub fn text_generation_status(provider: TextGenerationProvider) -> TextGenerationStatus {
+fn provider_status(provider: TextGenerationProvider) -> TextGenerationStatus {
     match provider {
         TextGenerationProvider::Codex => super::codex::status(),
         TextGenerationProvider::Claude => super::claude::status(),
     }
 }
 
+/// None means no saved provider choice: prefer a usable Codex default, then Claude.
+pub fn text_generation_status(provider: Option<TextGenerationProvider>) -> TextGenerationStatus {
+    status_with(provider, provider_status)
+}
+
+fn status_with(
+    provider: Option<TextGenerationProvider>,
+    mut probe: impl FnMut(TextGenerationProvider) -> TextGenerationStatus,
+) -> TextGenerationStatus {
+    if let Some(provider) = provider {
+        return probe(provider);
+    }
+    let mut guidance = Vec::new();
+    for provider in [
+        TextGenerationProvider::Codex,
+        TextGenerationProvider::Claude,
+    ] {
+        if crate::operation::current_operation().is_cancelled() {
+            break;
+        }
+        let status = probe(provider);
+        if status.status == TextGenerationStatusKind::Ready
+            && status.recommended_selection.is_some()
+        {
+            return status;
+        }
+        let (name, install, login) = match provider {
+            TextGenerationProvider::Codex => ("Codex", "the Codex CLI", "codex login"),
+            TextGenerationProvider::Claude => ("Claude", "Claude Code", "claude auth login"),
+        };
+        guidance.push(match status.status {
+            TextGenerationStatusKind::NotInstalled => {
+                format!("Install {install} on this machine, then run {login}.")
+            }
+            TextGenerationStatusKind::SignedOut => format!("Run {login} on this machine."),
+            TextGenerationStatusKind::UpdateRequired => {
+                format!("Update {install} on this machine.")
+            }
+            TextGenerationStatusKind::Ready => {
+                format!("Choose a {name} model in Settings; no default model is available.")
+            }
+            TextGenerationStatusKind::Unavailable => format!(
+                "{name} could not be checked on this machine. {}",
+                status.detail.unwrap_or_default()
+            )
+            .trim()
+            .to_string(),
+        });
+    }
+    TextGenerationStatus {
+        status: TextGenerationStatusKind::Unavailable,
+        detail: Some(format!("No AI provider is ready. {}", guidance.join(" "))),
+        version: None,
+        models: Vec::new(),
+        recommended_selection: None,
+    }
+}
+
+fn resolve_provider_selection(
+    requested: Option<&TextGenerationSelection>,
+    probe: impl FnMut(TextGenerationProvider) -> TextGenerationStatus,
+) -> Result<TextGenerationSelection, String> {
+    if let Some(selection) = requested {
+        return Ok(selection.clone());
+    }
+    let status = status_with(None, probe);
+    status.recommended_selection.ok_or_else(|| {
+        status
+            .detail
+            .unwrap_or_else(|| "No AI provider is ready. Check Settings.".into())
+    })
+}
+
 pub fn generate_commit_message(
     request: GenerateCommitMessageRequest,
 ) -> Result<GeneratedCommitMessage, String> {
     generate_with(&request, |prompt| {
-        let selection = request.text_generation_selection.as_ref();
-        match selection.map(|value| value.provider).unwrap_or_default() {
-            TextGenerationProvider::Codex => super::codex::generate(prompt, selection),
-            TextGenerationProvider::Claude => super::claude::generate(prompt, selection),
+        let selection = resolve_provider_selection(
+            request.text_generation_selection.as_ref(),
+            provider_status,
+        )?;
+        match selection.provider {
+            TextGenerationProvider::Codex => super::codex::generate(prompt, Some(&selection)),
+            TextGenerationProvider::Claude => super::claude::generate(prompt, Some(&selection)),
         }
     })
 }
@@ -146,6 +225,126 @@ fn generate_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn discovery(
+        provider: TextGenerationProvider,
+        status: TextGenerationStatusKind,
+    ) -> TextGenerationStatus {
+        TextGenerationStatus {
+            recommended_selection: (status == TextGenerationStatusKind::Ready).then(|| {
+                TextGenerationSelection {
+                    provider,
+                    model: Some("test-model".into()),
+                    reasoning_effort: None,
+                }
+            }),
+            status,
+            detail: None,
+            version: None,
+            models: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn automatic_selection_prefers_ready_codex_without_probing_claude() {
+        let status = status_with(None, |provider| {
+            assert_eq!(provider, TextGenerationProvider::Codex);
+            discovery(provider, TextGenerationStatusKind::Ready)
+        });
+        assert_eq!(
+            status.recommended_selection.unwrap().provider,
+            TextGenerationProvider::Codex
+        );
+    }
+
+    #[test]
+    fn automatic_status_and_generation_use_claude_when_codex_is_not_ready() {
+        for kind in [
+            TextGenerationStatusKind::NotInstalled,
+            TextGenerationStatusKind::SignedOut,
+            TextGenerationStatusKind::UpdateRequired,
+            TextGenerationStatusKind::Unavailable,
+        ] {
+            let probe = |provider| {
+                discovery(
+                    provider,
+                    if provider == TextGenerationProvider::Codex {
+                        kind
+                    } else {
+                        TextGenerationStatusKind::Ready
+                    },
+                )
+            };
+            let status = status_with(None, probe);
+            let selection = resolve_provider_selection(None, probe).unwrap();
+            assert_eq!(selection.provider, TextGenerationProvider::Claude);
+            assert_eq!(Some(selection), status.recommended_selection);
+        }
+    }
+
+    #[test]
+    fn automatic_selection_requires_a_usable_default_model() {
+        let status = status_with(None, |provider| {
+            let mut status = discovery(provider, TextGenerationStatusKind::Ready);
+            if provider == TextGenerationProvider::Codex {
+                status.recommended_selection = None;
+            }
+            status
+        });
+        assert_eq!(
+            status.recommended_selection.unwrap().provider,
+            TextGenerationProvider::Claude
+        );
+    }
+
+    #[test]
+    fn no_ready_provider_returns_setup_guidance_and_prevents_generation() {
+        let probe = |provider| {
+            discovery(
+                provider,
+                if provider == TextGenerationProvider::Codex {
+                    TextGenerationStatusKind::NotInstalled
+                } else {
+                    TextGenerationStatusKind::SignedOut
+                },
+            )
+        };
+        let status = status_with(None, probe);
+        assert_eq!(status.status, TextGenerationStatusKind::Unavailable);
+        assert!(status.recommended_selection.is_none());
+        assert!(status.models.is_empty());
+        let error = resolve_provider_selection(None, probe).unwrap_err();
+        assert_eq!(Some(error.clone()), status.detail);
+        assert!(error.contains("Install the Codex CLI"));
+        assert!(error.contains("claude auth login"));
+    }
+
+    #[test]
+    fn saved_selections_never_probe_or_choose_another_provider() {
+        for provider in [
+            TextGenerationProvider::Codex,
+            TextGenerationProvider::Claude,
+        ] {
+            for model in [None, Some("saved-model".to_string())] {
+                let saved = TextGenerationSelection {
+                    provider,
+                    model,
+                    reasoning_effort: None,
+                };
+                let resolved = resolve_provider_selection(Some(&saved), |_| {
+                    panic!("saved selection must not trigger automatic detection")
+                })
+                .unwrap();
+                assert_eq!(resolved, saved);
+            }
+            let status = status_with(Some(provider), |requested| {
+                assert_eq!(requested, provider);
+                discovery(requested, TextGenerationStatusKind::NotInstalled)
+            });
+            assert_eq!(status.status, TextGenerationStatusKind::NotInstalled);
+            assert!(status.recommended_selection.is_none());
+        }
+    }
 
     fn fixture() -> (tempfile::TempDir, GenerateCommitMessageRequest) {
         use super::super::models::{CommitFileSelection, WorkingCopyRequest};

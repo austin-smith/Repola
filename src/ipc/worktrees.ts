@@ -306,7 +306,7 @@ export function generateCommitMessage(
   }, { signal });
 }
 
-export function loadTextGenerationStatus(machineId: string, provider: TextGenerationProvider, signal?: AbortSignal): Promise<TextGenerationStatus> {
+export function loadTextGenerationStatus(machineId: string, provider: TextGenerationProvider | null, signal?: AbortSignal): Promise<TextGenerationStatus> {
   return invokeOperation<TextGenerationStatus>("text_generation_status", { machineId, provider }, { signal });
 }
 

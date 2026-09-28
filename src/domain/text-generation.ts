@@ -1,8 +1,9 @@
 import type { TextGenerationModel, TextGenerationPreferences, TextGenerationProvider, TextGenerationSelection, TextGenerationStatus } from "../ipc/types";
 
-export function activeGenerationSelection(preferences: TextGenerationPreferences | undefined): TextGenerationSelection {
-  const provider = preferences?.provider ?? "codex";
-  return { provider, model: null, reasoningEffort: null, ...preferences?.selections[provider] };
+export function activeGenerationSelection(preferences: TextGenerationPreferences | undefined): TextGenerationSelection | null {
+  if (!preferences) return null;
+  const provider = preferences.provider;
+  return { provider, model: null, reasoningEffort: null, ...preferences.selections[provider] };
 }
 
 export function rememberGenerationSelection(preferences: TextGenerationPreferences | undefined, selection: TextGenerationSelection): TextGenerationPreferences {

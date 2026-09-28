@@ -18,7 +18,7 @@ describe("generation model selection", () => {
     expect(activeGenerationSelection(saved)).toEqual(claude);
     const reloaded = JSON.parse(JSON.stringify(saved));
     expect(activeGenerationSelection({ ...reloaded, provider: "codex" })).toEqual(codex);
-    expect(activeGenerationSelection(undefined)).toEqual({ provider: "codex", model: null, reasoningEffort: null });
+    expect(activeGenerationSelection(undefined)).toBeNull();
   });
   it("resolves a provider default without replacing explicit unavailable choices", () => {
     expect(resolveGenerationPicker(null, status, false).selection).toEqual(recommended);
