@@ -4,7 +4,7 @@ import { ChangesWorkbench } from "./ChangesWorkbench";
 import type { GeneratedCommitMessage, WorkingCopySnapshot } from "../ipc/types";
 
 const ipc = vi.hoisted(() => ({
-  fetchWorkingCopy: vi.fn(), generateCommitMessage: vi.fn(),
+  fetchWorkingCopy: vi.fn(), generateCommitMessage: vi.fn(), synchronizeWorkingCopy: vi.fn(),
   watchWorktree: vi.fn(), unwatchWorktree: vi.fn(), onWorktreeChanged: vi.fn(),
 }));
 vi.mock("../ipc/worktrees", () => ipc);
@@ -82,6 +82,26 @@ describe("commit-message generation", () => {
     const signal = ipc.generateCommitMessage.mock.calls[0][2] as AbortSignal;
     view.unmount();
     expect(signal.aborted).toBe(true);
+  });
+
+  it("cancels generation when a pull replaces the snapshot without a watcher refresh", async () => {
+    ipc.fetchWorkingCopy.mockResolvedValue({ ...snapshot, remote: "origin", upstream: "origin/main", behind: 1 });
+    let complete!: (message: GeneratedCommitMessage) => void;
+    ipc.generateCommitMessage.mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
+    ipc.synchronizeWorkingCopy.mockResolvedValue({ snapshot: { ...snapshot, head: "new-head" }, output: "" });
+    render(<ChangesWorkbench />);
+    const generate = await screen.findByRole("button", { name: "Generate commit message" });
+    const summary = screen.getByPlaceholderText("Summary (required)");
+    fireEvent.change(summary, { target: { value: "existing message" } });
+    fireEvent.click(generate);
+    const signal = ipc.generateCommitMessage.mock.calls[0][2] as AbortSignal;
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Pull 1" })));
+    expect(ipc.synchronizeWorkingCopy).toHaveBeenCalled();
+    expect(ipc.fetchWorkingCopy).toHaveBeenCalledTimes(1);
+    expect(signal.aborted).toBe(true);
+    await act(async () => complete({ subject: "outdated message", body: "" }));
+    expect(summary).toHaveValue("existing message");
+    expect(summary).toBeEnabled();
   });
 
   it("refreshes external changes and cancels generation instead of applying a message for the old selection", async () => {

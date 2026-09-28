@@ -97,29 +97,40 @@ export function ChangesWorkbench() {
   // so the cache is stored with the snapshot and replaced whenever it is.
   const [workingCopy, setWorkingCopy] = useState<{ snapshot: WorkingCopySnapshot | null; diffCache: Map<string, FileDiff>; generation: number }>(() => ({ snapshot: null, diffCache: new Map(), generation: 0 }));
   const { snapshot, diffCache, generation } = workingCopy;
+  const [generateBusy, setGenerateBusy] = useState(false);
+  const [generationCancelling, setGenerationCancelling] = useState(false);
+  const generationController = useRef<AbortController | null>(null);
+  const generationSnapshot = useRef<WorkingCopySnapshot | null>(null);
   // A snapshot that changed nothing (its content stamps prove it) is dropped
   // whole, so focus and watcher refreshes over a quiet working copy render
   // nothing new. When it did change, diff-cache entries whose content
   // identity the new change list still produces are proven current and carry
   // forward; only genuinely changed files load again.
-  const setSnapshot = useCallback((next: WorkingCopySnapshot | null) => setWorkingCopy((current) => {
-    if (next && current.snapshot && workingCopySnapshotsEqual(current.snapshot, next)) return current;
-    const generation = current.generation + 1;
-    return {
-      snapshot: next,
-      diffCache: next ? retainDiffEntries(current.diffCache, next.changes, generation) : new Map(),
-      generation,
-    };
-  }), []);
+  const setSnapshot = useCallback((next: WorkingCopySnapshot | null) => {
+    const generating = generationController.current;
+    if (generating && !generating.signal.aborted && generationSnapshot.current
+      && (!next || !workingCopySnapshotsEqual(generationSnapshot.current, next))) {
+      // Both mutations and refreshes can change the commit selection. Cancel
+      // before publishing either result, outside React's state updater.
+      generating.abort();
+      setGenerationCancelling(true);
+      toast.add({ type: "error", title: "Working copy changed during generation", description: "Review the updated changes and generate the message again." });
+    }
+    setWorkingCopy((current) => {
+      if (next && current.snapshot && workingCopySnapshotsEqual(current.snapshot, next)) return current;
+      const generation = current.generation + 1;
+      return {
+        snapshot: next,
+        diffCache: next ? retainDiffEntries(current.diffCache, next.changes, generation) : new Map(),
+        generation,
+      };
+    });
+  }, []);
   const [changeSelection, setChangeSelection] = useState(emptyChangeSelection);
   const [commitSelections, setCommitSelections] = useState<CommitSelectionMap>(() => new Map());
   const changesListRef = useRef<HTMLDivElement>(null);
   const [busyPath, setBusyPath] = useState<string | null>(null);
   const [commitBusy, setCommitBusy] = useState(false);
-  const [generateBusy, setGenerateBusy] = useState(false);
-  const [generationCancelling, setGenerationCancelling] = useState(false);
-  const generationController = useRef<AbortController | null>(null);
-  const generationSnapshot = useRef<WorkingCopySnapshot | null>(null);
   const [syncBusy, setSyncBusy] = useState(false);
   const [operationBusy, setOperationBusy] = useState(false);
   const [pendingForcePush, setPendingForcePush] = useState(false);
@@ -191,15 +202,6 @@ export function ChangesWorkbench() {
     pendingReload.current = fetchWorkingCopy(machineId, repository.path, worktree.path, controller.signal)
       .then((next) => {
         if (controller.signal.aborted || mutatingRef.current) return;
-        const generating = generationController.current;
-        if (generating && !generating.signal.aborted && generationSnapshot.current
-          && !workingCopySnapshotsEqual(generationSnapshot.current, next)) {
-          // Reconciliation can include newly created files. Never apply a message
-          // generated for the previous selection after that selection changes.
-          generating.abort();
-          setGenerationCancelling(true);
-          toast.add({ type: "error", title: "Working copy changed during generation", description: "Review the updated changes and generate the message again." });
-        }
         setSnapshot(next);
         setChangeSelection((current) => {
           const ids = new Set(next.changes.map((change) => change.id));
