@@ -12,6 +12,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Remove once typescript-eslint supports TypeScript 7.
+    ignore:
+      - dependency-name: typescript
+        versions: [">=7.0.0 <8.0.0"]
     groups:
       frontend:
         patterns: ["*"]
