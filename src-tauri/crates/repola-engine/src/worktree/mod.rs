@@ -10,6 +10,7 @@ mod external_tools;
 mod history;
 mod history_mutations;
 mod identity;
+mod images;
 mod inspection;
 mod model_catalog;
 mod models;

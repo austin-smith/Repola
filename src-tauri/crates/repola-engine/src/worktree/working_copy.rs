@@ -4,15 +4,16 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use base64::prelude::{Engine as _, BASE64_STANDARD};
-
 use super::command;
+use super::images::{
+    image_comparison, image_preview, revision_image_preview, MAX_IMAGE_PREVIEW_BYTES,
+};
 use super::models::{
     ApplyPatchHunkRequest, CommitFileSelection, CommitHunkSelection, CommitPerson, CommitRequest,
     CommitResult, CommitSigning, CommitTrailer, ConflictFile, ConflictFileRequest,
     ConflictResolutionKind, DiscardAllRequest, DiscardFileRequest, DiscardScope, FileChange,
     FileChangeKind, FileDiff, FileDiffRequest, FileModeChange, GenerateCommitMessageRequest,
-    GitPath, ImagePreview, PatchHunk, PatchHunkAction, RepositoryOperation, ResolveConflictRequest,
+    GitPath, ImageVersion, PatchHunk, PatchHunkAction, RepositoryOperation, ResolveConflictRequest,
     ReviewedFileChange, SetFileStagingRequest, UndoCommitRequest, UndoCommitResult,
     WorkingCopyRequest, WorkingCopySnapshot,
 };
@@ -20,7 +21,6 @@ use super::models::{
 const MAX_COMMIT_SUMMARY_BYTES: usize = 998;
 const MAX_COMMIT_DESCRIPTION_BYTES: usize = 1024 * 1024;
 const MAX_FILE_PATCH_BYTES: usize = 8 * 1024 * 1024;
-const MAX_IMAGE_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CONFLICT_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_INSTRUCTION_BYTES: u64 = 20_000;
 
@@ -245,11 +245,28 @@ fn file_diff_with_options(
         || patch_output
             .windows(b"Subproject commit ".len())
             .any(|window| window == b"Subproject commit ");
-    let image = if binary && !submodule {
-        worktree_image_preview(&worktree, change)?
+    let image = if !submodule
+        && (binary
+            || matches!(
+                change.kind,
+                FileChangeKind::Renamed | FileChangeKind::Copied
+            )) {
+        let before = if let Some(head) = snapshot.head.as_deref().filter(|_| !change.untracked) {
+            revision_image_preview(
+                &worktree,
+                head,
+                change.previous_path.as_ref().unwrap_or(&change.path),
+                "HEAD",
+                !binary,
+            )?
+        } else {
+            ImageVersion::Missing
+        };
+        image_comparison(before, worktree_image_preview(&worktree, change, !binary)?)
     } else {
         None
     };
+    let binary = binary || image.is_some();
     let (patch, truncated) = truncate_file_patch(&patch_output);
     let hunks = if binary || truncated || change.conflicted {
         Vec::new()
@@ -284,56 +301,39 @@ fn file_diff_with_options(
 fn worktree_image_preview(
     worktree: &Path,
     change: &FileChange,
-) -> Result<Option<ImagePreview>, String> {
+    require_decodable: bool,
+) -> Result<ImageVersion, String> {
     if change.kind == FileChangeKind::Deleted || change.path.token.is_empty() {
-        return Ok(None);
+        return Ok(ImageVersion::Missing);
     }
     let relative = PathBuf::from(path_from_token(&change.path.token)?);
     let candidate = worktree.join(relative);
     let metadata = match fs::symlink_metadata(&candidate) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ImageVersion::Missing)
+        }
         Err(error) => return Err(format!("The image preview could not be inspected: {error}")),
     };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > MAX_IMAGE_PREVIEW_BYTES
-    {
-        return Ok(None);
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(ImageVersion::Unsupported);
+    }
+    if metadata.len() > MAX_IMAGE_PREVIEW_BYTES {
+        return Ok(ImageVersion::TooLarge);
     }
     let canonical = dunce::canonicalize(&candidate)
         .map_err(|error| format!("The image preview path could not be resolved: {error}"))?;
     if !canonical.starts_with(worktree) {
         return Err("The image preview resolved outside the selected working copy.".into());
     }
-    let bytes = fs::read(&canonical)
+    let mut bytes = Vec::new();
+    fs::File::open(&canonical)
+        .and_then(|file| {
+            file.take(MAX_IMAGE_PREVIEW_BYTES + 1)
+                .read_to_end(&mut bytes)
+        })
         .map_err(|error| format!("The image preview could not be read: {error}"))?;
-    image_preview(&bytes, "Current working copy")
-}
-
-pub(super) fn image_preview(bytes: &[u8], label: &str) -> Result<Option<ImagePreview>, String> {
-    if bytes.len() as u64 > MAX_IMAGE_PREVIEW_BYTES {
-        return Ok(None);
-    }
-    let mime_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        "image/png"
-    } else if bytes.starts_with(b"\xff\xd8\xff") {
-        "image/jpeg"
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        "image/gif"
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        "image/webp"
-    } else if bytes.starts_with(b"BM") {
-        "image/bmp"
-    } else {
-        return Ok(None);
-    };
-    Ok(Some(ImagePreview {
-        mime_type: mime_type.into(),
-        base64: BASE64_STANDARD.encode(bytes),
-        byte_length: bytes.len() as u64,
-        label: label.into(),
-    }))
+    Ok(image_preview(&bytes, "Working copy", require_decodable))
 }
 
 pub fn apply_patch_hunk(request: ApplyPatchHunkRequest) -> Result<WorkingCopySnapshot, String> {
@@ -3415,10 +3415,175 @@ mod tests {
         })
         .expect("image diff");
         assert!(image.binary);
-        let preview = image.image.expect("raster preview");
+        let comparison = image.image.expect("raster comparison");
+        assert!(matches!(comparison.before, ImageVersion::Missing));
+        let ImageVersion::Preview(preview) = comparison.after else {
+            panic!("working copy preview missing")
+        };
         assert_eq!(preview.mime_type, "image/png");
         assert_eq!(preview.byte_length, 24);
         assert!(!preview.base64.is_empty());
+    }
+
+    fn image_diff_at(repository: &Path, name: &str) -> super::super::models::ImageComparison {
+        let path = repository.to_string_lossy().into_owned();
+        let diff = file_diff(FileDiffRequest {
+            repository_path: path.clone(),
+            worktree_path: path,
+            path: git_path(name.as_bytes()),
+        })
+        .expect("image diff");
+        assert!(diff.binary);
+        diff.image.expect("image comparison")
+    }
+
+    fn assert_preview_bytes(version: &ImageVersion, bytes: &[u8], label: &str) {
+        use base64::prelude::{Engine as _, BASE64_STANDARD};
+        let ImageVersion::Preview(preview) = version else {
+            panic!("expected preview: {version:?}")
+        };
+        assert_eq!(BASE64_STANDARD.decode(&preview.base64).unwrap(), bytes);
+        assert_eq!(preview.label, label);
+    }
+
+    #[test]
+    fn image_comparison_uses_head_and_working_copy_without_changing_the_index() {
+        let repository = repository();
+        let name = "-logo space.png";
+        let before = b"\x89PNG\r\n\x1a\n\0before";
+        let staged = b"\x89PNG\r\n\x1a\n\0staged";
+        let after = b"\x89PNG\r\n\x1a\n\0after";
+        fs::write(repository.path().join(name), before).unwrap();
+        command::successful_git_at(repository.path(), ["add", "--", name]).unwrap();
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).unwrap();
+        fs::write(repository.path().join(name), staged).unwrap();
+        command::successful_git_at(repository.path(), ["add", "--", name]).unwrap();
+        fs::write(repository.path().join(name), after).unwrap();
+
+        let comparison = image_diff_at(repository.path(), name);
+        assert_preview_bytes(&comparison.before, before, "HEAD");
+        assert_preview_bytes(&comparison.after, after, "Working copy");
+        let index =
+            command::successful_git_at(repository.path(), ["show", &format!(":{name}")]).unwrap();
+        assert_eq!(index.stdout, staged);
+
+        fs::remove_file(repository.path().join(name)).unwrap();
+        let deleted = image_diff_at(repository.path(), name);
+        assert_preview_bytes(&deleted.before, before, "HEAD");
+        assert!(matches!(deleted.after, ImageVersion::Missing));
+    }
+
+    #[test]
+    fn image_comparison_preserves_previous_paths_for_pure_renames() {
+        let repository = repository();
+        let bytes = &super::super::images::test_png(b"image");
+        fs::write(repository.path().join("old logo.png"), bytes).unwrap();
+        command::successful_git_at(repository.path(), ["add", "--", "old logo.png"]).unwrap();
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).unwrap();
+        fs::rename(
+            repository.path().join("old logo.png"),
+            repository.path().join("new logo.png"),
+        )
+        .unwrap();
+        command::successful_git_at(repository.path(), ["add", "-A", "--"]).unwrap();
+        let snapshot = working_copy_snapshot(request(repository.path())).unwrap();
+        assert_eq!(snapshot.changes[0].kind, FileChangeKind::Renamed);
+
+        let comparison = image_diff_at(repository.path(), "new logo.png");
+        assert_preview_bytes(&comparison.before, bytes, "HEAD");
+        assert_preview_bytes(&comparison.after, bytes, "Working copy");
+    }
+
+    #[test]
+    fn renamed_text_with_image_signatures_keeps_textual_diffs() {
+        for prefix in ["BM", "GIF87a", "GIF89a", "RIFFtextWEBP"] {
+            for modified in [false, true] {
+                let repository = repository();
+                let before = format!(
+                    "{prefix} ordinary text\n{}",
+                    "unchanged text line\n".repeat(8)
+                );
+                fs::write(repository.path().join("old.txt"), &before).unwrap();
+                command::successful_git_at(repository.path(), ["add", "--", "old.txt"]).unwrap();
+                command::successful_git_at(repository.path(), ["commit", "-m", "base"]).unwrap();
+                fs::rename(
+                    repository.path().join("old.txt"),
+                    repository.path().join("new.txt"),
+                )
+                .unwrap();
+                if modified {
+                    fs::write(
+                        repository.path().join("new.txt"),
+                        format!("{before}added line\n"),
+                    )
+                    .unwrap();
+                }
+                command::successful_git_at(repository.path(), ["add", "-A", "--"]).unwrap();
+                let snapshot = working_copy_snapshot(request(repository.path())).unwrap();
+                assert_eq!(snapshot.changes[0].kind, FileChangeKind::Renamed);
+                let diff = file_diff(FileDiffRequest {
+                    repository_path: snapshot.repository_path,
+                    worktree_path: snapshot.worktree_path,
+                    path: git_path(b"new.txt"),
+                })
+                .unwrap();
+                assert!(
+                    !diff.binary,
+                    "text starting with {prefix} was classified as binary"
+                );
+                assert!(diff.image.is_none());
+                assert!(diff.patch.contains("rename from old.txt"));
+                if modified {
+                    assert!(diff.patch.contains("+added line"));
+                    assert!(!diff.hunks.is_empty());
+                    assert!(!diff.staged_hunks.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn image_comparison_keeps_the_readable_side_when_the_other_is_unavailable() {
+        let repository = repository();
+        let bytes = b"\x89PNG\r\n\x1a\n\0image";
+        fs::write(repository.path().join("logo.png"), bytes).unwrap();
+        command::successful_git_at(repository.path(), ["add", "--", "logo.png"]).unwrap();
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).unwrap();
+        fs::write(
+            repository.path().join("logo.png"),
+            vec![0; MAX_IMAGE_PREVIEW_BYTES as usize + 1],
+        )
+        .unwrap();
+        let oversized = image_diff_at(repository.path(), "logo.png");
+        assert_preview_bytes(&oversized.before, bytes, "HEAD");
+        assert!(matches!(oversized.after, ImageVersion::TooLarge));
+
+        fs::write(repository.path().join("logo.png"), b"binary\0data").unwrap();
+        let unsupported = image_diff_at(repository.path(), "logo.png");
+        assert_preview_bytes(&unsupported.before, bytes, "HEAD");
+        assert!(matches!(unsupported.after, ImageVersion::Unsupported));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_comparison_does_not_follow_working_copy_symlinks() {
+        let repository = repository();
+        let outside = tempfile::tempdir().unwrap();
+        let bytes = b"\x89PNG\r\n\x1a\n\0image";
+        fs::write(repository.path().join("logo.png"), bytes).unwrap();
+        command::successful_git_at(repository.path(), ["add", "--", "logo.png"]).unwrap();
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).unwrap();
+        fs::write(outside.path().join("logo.png"), bytes).unwrap();
+        fs::remove_file(repository.path().join("logo.png")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("logo.png"),
+            repository.path().join("logo.png"),
+        )
+        .unwrap();
+
+        let comparison = image_diff_at(repository.path(), "logo.png");
+        assert_preview_bytes(&comparison.before, bytes, "HEAD");
+        assert!(matches!(comparison.after, ImageVersion::Unsupported));
     }
 
     #[test]
