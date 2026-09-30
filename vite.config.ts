@@ -72,6 +72,8 @@ export default defineConfig(async () => ({
           if (/^(react|react-dom|scheduler)(\/|$)/.test(dependency)) {
             return "react-runtime";
           }
+          // Keep image-only slider code in the lazily loaded diff rather than startup UI.
+          if (dependency.startsWith("@base-ui/react/slider/")) return undefined;
           if (dependency.startsWith("@base-ui/")) return "ui-primitives";
           if (dependency.startsWith("@tauri-apps/")) return "tauri-runtime";
           return undefined;

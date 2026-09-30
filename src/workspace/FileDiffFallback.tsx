@@ -1,6 +1,6 @@
-import { FileQuestionIcon, GitCommitIcon, ImageIcon } from "lucide-react";
+import { FileQuestionIcon, GitCommitIcon } from "lucide-react";
 import type { FileDiff } from "../ipc/types";
-import { formatBytes } from "../domain/format";
+import { ImageComparisonView } from "./ImageComparisonView";
 
 export function FileDiffFallback({ diff }: { diff: FileDiff }) {
   if (diff.submodule) {
@@ -16,16 +16,7 @@ export function FileDiffFallback({ diff }: { diff: FileDiff }) {
     );
   }
   if (diff.image) {
-    const source = "data:" + diff.image.mimeType + ";base64," + diff.image.base64;
-    return (
-      <div className="flex min-h-full flex-col items-center justify-center gap-4 p-8">
-        <div className="flex items-center gap-2 text-sm"><ImageIcon className="size-4 text-muted-foreground" aria-hidden="true" /><strong>{diff.image.label}</strong><span className="text-muted-foreground">· {formatBytes(diff.image.byteLength)}</span></div>
-        <div className="grid max-h-[70vh] max-w-full place-items-center overflow-auto border bg-[repeating-conic-gradient(var(--muted)_0_25%,transparent_0_50%)_50%/16px_16px] p-4">
-          <img src={source} alt={diff.image.label + " image preview"} className="max-h-[62vh] max-w-full object-contain" />
-        </div>
-        <p className="max-w-md text-center text-xs text-muted-foreground">Raster preview is bounded to 4 MiB. Pixel-level before/after comparison is not available yet.</p>
-      </div>
-    );
+    return <ImageComparisonView comparison={diff.image} />;
   }
   return (
     <div className="grid min-h-full place-items-center p-8">

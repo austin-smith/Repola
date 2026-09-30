@@ -343,10 +343,26 @@ pub struct FileDiff {
     pub truncated: bool,
     pub binary: bool,
     pub submodule: bool,
-    pub image: Option<ImagePreview>,
+    pub image: Option<ImageComparison>,
     pub hunks: Vec<PatchHunk>,
     pub staged_hunks: Vec<PatchHunk>,
     pub unstaged_hunks: Vec<PatchHunk>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageComparison {
+    pub before: ImageVersion,
+    pub after: ImageVersion,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "preview", rename_all = "camelCase")]
+pub enum ImageVersion {
+    Missing,
+    Unsupported,
+    TooLarge,
+    Preview(ImagePreview),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

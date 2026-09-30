@@ -269,11 +269,20 @@ export interface FileDiff {
   truncated: boolean;
   binary: boolean;
   submodule: boolean;
-  image: ImagePreview | null;
+  image: ImageComparison | null;
   hunks: PatchHunk[];
   stagedHunks: PatchHunk[];
   unstagedHunks: PatchHunk[];
 }
+
+export interface ImageComparison {
+  before: ImageVersion;
+  after: ImageVersion;
+}
+
+export type ImageVersion =
+  | { kind: "preview"; preview: ImagePreview }
+  | { kind: "missing" | "unsupported" | "tooLarge" };
 
 export interface ImagePreview {
   mimeType: string;

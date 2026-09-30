@@ -2,13 +2,13 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::command;
+use super::images::{image_comparison, revision_image_preview};
 use super::models::{
     CommitChangedFile, CommitFileDiffRequest, CommitFilesRequest, CommitSignature, CommitSummary,
-    FileChangeKind, FileDiff, HistoryPage, HistoryRequest, ReflogEntry, ReflogRequest,
+    FileChangeKind, FileDiff, HistoryPage, HistoryRequest, ImageVersion, ReflogEntry,
+    ReflogRequest,
 };
-use super::working_copy::{
-    empty_tree, git_path, image_preview, path_from_token, truncate_file_patch,
-};
+use super::working_copy::{empty_tree, git_path, path_from_token, truncate_file_patch};
 
 const MAX_HISTORY_PAGE: u16 = 100;
 const MAX_REFLOG_PAGE: u16 = 500;
@@ -232,28 +232,25 @@ pub fn commit_file_diff(request: CommitFileDiffRequest) -> Result<FileDiff, Stri
         .stdout
         .windows(b"Subproject commit ".len())
         .any(|window| window == b"Subproject commit ");
-    let image = if binary && !submodule {
-        let (revision, path) = if file.kind == FileChangeKind::Deleted {
-            (
-                base.as_str(),
-                file.previous_path.as_ref().unwrap_or(&file.path),
-            )
-        } else {
-            (request.commit.as_str(), &file.path)
-        };
-        commit_image_preview(
+    let image = if !submodule
+        && (binary || matches!(file.kind, FileChangeKind::Renamed | FileChangeKind::Copied))
+    {
+        let before = revision_image_preview(
             &worktree,
-            revision,
-            path,
-            if file.kind == FileChangeKind::Deleted {
-                "Previous commit"
-            } else {
-                "Selected commit"
-            },
-        )?
+            &base,
+            file.previous_path.as_ref().unwrap_or(&file.path),
+            "Parent commit",
+        )?;
+        let after = if file.kind == FileChangeKind::Deleted {
+            ImageVersion::Missing
+        } else {
+            revision_image_preview(&worktree, &request.commit, &file.path, "Selected commit")?
+        };
+        image_comparison(before, after)
     } else {
         None
     };
+    let binary = binary || image.is_some();
     let (patch, truncated) = truncate_file_patch(&patch.stdout);
     Ok(FileDiff {
         patch,
@@ -265,45 +262,6 @@ pub fn commit_file_diff(request: CommitFileDiffRequest) -> Result<FileDiff, Stri
         staged_hunks: Vec::new(),
         unstaged_hunks: Vec::new(),
     })
-}
-
-fn commit_image_preview(
-    worktree: &Path,
-    revision: &str,
-    path: &super::models::GitPath,
-    label: &str,
-) -> Result<Option<super::models::ImagePreview>, String> {
-    let mut object = OsString::from(revision);
-    object.push(":");
-    object.push(path_from_token(&path.token)?);
-    let size = command::git_at(
-        worktree,
-        [
-            OsString::from("cat-file"),
-            OsString::from("-s"),
-            object.clone(),
-        ],
-    )
-    .map_err(|error| error.to_string())?;
-    if !size.status.success() {
-        return Ok(None);
-    }
-    let size = String::from_utf8_lossy(&size.stdout)
-        .trim()
-        .parse::<u64>()
-        .map_err(|_| "Git returned an invalid image blob size.".to_string())?;
-    if size > 4 * 1024 * 1024 {
-        return Ok(None);
-    }
-    let blob = command::git_at(
-        worktree,
-        [OsString::from("cat-file"), OsString::from("blob"), object],
-    )
-    .map_err(|error| error.to_string())?;
-    if !blob.status.success() {
-        return Ok(None);
-    }
-    image_preview(&blob.stdout, label)
 }
 
 fn commit_base(worktree: &Path, commit: &str) -> Result<String, String> {
@@ -471,6 +429,111 @@ fn text(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image_repository() -> tempfile::TempDir {
+        let repository = tempfile::tempdir().unwrap();
+        command::successful_git_at(repository.path(), ["init"]).unwrap();
+        command::successful_git_at(repository.path(), ["config", "core.autocrlf", "false"])
+            .unwrap();
+        command::successful_git_at(repository.path(), ["config", "user.name", "Image Test"])
+            .unwrap();
+        command::successful_git_at(
+            repository.path(),
+            ["config", "user.email", "image@example.invalid"],
+        )
+        .unwrap();
+        repository
+    }
+
+    fn commit_image_files(repository: &Path) -> String {
+        command::successful_git_at(repository, ["add", "-A", "--"]).unwrap();
+        command::successful_git_at(repository, ["commit", "-m", "image change"]).unwrap();
+        let head = command::successful_git_at(repository, ["rev-parse", "HEAD"]).unwrap();
+        String::from_utf8(head.stdout).unwrap().trim().into()
+    }
+
+    fn image_diff_at(
+        repository: &Path,
+        commit: &str,
+        name: &str,
+    ) -> super::super::models::ImageComparison {
+        let path = repository.to_string_lossy().into_owned();
+        let diff = commit_file_diff(CommitFileDiffRequest {
+            repository_path: path.clone(),
+            worktree_path: path,
+            commit: commit.into(),
+            path: git_path(name.as_bytes()),
+        })
+        .unwrap();
+        assert!(diff.binary);
+        diff.image.expect("image comparison")
+    }
+
+    fn assert_preview_bytes(version: &ImageVersion, bytes: &[u8], label: &str) {
+        use base64::prelude::{Engine as _, BASE64_STANDARD};
+        let ImageVersion::Preview(preview) = version else {
+            panic!("expected preview: {version:?}")
+        };
+        assert_eq!(BASE64_STANDARD.decode(&preview.base64).unwrap(), bytes);
+        assert_eq!(preview.label, label);
+    }
+
+    #[test]
+    fn compares_committed_images_for_additions_modifications_renames_and_deletions() {
+        let repository = image_repository();
+        let before = b"\x89PNG\r\n\x1a\n\0before";
+        let after = b"\x89PNG\r\n\x1a\n\0after";
+        std::fs::write(repository.path().join("old logo.png"), before).unwrap();
+        let root = commit_image_files(repository.path());
+        let added = image_diff_at(repository.path(), &root, "old logo.png");
+        assert!(matches!(added.before, ImageVersion::Missing));
+        assert_preview_bytes(&added.after, before, "Selected commit");
+
+        std::fs::write(repository.path().join("old logo.png"), after).unwrap();
+        let modified_commit = commit_image_files(repository.path());
+        std::fs::write(
+            repository.path().join("old logo.png"),
+            b"unrelated working copy",
+        )
+        .unwrap();
+        let modified = image_diff_at(repository.path(), &modified_commit, "old logo.png");
+        assert_preview_bytes(&modified.before, before, "Parent commit");
+        assert_preview_bytes(&modified.after, after, "Selected commit");
+
+        std::fs::write(repository.path().join("old logo.png"), after).unwrap();
+        std::fs::rename(
+            repository.path().join("old logo.png"),
+            repository.path().join("new logo.png"),
+        )
+        .unwrap();
+        let rename_commit = commit_image_files(repository.path());
+        let renamed = image_diff_at(repository.path(), &rename_commit, "new logo.png");
+        assert_preview_bytes(&renamed.before, after, "Parent commit");
+        assert_preview_bytes(&renamed.after, after, "Selected commit");
+
+        std::fs::remove_file(repository.path().join("new logo.png")).unwrap();
+        let deletion_commit = commit_image_files(repository.path());
+        let deleted = image_diff_at(repository.path(), &deletion_commit, "new logo.png");
+        assert_preview_bytes(&deleted.before, after, "Parent commit");
+        assert!(matches!(deleted.after, ImageVersion::Missing));
+    }
+
+    #[test]
+    fn oversized_commit_blobs_do_not_hide_the_other_image() {
+        let repository = image_repository();
+        let bytes = b"\x89PNG\r\n\x1a\n\0image";
+        std::fs::write(repository.path().join("logo.png"), bytes).unwrap();
+        commit_image_files(repository.path());
+        std::fs::write(
+            repository.path().join("logo.png"),
+            vec![0; super::super::images::MAX_IMAGE_PREVIEW_BYTES as usize + 1],
+        )
+        .unwrap();
+        let commit = commit_image_files(repository.path());
+        let comparison = image_diff_at(repository.path(), &commit, "logo.png");
+        assert_preview_bytes(&comparison.before, bytes, "Parent commit");
+        assert!(matches!(comparison.after, ImageVersion::TooLarge));
+    }
 
     #[test]
     fn parses_multiple_nul_delimited_commits() {
