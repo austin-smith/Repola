@@ -9,6 +9,18 @@ use super::models::{GitPath, ImageComparison, ImagePreview, ImageVersion};
 use super::working_copy::path_from_token;
 
 pub(super) const MAX_IMAGE_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_IMAGE_VALIDATION_DIMENSION: u32 = 8192;
+const MAX_IMAGE_VALIDATION_ALLOC_BYTES: u64 = 32 * 1024 * 1024;
+
+fn validate_raster(bytes: &[u8], format: image::ImageFormat) -> image::ImageResult<()> {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_VALIDATION_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_VALIDATION_DIMENSION);
+    limits.max_alloc = Some(MAX_IMAGE_VALIDATION_ALLOC_BYTES);
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(limits);
+    reader.decode().map(|_| ())
+}
 
 pub(super) fn image_comparison(
     before: ImageVersion,
@@ -40,12 +52,8 @@ pub(super) fn image_preview(bytes: &[u8], label: &str, require_decodable: bool) 
     };
     // Git emits 0/0 numstat for a pure image rename. Before overriding its text
     // classification, validate the raster; text can share short signatures (BM).
-    // The reader's allocation limits bound decoding as well as the byte limit above.
-    if require_decodable
-        && image::ImageReader::with_format(Cursor::new(bytes), format)
-            .decode()
-            .is_err()
-    {
+    // Explicit decoder limits also bound expansion of small compressed files.
+    if require_decodable && validate_raster(bytes, format).is_err() {
         return ImageVersion::Unsupported;
     }
     ImageVersion::Preview(ImagePreview {
@@ -183,6 +191,39 @@ mod tests {
                 BASE64_STANDARD.decode(preview.base64).unwrap(),
                 *bytes.get_ref()
             );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_large_rasters_before_allocating_pixels() {
+        for (width, height, kind) in [
+            (8193u32, 1u32, image::error::LimitErrorKind::DimensionError),
+            (1, 8193, image::error::LimitErrorKind::DimensionError),
+            (4096, 4096, image::error::LimitErrorKind::InsufficientMemory),
+        ] {
+            // A valid BMP header advertising a large raster, without pixel data.
+            // Limit errors must precede the missing-data error and allocation.
+            let mut bytes = vec![0u8; 54];
+            bytes[..2].copy_from_slice(b"BM");
+            bytes[2..6].copy_from_slice(&54u32.to_le_bytes());
+            bytes[10..14].copy_from_slice(&54u32.to_le_bytes());
+            bytes[14..18].copy_from_slice(&40u32.to_le_bytes());
+            bytes[18..22].copy_from_slice(&width.to_le_bytes());
+            bytes[22..26].copy_from_slice(&height.to_le_bytes());
+            bytes[26..28].copy_from_slice(&1u16.to_le_bytes());
+            bytes[28..30].copy_from_slice(&24u16.to_le_bytes());
+            assert_eq!(
+                image::ImageReader::with_format(Cursor::new(&bytes), image::ImageFormat::Bmp)
+                    .into_dimensions()
+                    .unwrap(),
+                (width, height),
+            );
+            let error = validate_raster(&bytes, image::ImageFormat::Bmp).unwrap_err();
+            assert!(matches!(error, image::ImageError::Limits(error) if error.kind() == kind));
+            assert!(matches!(
+                image_preview(&bytes, "Before", true),
+                ImageVersion::Unsupported
+            ));
         }
     }
 
