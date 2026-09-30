@@ -103,6 +103,9 @@ describe("image comparison", () => {
     const slider = await screen.findByRole("slider", { name: "Swipe position" });
     expect(slider).toHaveAttribute("aria-valuenow", "50");
     expect(screen.getByRole("group", { name: "Swipe image comparison" })).toBeInTheDocument();
+    const labels = screen.getByText("Split 50%").parentElement;
+    expect(labels?.firstElementChild).toHaveTextContent("Before");
+    expect(labels?.lastElementChild).toHaveTextContent("After");
     expect(screen.getByRole("img", { name: "After image" }).parentElement).toHaveStyle({ clipPath: "inset(0 0 0 50%)" });
     fireEvent.keyDown(slider, { key: "End" });
     expect(slider).toHaveAttribute("aria-valuenow", "100");

@@ -159,7 +159,7 @@ export function ImageComparisonView({ comparison }: { comparison: ImageCompariso
           {modes.map((item) => <ToggleGroupItem key={item.value} value={item.value} disabled={item.value !== "2-up" && !frame} className="min-w-0 px-2">{item.label}</ToggleGroupItem>)}
         </ToggleGroup>
         {activeMode === "swipe" || activeMode === "onion" ? <div className="flex w-full max-w-md flex-col gap-2">
-          <div className="flex justify-between text-xs text-muted-foreground"><span>{activeMode === "swipe" ? "After" : "Before"}</span><span className="tabular-nums">{activeMode === "swipe" ? `Split ${position}%` : `After ${position}%`}</span><span>{activeMode === "swipe" ? "Before" : "After"}</span></div>
+          <div className="flex justify-between text-xs text-muted-foreground"><span>Before</span><span className="tabular-nums">{activeMode === "swipe" ? `Split ${position}%` : `After ${position}%`}</span><span>After</span></div>
           <Slider thumbLabel={activeMode === "swipe" ? "Swipe position" : "After image opacity"} value={[position]} min={0} max={100} step={1}
             onValueChange={(value) => {
               const next = Array.isArray(value) ? value[0] : value;

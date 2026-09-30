@@ -240,11 +240,18 @@ pub fn commit_file_diff(request: CommitFileDiffRequest) -> Result<FileDiff, Stri
             &base,
             file.previous_path.as_ref().unwrap_or(&file.path),
             "Parent commit",
+            !binary,
         )?;
         let after = if file.kind == FileChangeKind::Deleted {
             ImageVersion::Missing
         } else {
-            revision_image_preview(&worktree, &request.commit, &file.path, "Selected commit")?
+            revision_image_preview(
+                &worktree,
+                &request.commit,
+                &file.path,
+                "Selected commit",
+                !binary,
+            )?
         };
         image_comparison(before, after)
     } else {
@@ -481,8 +488,8 @@ mod tests {
     #[test]
     fn compares_committed_images_for_additions_modifications_renames_and_deletions() {
         let repository = image_repository();
-        let before = b"\x89PNG\r\n\x1a\n\0before";
-        let after = b"\x89PNG\r\n\x1a\n\0after";
+        let before = &super::super::images::test_png(b"before");
+        let after = &super::super::images::test_png(b"after");
         std::fs::write(repository.path().join("old logo.png"), before).unwrap();
         let root = commit_image_files(repository.path());
         let added = image_diff_at(repository.path(), &root, "old logo.png");
@@ -516,6 +523,51 @@ mod tests {
         let deleted = image_diff_at(repository.path(), &deletion_commit, "new logo.png");
         assert_preview_bytes(&deleted.before, after, "Parent commit");
         assert!(matches!(deleted.after, ImageVersion::Missing));
+    }
+
+    #[test]
+    fn committed_text_renames_with_image_signatures_keep_textual_diffs() {
+        for prefix in ["BM", "GIF87a", "GIF89a", "RIFFtextWEBP"] {
+            for modified in [false, true] {
+                let repository = image_repository();
+                let before = format!(
+                    "{prefix} ordinary text\n{}",
+                    "unchanged text line\n".repeat(8)
+                );
+                std::fs::write(repository.path().join("old.txt"), &before).unwrap();
+                commit_image_files(repository.path());
+                std::fs::rename(
+                    repository.path().join("old.txt"),
+                    repository.path().join("new.txt"),
+                )
+                .unwrap();
+                if modified {
+                    std::fs::write(
+                        repository.path().join("new.txt"),
+                        format!("{before}added line\n"),
+                    )
+                    .unwrap();
+                }
+                let commit = commit_image_files(repository.path());
+                let path = repository.path().to_string_lossy().into_owned();
+                let diff = commit_file_diff(CommitFileDiffRequest {
+                    repository_path: path.clone(),
+                    worktree_path: path,
+                    commit,
+                    path: git_path(b"new.txt"),
+                })
+                .unwrap();
+                assert!(
+                    !diff.binary,
+                    "text starting with {prefix} was classified as binary"
+                );
+                assert!(diff.image.is_none());
+                assert!(diff.patch.contains("rename from old.txt"));
+                if modified {
+                    assert!(diff.patch.contains("+added line"));
+                }
+            }
+        }
     }
 
     #[test]

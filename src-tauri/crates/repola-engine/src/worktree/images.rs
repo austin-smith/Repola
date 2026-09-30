@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::io::Cursor;
 use std::path::Path;
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
@@ -20,23 +21,33 @@ pub(super) fn image_comparison(
     }
 }
 
-pub(super) fn image_preview(bytes: &[u8], label: &str) -> ImageVersion {
+pub(super) fn image_preview(bytes: &[u8], label: &str, require_decodable: bool) -> ImageVersion {
     if bytes.len() as u64 > MAX_IMAGE_PREVIEW_BYTES {
         return ImageVersion::TooLarge;
     }
-    let mime_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        "image/png"
+    let (mime_type, format) = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        ("image/png", image::ImageFormat::Png)
     } else if bytes.starts_with(b"\xff\xd8\xff") {
-        "image/jpeg"
+        ("image/jpeg", image::ImageFormat::Jpeg)
     } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        "image/gif"
+        ("image/gif", image::ImageFormat::Gif)
     } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        "image/webp"
+        ("image/webp", image::ImageFormat::WebP)
     } else if bytes.starts_with(b"BM") {
-        "image/bmp"
+        ("image/bmp", image::ImageFormat::Bmp)
     } else {
         return ImageVersion::Unsupported;
     };
+    // Git emits 0/0 numstat for a pure image rename. Before overriding its text
+    // classification, validate the raster; text can share short signatures (BM).
+    // The reader's allocation limits bound decoding as well as the byte limit above.
+    if require_decodable
+        && image::ImageReader::with_format(Cursor::new(bytes), format)
+            .decode()
+            .is_err()
+    {
+        return ImageVersion::Unsupported;
+    }
     ImageVersion::Preview(ImagePreview {
         mime_type: mime_type.into(),
         base64: BASE64_STANDARD.encode(bytes),
@@ -50,6 +61,7 @@ pub(super) fn revision_image_preview(
     revision: &str,
     path: &GitPath,
     label: &str,
+    require_decodable: bool,
 ) -> Result<ImageVersion, String> {
     let mut object = OsString::from(revision);
     object.push(":");
@@ -81,7 +93,14 @@ pub(super) fn revision_image_preview(
     if !blob.status.success() {
         return Ok(ImageVersion::Missing);
     }
-    Ok(image_preview(&blob.stdout, label))
+    Ok(image_preview(&blob.stdout, label, require_decodable))
+}
+
+#[cfg(test)]
+pub(super) fn test_png(suffix: &[u8]) -> Vec<u8> {
+    let mut bytes = BASE64_STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGO44+YGAANqAWmzbfR3AAAAAElFTkSuQmCC").unwrap();
+    bytes.extend_from_slice(suffix);
+    bytes
 }
 
 #[cfg(test)]
@@ -98,7 +117,7 @@ mod tests {
             (b"RIFF\0\0\0\0WEBP", "image/webp"),
             (b"BM\0bmp", "image/bmp"),
         ] {
-            let ImageVersion::Preview(preview) = image_preview(bytes, "Before") else {
+            let ImageVersion::Preview(preview) = image_preview(bytes, "Before", false) else {
                 panic!("expected image preview")
             };
             assert_eq!(preview.mime_type, mime_type);
@@ -107,13 +126,64 @@ mod tests {
             assert_eq!(BASE64_STANDARD.decode(preview.base64).unwrap(), bytes);
         }
         assert!(matches!(
-            image_preview(b"binary\0data", "Before"),
+            image_preview(b"binary\0data", "Before", false),
             ImageVersion::Unsupported
         ));
         assert!(matches!(
-            image_preview(b"RIFF\0\0\0\0WAVE", "Before"),
+            image_preview(b"RIFF\0\0\0\0WAVE", "Before", false),
             ImageVersion::Unsupported
         ));
+    }
+
+    #[test]
+    fn text_classification_requires_a_decodable_raster_before_promotion() {
+        for prefix in ["BM", "GIF87a", "GIF89a", "RIFFtextWEBP"] {
+            let text = format!(
+                "{prefix} ordinary text\n{}",
+                "unchanged text line\n".repeat(8)
+            );
+            assert!(matches!(
+                image_preview(text.as_bytes(), "Before", true),
+                ImageVersion::Unsupported
+            ));
+        }
+        assert!(matches!(
+            image_preview(b"\x89PNG\r\n\x1a\n\0not a raster", "Before", true),
+            ImageVersion::Unsupported
+        ));
+        let bytes = test_png(b"image");
+        let ImageVersion::Preview(preview) = image_preview(&bytes, "Before", true) else {
+            panic!("valid raster was not recognized")
+        };
+        assert_eq!(BASE64_STANDARD.decode(&preview.base64).unwrap(), bytes);
+    }
+
+    #[test]
+    fn validated_previews_support_each_raster_format() {
+        let pixel = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            1,
+            1,
+            image::Rgb([255, 0, 0]),
+        ));
+        for (format, mime_type) in [
+            (image::ImageFormat::Png, "image/png"),
+            (image::ImageFormat::Jpeg, "image/jpeg"),
+            (image::ImageFormat::Gif, "image/gif"),
+            (image::ImageFormat::WebP, "image/webp"),
+            (image::ImageFormat::Bmp, "image/bmp"),
+        ] {
+            let mut bytes = Cursor::new(Vec::new());
+            pixel.write_to(&mut bytes, format).unwrap();
+            let ImageVersion::Preview(preview) = image_preview(bytes.get_ref(), "Before", true)
+            else {
+                panic!("valid {format:?} image was not recognized")
+            };
+            assert_eq!(preview.mime_type, mime_type);
+            assert_eq!(
+                BASE64_STANDARD.decode(preview.base64).unwrap(),
+                *bytes.get_ref()
+            );
+        }
     }
 
     #[test]
@@ -121,15 +191,15 @@ mod tests {
         let mut bytes = vec![0; MAX_IMAGE_PREVIEW_BYTES as usize];
         bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
         let comparison = image_comparison(
-            image_preview(&bytes, "Before"),
-            image_preview(&bytes, "After"),
+            image_preview(&bytes, "Before", false),
+            image_preview(&bytes, "After", false),
         )
         .unwrap();
         let serialized = serde_json::to_vec(&comparison).unwrap();
         assert!(serialized.len() < crate::protocol::MAX_FRAME_BYTES);
         bytes.push(0);
         assert!(matches!(
-            image_preview(&bytes, "After"),
+            image_preview(&bytes, "After", false),
             ImageVersion::TooLarge
         ));
         assert_eq!(

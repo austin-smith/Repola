@@ -257,11 +257,12 @@ fn file_diff_with_options(
                 head,
                 change.previous_path.as_ref().unwrap_or(&change.path),
                 "HEAD",
+                !binary,
             )?
         } else {
             ImageVersion::Missing
         };
-        image_comparison(before, worktree_image_preview(&worktree, change)?)
+        image_comparison(before, worktree_image_preview(&worktree, change, !binary)?)
     } else {
         None
     };
@@ -297,7 +298,11 @@ fn file_diff_with_options(
     })
 }
 
-fn worktree_image_preview(worktree: &Path, change: &FileChange) -> Result<ImageVersion, String> {
+fn worktree_image_preview(
+    worktree: &Path,
+    change: &FileChange,
+    require_decodable: bool,
+) -> Result<ImageVersion, String> {
     if change.kind == FileChangeKind::Deleted || change.path.token.is_empty() {
         return Ok(ImageVersion::Missing);
     }
@@ -328,7 +333,7 @@ fn worktree_image_preview(worktree: &Path, change: &FileChange) -> Result<ImageV
                 .read_to_end(&mut bytes)
         })
         .map_err(|error| format!("The image preview could not be read: {error}"))?;
-    Ok(image_preview(&bytes, "Working copy"))
+    Ok(image_preview(&bytes, "Working copy", require_decodable))
 }
 
 pub fn apply_patch_hunk(request: ApplyPatchHunkRequest) -> Result<WorkingCopySnapshot, String> {
@@ -3471,7 +3476,7 @@ mod tests {
     #[test]
     fn image_comparison_preserves_previous_paths_for_pure_renames() {
         let repository = repository();
-        let bytes = b"\x89PNG\r\n\x1a\n\0image";
+        let bytes = &super::super::images::test_png(b"image");
         fs::write(repository.path().join("old logo.png"), bytes).unwrap();
         command::successful_git_at(repository.path(), ["add", "--", "old logo.png"]).unwrap();
         command::successful_git_at(repository.path(), ["commit", "-m", "base"]).unwrap();
@@ -3487,6 +3492,54 @@ mod tests {
         let comparison = image_diff_at(repository.path(), "new logo.png");
         assert_preview_bytes(&comparison.before, bytes, "HEAD");
         assert_preview_bytes(&comparison.after, bytes, "Working copy");
+    }
+
+    #[test]
+    fn renamed_text_with_image_signatures_keeps_textual_diffs() {
+        for prefix in ["BM", "GIF87a", "GIF89a", "RIFFtextWEBP"] {
+            for modified in [false, true] {
+                let repository = repository();
+                let before = format!(
+                    "{prefix} ordinary text\n{}",
+                    "unchanged text line\n".repeat(8)
+                );
+                fs::write(repository.path().join("old.txt"), &before).unwrap();
+                command::successful_git_at(repository.path(), ["add", "--", "old.txt"]).unwrap();
+                command::successful_git_at(repository.path(), ["commit", "-m", "base"]).unwrap();
+                fs::rename(
+                    repository.path().join("old.txt"),
+                    repository.path().join("new.txt"),
+                )
+                .unwrap();
+                if modified {
+                    fs::write(
+                        repository.path().join("new.txt"),
+                        format!("{before}added line\n"),
+                    )
+                    .unwrap();
+                }
+                command::successful_git_at(repository.path(), ["add", "-A", "--"]).unwrap();
+                let snapshot = working_copy_snapshot(request(repository.path())).unwrap();
+                assert_eq!(snapshot.changes[0].kind, FileChangeKind::Renamed);
+                let diff = file_diff(FileDiffRequest {
+                    repository_path: snapshot.repository_path,
+                    worktree_path: snapshot.worktree_path,
+                    path: git_path(b"new.txt"),
+                })
+                .unwrap();
+                assert!(
+                    !diff.binary,
+                    "text starting with {prefix} was classified as binary"
+                );
+                assert!(diff.image.is_none());
+                assert!(diff.patch.contains("rename from old.txt"));
+                if modified {
+                    assert!(diff.patch.contains("+added line"));
+                    assert!(!diff.hunks.is_empty());
+                    assert!(!diff.staged_hunks.is_empty());
+                }
+            }
+        }
     }
 
     #[test]
