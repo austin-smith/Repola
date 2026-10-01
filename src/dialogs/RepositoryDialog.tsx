@@ -9,6 +9,8 @@ import { ActionableGitError } from "../components/ActionableGitError";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import type { MachineProfile } from "../ipc/types";
 import { cloneRepository, createRepository } from "../ipc/worktrees";
+import { RepositoryDropZone } from "../components/RepositoryDropZone";
+import { useRepositoryDrop } from "../app/use-repository-drop";
 
 type RepositoryMode = "add" | "clone" | "create";
 
@@ -16,11 +18,15 @@ export function RepositoryDialog({
   machine,
   onAddExisting,
   onCompleted,
+  onDropRepositories,
+  dropDisabled,
   onClose,
 }: {
   machine: MachineProfile;
   onAddExisting: (path?: string) => Promise<boolean>;
   onCompleted: (repositoryPath: string) => Promise<boolean>;
+  onDropRepositories: (paths: string[]) => Promise<boolean>;
+  dropDisabled: boolean;
   onClose: () => void;
 }) {
   const [mode, setMode] = useState<RepositoryMode>("add");
@@ -31,6 +37,16 @@ export function RepositoryDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const controller = useRef<AbortController | null>(null);
+  const dropEnabled = machine.kind === "local" && mode === "add" && !busy && !dropDisabled;
+  const { ref: dropRef, active: dropActive } = useRepositoryDrop(dropEnabled, async (paths) => {
+    setBusy(true);
+    setError(null);
+    try {
+      if (await onDropRepositories(paths)) onClose();
+    } finally {
+      setBusy(false);
+    }
+  });
 
   const close = () => {
     if (busy) controller.current?.abort();
@@ -101,10 +117,7 @@ export function RepositoryDialog({
                 <FieldDescription>Enter the full path as it exists on {machine.name}.</FieldDescription>
               </Field>
             ) : (
-              <div className="flex flex-col items-center gap-3 border bg-muted/35 p-6 text-center">
-                <FolderOpenIcon className="size-6 text-muted-foreground" aria-hidden="true" />
-                <div><strong className="text-sm">Choose an existing working copy</strong><p className="mt-1 text-sm text-muted-foreground">Repola will inspect the folder without changing the repository.</p></div>
-              </div>
+              <RepositoryDropZone ref={dropRef} active={dropActive} disabled={!dropEnabled} />
             )
           ) : (
             <>
