@@ -1,7 +1,5 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
-  CheckIcon,
-  ChevronDownIcon,
   ChevronRightIcon,
   DatabaseIcon,
   FolderOpenIcon,
@@ -16,9 +14,9 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Combobox, ComboboxCollection, ComboboxContent, ComboboxEmpty, ComboboxGroup, ComboboxInput, ComboboxItem, ComboboxLabel, ComboboxList, ComboboxTrigger, ComboboxValue } from "@/components/ui/combobox";
+import { Combobox, ComboboxCollection, ComboboxContent, ComboboxEmpty, ComboboxGroup, ComboboxInput, ComboboxItem, ComboboxLabel, ComboboxList, ComboboxSeparator, ComboboxTrigger, ComboboxValue } from "@/components/ui/combobox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -30,6 +28,7 @@ import { usePathSeparator } from "../app/environment";
 import { ActionableGitError } from "../components/ActionableGitError";
 import type { HistoryTarget } from "../dialogs/HistoryMutationDialog";
 import { shortSha } from "../domain/format";
+import { matchesRepositoryQuery } from "../domain/repository-picker";
 import { groupWorktreesForPicker, matchesWorktreeQuery, worktreeBranchLabel, worktreeFolderName, type WorktreePickerGroup } from "../domain/worktree-picker";
 import { loadBranches, mutateBranch, revealWorktree } from "../ipc/worktrees";
 import type { BranchInfo, RepositorySummary, WorktreeRecord } from "../ipc/types";
@@ -61,51 +60,12 @@ export function RepositoryToolbar({
     <section className="flex h-16 shrink-0 items-center gap-1 border-b bg-card px-3" aria-label="Working-copy context">
       <div className="flex min-w-0 flex-1 items-center gap-1">
         <span className="sr-only">Current repository and working copy</span>
-          <DropdownMenu>
-            <DropdownMenuTrigger render={<Button id="current-repository" variant="ghost" className="w-56 justify-between font-medium" aria-label="Current repository" />}>
-              <span className="flex min-w-0 items-center gap-1.5">
-                <DatabaseIcon data-icon="inline-start" aria-hidden="true" />
-                <span className="truncate">{repository?.name ?? "Select a repository…"}</span>
-              </span>
-              <ChevronDownIcon data-icon="inline-end" className="text-muted-foreground" aria-hidden="true" />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent className="min-w-64" align="start">
-              <DropdownMenuGroup>
-                {repositories.map((item) => (
-                  <DropdownMenuItem key={item.path} onClick={() => onRepositoryChange(item.path)}>
-                    <span className="flex min-w-0 flex-1 items-center gap-2">
-                      <span className="min-w-0 flex-1 truncate">{item.name}</span>
-                      {item.path === repository?.path ? <CheckIcon aria-hidden="true" /> : null}
-                    </span>
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuGroup>
-              <DropdownMenuSeparator />
-              <DropdownMenuGroup>
-                <DropdownMenuItem onClick={onAddRepository}>
-                  <FolderPlusIcon aria-hidden="true" />
-                  Add Repository…
-                </DropdownMenuItem>
-                {machineKind === "local" && repository ? (
-                  <DropdownMenuItem onClick={() => { void revealWorktree(repository.path).catch((cause: unknown) => toast.add({ type: "error", title: `Could not show the repository in ${fileManagerName()}`, description: toMessage(cause) })); }}>
-                    <FolderOpenIcon aria-hidden="true" />
-                    Show in {fileManagerName()}
-                  </DropdownMenuItem>
-                ) : null}
-              </DropdownMenuGroup>
-              {repository ? (
-                <>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuGroup>
-                    <DropdownMenuItem variant="destructive" onClick={() => setPendingRepositoryRemoval(true)}>
-                      <Trash2Icon aria-hidden="true" />
-                      Remove from Repola…
-                    </DropdownMenuItem>
-                  </DropdownMenuGroup>
-                </>
-              ) : null}
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <RepositoryPicker
+            repositories={repositories}
+            onRepositoryChange={onRepositoryChange}
+            onAddRepository={onAddRepository}
+            onRemoveRepository={() => setPendingRepositoryRemoval(true)}
+          />
           <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
           <WorktreePicker worktrees={worktrees} onWorktreeChange={onWorktreeChange} />
           <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
@@ -133,6 +93,99 @@ export function RepositoryToolbar({
         </DialogContent>
       </Dialog>
     </section>
+  );
+}
+
+type RepositoryAction = { action: "add" | "reveal" | "remove"; label: string };
+type RepositoryPickerItem = RepositorySummary | RepositoryAction;
+
+const isRepositoryAction = (item: RepositoryPickerItem): item is RepositoryAction => "action" in item;
+
+function RepositoryPicker({
+  repositories,
+  onRepositoryChange,
+  onAddRepository,
+  onRemoveRepository,
+}: {
+  repositories: RepositorySummary[];
+  onRepositoryChange: (path: string) => void;
+  onAddRepository: () => void;
+  onRemoveRepository: () => void;
+}) {
+  const { machineKind, repository } = useRepositoryContext();
+  const [query, setQuery] = useState("");
+  const actions = useMemo<RepositoryAction[]>(() => [
+    { action: "add", label: "Add Repository…" },
+    ...(machineKind === "local" && repository ? [{ action: "reveal" as const, label: `Show in ${fileManagerName()}` }] : []),
+    ...(repository ? [{ action: "remove" as const, label: "Remove from Repola…" }] : []),
+  ], [machineKind, repository]);
+  const matches = useMemo(() => repositories.filter((item) => matchesRepositoryQuery(item, query)), [repositories, query]);
+  const selected = repositories.find((item) => item.path === repository?.path) ?? null;
+
+  const runAction = ({ action }: RepositoryAction) => {
+    if (action === "add") onAddRepository();
+    else if (action === "remove") onRemoveRepository();
+    else if (repository) {
+      void revealWorktree(repository.path).catch((cause: unknown) => toast.add({ type: "error", title: `Could not show the repository in ${fileManagerName()}`, description: toMessage(cause) }));
+    }
+  };
+
+  return (
+    <Combobox<RepositoryPickerItem>
+      items={[...repositories, ...actions]}
+      filteredItems={[...matches, ...actions]}
+      autoHighlight
+      value={selected}
+      inputValue={query}
+      onInputValueChange={setQuery}
+      onOpenChange={(open) => { if (!open) setQuery(""); }}
+      itemToStringLabel={(item) => isRepositoryAction(item) ? item.label : item.name}
+      itemToStringValue={(item) => isRepositoryAction(item) ? `action:${item.action}` : item.path}
+      isItemEqualToValue={(item, value) => !isRepositoryAction(item) && !isRepositoryAction(value) && item.path === value.path}
+      onValueChange={(value) => {
+        if (!value) return;
+        if (isRepositoryAction(value)) runAction(value);
+        else if (value.path !== repository?.path) onRepositoryChange(value.path);
+      }}
+    >
+      <ComboboxTrigger
+        id="current-repository"
+        render={<Button variant="ghost" className="w-56 justify-between font-medium" aria-label="Current repository" />}
+      >
+        <span className="flex min-w-0 items-center gap-1.5">
+          <DatabaseIcon data-icon="inline-start" aria-hidden="true" />
+          <span className="truncate">
+            <ComboboxValue placeholder="Select a repository…" />
+          </span>
+        </span>
+      </ComboboxTrigger>
+      <ComboboxContent className="w-auto min-w-64 max-w-[min(28rem,var(--available-width))]">
+        <ComboboxInput showTrigger={false} placeholder="Filter repositories" aria-label="Filter repositories" />
+        <ComboboxList className="max-h-[min(40rem,calc(var(--available-height)---spacing(9)))]">
+          {matches.length === 0 ? (
+            <div className="py-2 text-center text-sm text-muted-foreground">
+              {repositories.length === 0 ? "No repositories added." : "No repositories match."}
+            </div>
+          ) : matches.map((item) => (
+            <ComboboxItem key={item.path} value={item}>
+              <span className="min-w-0 flex-1 truncate">{item.name}</span>
+            </ComboboxItem>
+          ))}
+          <ComboboxSeparator />
+          {actions.map((item) => (
+            <ComboboxItem
+              key={item.action}
+              value={item}
+              data-variant={item.action === "remove" ? "destructive" : undefined}
+              className="data-[variant=destructive]:text-destructive data-[variant=destructive]:data-highlighted:bg-destructive/10 data-[variant=destructive]:data-highlighted:text-destructive dark:data-[variant=destructive]:data-highlighted:bg-destructive/20 data-[variant=destructive]:*:[svg]:text-destructive"
+            >
+              {item.action === "add" ? <FolderPlusIcon aria-hidden="true" /> : item.action === "reveal" ? <FolderOpenIcon aria-hidden="true" /> : <Trash2Icon aria-hidden="true" />}
+              {item.label}
+            </ComboboxItem>
+          ))}
+        </ComboboxList>
+      </ComboboxContent>
+    </Combobox>
   );
 }
 
