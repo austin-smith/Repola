@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CopyIcon, FolderOpenIcon, FolderPlusIcon, PlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -9,6 +9,8 @@ import { ActionableGitError } from "../components/ActionableGitError";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import type { MachineProfile } from "../ipc/types";
 import { cloneRepository, createRepository } from "../ipc/worktrees";
+import { RepositoryDropZone } from "../components/RepositoryDropZone";
+import { useRepositoryDrop } from "../app/use-repository-drop";
 
 type RepositoryMode = "add" | "clone" | "create";
 
@@ -16,11 +18,15 @@ export function RepositoryDialog({
   machine,
   onAddExisting,
   onCompleted,
+  onDropRepositories,
+  dropDisabled,
   onClose,
 }: {
   machine: MachineProfile;
   onAddExisting: (path?: string) => Promise<boolean>;
   onCompleted: (repositoryPath: string) => Promise<boolean>;
+  onDropRepositories: (paths: string[]) => Promise<boolean>;
+  dropDisabled: boolean;
   onClose: () => void;
 }) {
   const [mode, setMode] = useState<RepositoryMode>("add");
@@ -29,11 +35,35 @@ export function RepositoryDialog({
   const [existingPath, setExistingPath] = useState("");
   const [initialBranch, setInitialBranch] = useState("main");
   const [busy, setBusy] = useState(false);
+  const [dropping, setDropping] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const controller = useRef<AbortController | null>(null);
+  const dropLifetime = useRef<AbortController | null>(null);
+  useEffect(() => () => { dropLifetime.current?.abort(); }, []);
+  const dropEnabled = machine.kind === "local" && mode === "add" && !busy && !dropDisabled;
+  const { ref: dropRef, active: dropActive } = useRepositoryDrop(dropEnabled, async (paths) => {
+    // This signal only guards dialog completion; App owns the accepted addition.
+    const lifetime = new AbortController();
+    dropLifetime.current = lifetime;
+    setBusy(true);
+    setDropping(true);
+    setError(null);
+    try {
+      if (await onDropRepositories(paths) && !lifetime.signal.aborted) onClose();
+    } finally {
+      if (dropLifetime.current === lifetime) dropLifetime.current = null;
+      if (!lifetime.signal.aborted) {
+        setBusy(false);
+        setDropping(false);
+      }
+    }
+  });
 
   const close = () => {
-    if (busy) controller.current?.abort();
+    if (dropping) {
+      dropLifetime.current?.abort();
+      onClose();
+    } else if (busy) controller.current?.abort();
     else onClose();
   };
 
@@ -79,7 +109,7 @@ export function RepositoryDialog({
 
   return (
     <Dialog open onOpenChange={(open) => { if (!open) close(); }}>
-      <DialogContent className="sm:max-w-lg" showCloseButton={!busy}>
+      <DialogContent className="sm:max-w-lg" showCloseButton={!busy || dropping}>
         <form className="contents" onSubmit={(event) => void submit(event)}>
           <DialogHeader>
             <DialogTitle>{machine.kind === "local" ? "Add Repository" : `Add Repository on ${machine.name}`}</DialogTitle>
@@ -101,10 +131,7 @@ export function RepositoryDialog({
                 <FieldDescription>Enter the full path as it exists on {machine.name}.</FieldDescription>
               </Field>
             ) : (
-              <div className="flex flex-col items-center gap-3 border bg-muted/35 p-6 text-center">
-                <FolderOpenIcon className="size-6 text-muted-foreground" aria-hidden="true" />
-                <div><strong className="text-sm">Choose an existing working copy</strong><p className="mt-1 text-sm text-muted-foreground">Repola will inspect the folder without changing the repository.</p></div>
-              </div>
+              <RepositoryDropZone ref={dropRef} active={dropActive} disabled={!dropEnabled} />
             )
           ) : (
             <>
@@ -128,8 +155,9 @@ export function RepositoryDialog({
             </>
           )}
           {error ? <ActionableGitError message={error} /> : null}
+          {dropping ? <p role="status" className="text-sm text-muted-foreground">Repository addition continues in the workspace after you close this dialog.</p> : null}
           <DialogFooter>
-            <Button type="button" variant="outline" onClick={close}>{busy ? "Cancel operation" : "Cancel"}</Button>
+            <Button type="button" variant="outline" onClick={close}>{dropping ? "Close dialog" : busy ? "Cancel operation" : "Cancel"}</Button>
             <Button type="submit" disabled={submitDisabled}>
               {busy ? <Spinner data-icon="inline-start" /> : mode === "clone" ? <CopyIcon data-icon="inline-start" aria-hidden="true" /> : mode === "create" ? <PlusIcon data-icon="inline-start" aria-hidden="true" /> : <FolderPlusIcon data-icon="inline-start" aria-hidden="true" />}
               {busy ? "Working…" : mode === "clone" ? "Clone Repository" : mode === "create" ? "Create Repository" : machine.kind === "ssh" ? "Add Repository" : "Choose Repository…"}

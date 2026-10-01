@@ -18,6 +18,8 @@ describe("RepositoryDialog", () => {
         machine={localMachine}
         onAddExisting={vi.fn()}
         onCompleted={vi.fn()}
+        onDropRepositories={vi.fn()}
+        dropDisabled={false}
         onClose={vi.fn()}
       />,
     );
