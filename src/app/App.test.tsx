@@ -160,6 +160,29 @@ describe("repository drop entry points", () => {
     expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({ type: "warning", description: "Not a Git working copy" }));
   });
 
+  it.each(["footer", "escape", "close button"])("dismisses a pending drop with %s without closing a reopened dialog", async (control) => {
+    let complete!: (repository: string) => void;
+    mocks.resolve.mockImplementationOnce(() => new Promise<string>((resolve) => { complete = resolve; }));
+    renderApp();
+    await screen.findByText("No repositories yet");
+    fireEvent.click(screen.getByRole("button", { name: "Add Repository…" }));
+    const target = await screen.findByRole("region", { name: "Drop repositories" });
+    act(() => dropOn(target));
+    expect(screen.queryByRole("button", { name: "Cancel operation" })).not.toBeInTheDocument();
+    expect(screen.getByText("Repository addition continues in the workspace after you close this dialog.")).toHaveAttribute("role", "status");
+    if (control === "escape") fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    else fireEvent.click(screen.getByRole("button", { name: control === "footer" ? "Close dialog" : "Close" }));
+    expect(screen.queryByRole("heading", { name: "Add Repository" })).not.toBeInTheDocument();
+
+    // The menu can reopen onboarding while App finishes the accepted drop.
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    fireEvent.click(screen.getByRole("option", { name: /Add Repository/ }));
+    await screen.findByRole("heading", { name: "Add Repository" });
+    await act(async () => complete("repository"));
+    expect(mocks.register).toHaveBeenCalledExactlyOnceWith("local", "repository");
+    expect(screen.getByRole("heading", { name: "Add Repository" })).toBeInTheDocument();
+  });
+
   it("never enables local file drops for a remote machine", async () => {
     mocks.loadContext.mockResolvedValue({ ...context, selectedMachineId: "remote" });
     renderApp();
