@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   check: vi.fn(),
@@ -11,6 +11,7 @@ vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: mocks.relaunch }));
 vi.mock("@tauri-apps/plugin-updater", () => ({ check: mocks.check }));
 
 describe("updater coordinator", () => {
+  afterEach(() => vi.unstubAllEnvs());
   beforeEach(() => {
     vi.resetModules();
     mocks.check.mockReset();
@@ -71,5 +72,16 @@ describe("updater coordinator", () => {
     const updater = await import("./updater");
     await updater.checkForUpdates(false);
     expect(updater.getUpdaterState()).toEqual({ status: "idle" });
+  });
+
+  it("closes a cross-channel offer before it can become installable", async () => {
+    vi.stubEnv("VITE_REPOLA_RELEASE_CHANNEL", "stable");
+    const update = { version: "0.2.0-nightly.123", close: vi.fn(async () => undefined) };
+    mocks.check.mockResolvedValue(update);
+    const updater = await import("./updater");
+    await updater.checkForUpdates();
+    expect(update.close).toHaveBeenCalledOnce();
+    expect(updater.getUpdaterState()).toMatchObject({ status: "error", context: "check" });
+    expect(updater.getUpdaterState()).not.toHaveProperty("version", update.version);
   });
 });

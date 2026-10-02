@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { TooltipButton } from "@/components/tooltip-button";
 import { Spinner } from "@/components/ui/spinner";
 import { checkForUpdates, installAvailableUpdate, useUpdaterState } from "./updater";
+import { releaseLabel } from "./release";
 
 function progressLabel(downloadedBytes: number, totalBytes: number | null): string {
   const downloaded = Math.max(0, downloadedBytes);
@@ -79,6 +80,7 @@ export function UpdateSettings() {
     <div className="flex items-start justify-between gap-4 border bg-card p-3">
       <div className="min-w-0">
         <strong className="text-sm">Software updates</strong>
+        <p className="mt-1 text-xs text-muted-foreground">{releaseLabel}</p>
         <p className={`mt-1 text-xs ${updater.status === "error" ? "text-destructive" : "text-muted-foreground"}`}>
           {updater.status === "checking" ? "Checking the signed release channel…"
             : updater.status === "upToDate" ? "Repola is up to date."

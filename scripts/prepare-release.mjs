@@ -1,13 +1,13 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-
-const repository = "austin-smith/repola";
+import { readJson, repository, updateBaseUrl, validateRelease } from "./release-utils.mjs";
 
 function normalizedBase64(value) {
   return value.replace(/=+$/, "");
 }
 
-export function buildReleaseConfig({ environment, packageJson, tauriConfig, cargoManifest }) {
+export function buildReleaseConfig({ environment, packageJson, tauriConfig, cargoManifest, release }) {
+  validateRelease(release);
   const required = (name) => {
     const value = environment[name]?.trim();
     if (!value) throw new Error(`Release configuration requires ${name}.`);
@@ -18,22 +18,18 @@ export function buildReleaseConfig({ environment, packageJson, tauriConfig, carg
   const workspacePackage = cargoManifest.match(/^\[workspace\.package\]\s*\n([\s\S]*?)(?=^\[|(?![\s\S]))/m)?.[1] ?? "";
   const cargoVersion = workspacePackage.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
   const version = packageJson.version;
-  if (!version || version !== tauriConfig.version || version !== cargoVersion) {
+  if (!version || version !== tauriConfig.version || version !== cargoVersion || version !== release.version) {
     throw new Error(
       `Release versions must match (package=${version ?? "missing"}, Tauri=${tauriConfig.version ?? "missing"}, Cargo=${cargoVersion ?? "missing"}).`,
     );
   }
 
   const githubRepository = required("GITHUB_REPOSITORY");
-  if (githubRepository !== repository) {
+  if (githubRepository.toLowerCase() !== repository.toLowerCase()) {
     throw new Error(`Release builds are pinned to ${repository}; received ${githubRepository}.`);
   }
-  if (required("GITHUB_REF_TYPE") !== "tag") {
-    throw new Error("Release builds must run from an existing version tag.");
-  }
-  const refName = required("GITHUB_REF_NAME");
-  if (refName !== `v${version}`) {
-    throw new Error(`Release tag ${refName} does not match application version v${version}.`);
+  if (required("GITHUB_REF") !== release.sourceRef || required("REPOLA_RELEASE_SHA") !== release.sha) {
+    throw new Error("Release source must match the validated workflow metadata.");
   }
 
   const publicKey = required("REPOLA_SIGNING_PUBLIC_KEY");
@@ -67,7 +63,8 @@ export function buildReleaseConfig({ environment, packageJson, tauriConfig, carg
     plugins: {
       updater: {
         pubkey: publicKey,
-        endpoints: [`https://github.com/${repository}/releases/latest/download/latest.json`],
+        requireSignedVersion: true,
+        endpoints: [`${updateBaseUrl}/${release.channel}.json`],
       },
     },
   };
@@ -75,6 +72,7 @@ export function buildReleaseConfig({ environment, packageJson, tauriConfig, carg
   const runnerOs = required("RUNNER_OS");
   if (runnerOs === "macOS") {
     const signingIdentity = required("APPLE_SIGNING_IDENTITY");
+    if (signingIdentity === "-") throw new Error("macOS releases require a Developer ID identity, not ad-hoc signing.");
     required("APPLE_CERTIFICATE");
     required("APPLE_CERTIFICATE_PASSWORD");
     const hasAppleId = Boolean(
@@ -87,20 +85,25 @@ export function buildReleaseConfig({ environment, packageJson, tauriConfig, carg
       throw new Error("macOS release builds require either Apple ID notarization credentials or App Store Connect API credentials.");
     }
     releaseConfig.bundle.macOS = { signingIdentity };
+    releaseConfig.bundle.targets = ["app", "dmg"];
   } else if (runnerOs === "Windows") {
     releaseConfig.bundle.windows = { signCommand: required("REPOLA_WINDOWS_SIGN_COMMAND") };
-  } else if (runnerOs !== "Linux") {
+    releaseConfig.bundle.targets = ["nsis"];
+  } else if (runnerOs === "Linux") {
+    releaseConfig.bundle.targets = ["appimage", "deb"];
+  } else {
     throw new Error(`Unsupported release runner operating system: ${runnerOs}.`);
   }
 
   return releaseConfig;
 }
 
-export async function prepareRelease(environment = process.env) {
+export async function prepareRelease(environment = process.env, metadataPath = new URL("../.release/release.json", import.meta.url)) {
+  const release = await readJson(metadataPath);
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const tauriConfig = JSON.parse(await readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
   const cargoManifest = await readFile(new URL("../src-tauri/Cargo.toml", import.meta.url), "utf8");
-  const releaseConfig = buildReleaseConfig({ environment, packageJson, tauriConfig, cargoManifest });
+  const releaseConfig = buildReleaseConfig({ environment, packageJson, tauriConfig, cargoManifest, release });
   await writeFile(
     new URL("../src-tauri/tauri.release.conf.json", import.meta.url),
     `${JSON.stringify(releaseConfig, null, 2)}\n`,
@@ -110,5 +113,5 @@ export async function prepareRelease(environment = process.env) {
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
-  await prepareRelease();
+  await prepareRelease(process.env, process.argv[2]);
 }
