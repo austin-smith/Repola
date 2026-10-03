@@ -79,6 +79,48 @@ describe.skipIf(!available)("Windows release signing", () => {
     expect(result.stderr).toMatch(/unexpected SHA256 digest/);
   });
 
+  it.each(["Valid", "NotSigned"])("verifies the packaged executable with status %s and cleans up extraction", (status) => {
+    const result = run(`
+      $script:calls = [System.Collections.Generic.List[string]]::new()
+      function Invoke-SigningTool { }
+      function Get-AuthenticodeSignature {
+        param($LiteralPath)
+        $script:calls.Add($LiteralPath)
+        $status = if ([IO.Path]::GetFileName($LiteralPath) -eq 'repola.exe') { ${quote(status)} } else { 'Valid' }
+        return [pscustomobject]@{ Status = $status; SignatureType = 'Authenticode'; TimeStamperCertificate = 'timestamp' }
+      }
+      function 7z {
+        if ($args[-1] -ne ${quote(file)}) { throw 'Installer argument changed' }
+        $output = ($args | Where-Object { $_.StartsWith('-o') }).Substring(2)
+        [IO.File]::WriteAllText((Join-Path $output 'repola.exe'), 'packaged fixture')
+        $global:LASTEXITCODE = 0
+      }
+      $failure = $null
+      try { Assert-WindowsInstaller ${quote(file)} } catch { $failure = $_.Exception.Message }
+      [pscustomobject]@{ calls = @($script:calls); failure = $failure; directories = @(Get-ChildItem -LiteralPath ${quote(directory)} -Directory).Count } | ConvertTo-Json -Compress
+    `, { RUNNER_TEMP: directory });
+    expect(result.status, result.stderr).toBe(0);
+    const output = JSON.parse(result.stdout.trim());
+    expect(output.calls[0]).toBe(file);
+    expect(output.calls[1]).toMatch(/repola\.exe$/);
+    expect(output.directories).toBe(0);
+    if (status === "Valid") expect(output.failure).toBeNull();
+    else expect(output.failure).toMatch(/Invalid embedded Authenticode signature/);
+  });
+
+  it("stops on extraction failure and removes only its temporary directory", () => {
+    const result = run(`
+      function Assert-WindowsSignature { }
+      function 7z { $global:LASTEXITCODE = 2 }
+      try { Assert-WindowsInstaller ${quote(file)} } finally {
+        if (-not (Test-Path -LiteralPath ${quote(file)})) { throw 'Removed input installer' }
+        if (@(Get-ChildItem -LiteralPath ${quote(directory)} -Directory).Count -ne 0) { throw 'Leaked extraction directory' }
+      }
+    `, { RUNNER_TEMP: directory });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/Installer extraction failed with exit code 2/);
+  });
+
   it.runIf(process.platform === "win32")("rejects a real unsigned file using Windows Authenticode validation", () => {
     const result = run(`Assert-WindowsSignature ${quote(file)}`);
     expect(result.status).not.toBe(0);

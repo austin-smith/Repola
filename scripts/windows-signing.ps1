@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('prepare', 'sign', 'verify')]
+    [ValidateSet('prepare', 'sign', 'verify', 'verify-installer')]
     [string]$Operation,
     [string[]]$FilePath
 )
@@ -50,6 +50,22 @@ function Assert-WindowsSignature([string]$Path) {
     Invoke-SigningTool -Arguments @('verify', '/pa', '/all', '/tw', $resolved)
 }
 
+function Assert-WindowsInstaller([string]$Path) {
+    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    Assert-WindowsSignature $resolved
+    $directory = Join-Path (Get-RequiredSigningEnvironment 'RUNNER_TEMP') "repola-installer-verification-$([Guid]::NewGuid())"
+    New-Item -Path $directory -ItemType Directory | Out-Null
+    try {
+        & 7z x '-y' "-o$directory" '--' $resolved
+        if ($LASTEXITCODE -ne 0) { throw "Installer extraction failed with exit code $LASTEXITCODE." }
+        $applications = @(Get-ChildItem -LiteralPath $directory -Recurse -File -Filter 'repola.exe')
+        if ($applications.Count -ne 1) { throw "Expected one packaged desktop executable; found $($applications.Count)." }
+        Assert-WindowsSignature $applications[0].FullName
+    } finally {
+        Remove-Item -LiteralPath $directory -Recurse -Force
+    }
+}
+
 function Initialize-WindowsSigning {
     $endpoint = [Uri](Get-RequiredSigningEnvironment 'AZURE_TRUSTED_SIGNING_ENDPOINT')
     if ($endpoint.Scheme -ne 'https' -or -not $endpoint.Host.EndsWith('.codesigning.azure.net') -or
@@ -92,6 +108,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         if (-not $FilePath -or $FilePath.Count -eq 0) { throw 'Specify at least one file to sign or verify.' }
         foreach ($file in $FilePath) {
             if ($Operation -eq 'sign') { Sign-WindowsFile $file }
+            elseif ($Operation -eq 'verify-installer') { Assert-WindowsInstaller $file }
             else { Assert-WindowsSignature $file }
         }
     }
