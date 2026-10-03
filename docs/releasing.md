@@ -1,8 +1,16 @@
 # Releasing Repola
 
-Stable tags (`vX.Y.Z`) build a draft for review. Nightlies (`X.Y.Z-nightly.<run-number>`) publish daily at 09:17 UTC, or through **Release → Run workflow → main**. Unchanged nightlies are skipped. Both channels require successful Linux, macOS, and Windows CI at the exact source commit on `main`.
+Stable tags (`vX.Y.Z`) build a draft for review. Nightlies (`X.Y.Z-nightly.<run-number>`) publish daily at 09:17 UTC, or through **Release → Run workflow → main → Publish nightly**. Unchanged nightlies are skipped. Both channels require successful Linux, macOS, and Windows CI at the exact source commit on `main`.
 
 Desktop releases support macOS Apple Silicon and Intel (DMG), Linux x64 (AppImage and Debian package), and Windows x64 (NSIS), with matching agents for each target plus Linux ARM64.
+
+## Build test installers
+
+Run **Build installers** on the desired branch and download the installers from the run's **Artifacts** section. These builds do not publish releases or enable automatic updates. You can also build any branch through **Release** with **Build installers** selected:
+
+```bash
+gh workflow run release.yml --ref <branch> -f operation='Build installers'
+```
 
 ## Setup
 

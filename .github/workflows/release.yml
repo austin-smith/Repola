@@ -6,17 +6,31 @@ on:
   schedule:
     - cron: "17 9 * * *"
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Operation to run for the selected branch
+        required: true
+        type: choice
+        default: Build installers
+        options: [Build installers, Publish nightly]
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: release-build-${{ github.ref }}
+  group: release-build-${{ github.ref }}-${{ inputs.operation || 'release' }}
   cancel-in-progress: false
 
 jobs:
+  build-installers:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'Build installers'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-installers.yml
+
   plan:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation == 'Publish nightly'
     runs-on: ubuntu-latest
     outputs:
       skip: ${{ steps.metadata.outputs.skip }}
@@ -25,6 +39,12 @@ jobs:
       tag: ${{ steps.metadata.outputs.tag }}
       channel: ${{ steps.metadata.outputs.channel }}
     steps:
+      - name: Require main for manual nightly publication
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          REPOLA_SOURCE_REF: ${{ github.ref }}
+        run: test "$REPOLA_SOURCE_REF" = refs/heads/main
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
