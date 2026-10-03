@@ -1,6 +1,8 @@
+import type { ComponentProps } from "react";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RepositorySummary, WorktreeRecord } from "../ipc/types";
+import { fileManagerName } from "../domain/platform";
 import { RepositoryProvider } from "./context";
 import { RepositoryToolbar } from "./RepositoryToolbar";
 
@@ -43,43 +45,76 @@ function worktree(path: string, branch: string, isPrimary = false): WorktreeReco
   };
 }
 
+function renderToolbar(overrides: Partial<ComponentProps<typeof RepositoryToolbar>> = {}) {
+  return render(
+    <RepositoryProvider value={{
+      machineId: "local",
+      machineKind: "local",
+      machineOs: null,
+      repository,
+      worktree: null,
+      refreshWorkspace: vi.fn(),
+      showChanges: vi.fn(),
+    }}>
+      <RepositoryToolbar
+        repositories={[repository]}
+        worktrees={[]}
+        onRepositoryChange={vi.fn()}
+        onWorktreeChange={vi.fn()}
+        onAddRepository={vi.fn()}
+        onCreateWorktree={vi.fn()}
+        onRemoveRepository={vi.fn()}
+        {...overrides}
+      />
+    </RepositoryProvider>,
+  );
+}
+
 describe("RepositoryToolbar", () => {
   afterEach(cleanup);
 
-  it("puts repository creation in the repository dropdown", () => {
+  it("puts repository actions in the repository picker", () => {
     const onAddRepository = vi.fn();
-
-    render(
-      <RepositoryProvider value={{
-        machineId: "local",
-        machineKind: "local",
-        machineOs: null,
-        repository,
-        worktree: null,
-        refreshWorkspace: vi.fn(),
-        showChanges: vi.fn(),
-      }}>
-        <RepositoryToolbar
-          repositories={[repository]}
-          worktrees={[]}
-          onRepositoryChange={vi.fn()}
-          onWorktreeChange={vi.fn()}
-          onAddRepository={onAddRepository}
-          onCreateWorktree={vi.fn()}
-          onRemoveRepository={vi.fn()}
-        />
-      </RepositoryProvider>,
-    );
+    renderToolbar({ onAddRepository });
 
     expect(screen.queryByRole("button", { name: "Repository actions" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Current repository" }));
-    const menu = screen.getByRole("menu", { name: "Current repository" });
-    expect(within(menu).getByRole("menuitem", { name: "repola" })).toBeInTheDocument();
-    expect(within(menu).queryByText(/worktree|attention|healthy|conflicted|KB|GB/i)).not.toBeInTheDocument();
-    expect(within(menu).getByRole("menuitem", { name: "Remove from Repola…" })).toBeInTheDocument();
-    fireEvent.click(within(menu).getByRole("menuitem", { name: "Add Repository…" }));
+    fireEvent.click(screen.getByRole("combobox", { name: "Current repository" }));
+    const list = screen.getByRole("listbox");
+    expect(within(list).getByRole("option", { name: "repola" })).toBeInTheDocument();
+    expect(within(list).queryByText(/worktree|attention|healthy|conflicted|KB|GB/i)).not.toBeInTheDocument();
+    expect(within(list).getByRole("option", { name: "Remove from Repola…" })).toBeInTheDocument();
+    fireEvent.click(within(list).getByRole("option", { name: "Add Repository…" }));
 
     expect(onAddRepository).toHaveBeenCalledOnce();
+  });
+
+  it("filters repositories by name and switches on selection", () => {
+    const onRepositoryChange = vi.fn();
+    const other = { ...repository, id: "repo-2", name: "t3code", path: "/repos/t3code" };
+    renderToolbar({ repositories: [repository, other], onRepositoryChange });
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Current repository" }));
+    const filter = screen.getByRole("combobox", { name: "Filter repositories" });
+    fireEvent.change(filter, { target: { value: "T3" } });
+    expect(screen.queryByRole("option", { name: "repola" })).not.toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Add Repository…" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "t3code" }));
+
+    expect(onRepositoryChange).toHaveBeenCalledWith("/repos/t3code");
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Current repository" }));
+    expect(screen.getByRole("combobox", { name: "Filter repositories" })).toHaveValue("");
+    expect(screen.getByRole("option", { name: "repola" })).toBeInTheDocument();
+  });
+
+  it("explains when no repository matches the filter", () => {
+    renderToolbar();
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Current repository" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "Filter repositories" }), { target: { value: "missing" } });
+
+    expect(screen.getByText("No repositories match.")).toBeInTheDocument();
+    expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual(["Add Repository…", `Show in ${fileManagerName()}`, "Remove from Repola…"]);
   });
 
   it("filters worktrees by folder name or branch and switches on selection", () => {
@@ -91,27 +126,7 @@ describe("RepositoryToolbar", () => {
       worktree("/worktrees/t3code-64844281", "t3code/investigate-repo-disk-usage"),
     ];
 
-    render(
-      <RepositoryProvider value={{
-        machineId: "local",
-        machineKind: "local",
-        machineOs: null,
-        repository,
-        worktree: null,
-        refreshWorkspace: vi.fn(),
-        showChanges: vi.fn(),
-      }}>
-        <RepositoryToolbar
-          repositories={[repository]}
-          worktrees={worktrees}
-          onRepositoryChange={vi.fn()}
-          onWorktreeChange={onWorktreeChange}
-          onAddRepository={vi.fn()}
-          onCreateWorktree={vi.fn()}
-          onRemoveRepository={vi.fn()}
-        />
-      </RepositoryProvider>,
-    );
+    renderToolbar({ worktrees, onWorktreeChange });
 
     fireEvent.click(screen.getByRole("combobox", { name: "Current worktree" }));
     const list = screen.getByRole("listbox");

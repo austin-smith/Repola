@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   AlertTriangleIcon,
   ClockIcon,
@@ -87,6 +86,8 @@ import { WorktreeDetails, type PullState } from "../workspace/WorktreeDetails";
 import { PaneResizeHandle } from "../workspace/PaneResizeHandle";
 import { LazyDialog } from "../workspace/LazyDialog";
 import { DiffDialog } from "../workspace/lazy";
+import { RepositoryDropZone } from "../components/RepositoryDropZone";
+import { useRepositoryDrop } from "./use-repository-drop";
 
 const stateOptions: { value: StateFilter; label: string }[] = [
   { value: "all", label: "Every state" },
@@ -126,7 +127,6 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [repositoryDialogOpen, setRepositoryDialogOpen] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
-  const [dropActive, setDropActive] = useState(false);
   const [worktreeContext, setWorktreeContext] = useState<{ worktree: WorktreeRecord; x: number; y: number } | null>(null);
   const [createWorktreeOpen, setCreateWorktreeOpen] = useState(false);
   const [repositoriesBusy, setRepositoriesBusy] = useState(false);
@@ -793,47 +793,45 @@ function App() {
     return () => { dispose?.(); };
   }, [performMenuAction]);
 
-  // Keep the drop handler's view of the registered list in a ref so the webview listener
-  // is registered once rather than on every repository add/remove.
-  const registeredRepositoriesRef = useRef(registeredRepositories);
-  useEffect(() => { registeredRepositoriesRef.current = registeredRepositories; }, [registeredRepositories]);
-  const dropEnabled = selectedMachine?.kind === "local";
-  useEffect(() => {
-    if (!dropEnabled) return;
-    let dispose: (() => void) | null = null;
-    void getCurrentWebview().onDragDropEvent((event) => {
-      if (event.payload.type === "enter" || event.payload.type === "over") {
-        setDropActive(true);
-      } else if (event.payload.type === "leave") {
-        setDropActive(false);
-      } else if (event.payload.type === "drop") {
-        setDropActive(false);
-        const droppedPaths = event.payload.paths;
-        void (async () => {
-          const resolved = await Promise.allSettled(droppedPaths.map(resolveDroppedRepository));
-          const repositories = resolved.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
-          if (repositories.length === 0) {
-            const failure = resolved.find((result): result is PromiseRejectedResult => result.status === "rejected");
-            toast.add({ type: "error", title: "No Git repository was added", description: failure ? toMessage(failure.reason) : "Drop a repository folder or a file inside a working copy." });
-            return;
-          }
-          try {
-            let nextRepositories = registeredRepositoriesRef.current ?? [];
-            for (const repository of Array.from(new Set(repositories))) {
-              const result = await registerRepository("local", repository);
-              nextRepositories = result.registeredRepositories;
-            }
-            setRegisteredRepositories(nextRepositories);
-            await refresh("local", nextRepositories);
-            toast.add({ type: "success", title: repositories.length === 1 ? "Repository added" : `${repositories.length} repositories added`, description: repositories.join("\n") });
-          } catch (cause) {
-            toast.add({ type: "error", title: "Could not add dropped repositories", description: toMessage(cause) });
-          }
-        })();
+  const repositoryDropsBlocked = loading || repositoriesBusy || machinesBusy || actionBusy || bulkBusy
+    || settingsOpen || commandPaletteOpen || createWorktreeOpen || bulk !== null || actionPlan !== null || diffWorktree !== null;
+  const addDroppedRepositories = async (paths: string[]): Promise<boolean> => {
+    if (selectedMachine?.kind !== "local" || repositoryDropsBlocked) return false;
+    setRepositoriesBusy(true);
+    try {
+      const resolved = await Promise.allSettled(paths.map((path) => resolveDroppedRepository(path)));
+      const repositories = Array.from(new Set(resolved.flatMap((result) => result.status === "fulfilled" ? [result.value] : [])));
+      const failures = resolved.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (repositories.length === 0) {
+        toast.add({ type: "error", title: "No Git repository was added", description: failures.length ? toMessage(failures[0].reason) : "Drop a repository folder or a file inside a working copy." });
+        return false;
       }
-    }).then((unlisten) => { dispose = unlisten; });
-    return () => { dispose?.(); };
-  }, [dropEnabled, refresh]);
+      if (activeMachineId.current !== "local") return false;
+      let nextRepositories = repositoryPaths;
+      for (const repository of repositories) {
+        const result = await registerRepository("local", repository);
+        nextRepositories = result.registeredRepositories;
+      }
+      // A pending local drop must not replace another machine's inventory.
+      if (activeMachineId.current !== "local") return false;
+      setRegisteredRepositories(nextRepositories);
+      setCurrentRepositoryPath(repositories[0]);
+      setCurrentWorktreePath(null);
+      setWorkspaceView("changes");
+      await refresh("local", nextRepositories);
+      toast.add({ type: "success", title: repositories.length === 1 ? "Repository added" : `${repositories.length} repositories added`, description: repositories.join("\n") });
+      if (failures.length) toast.add({ type: "warning", title: "Some dropped items could not be added", description: failures.map((failure) => toMessage(failure.reason)).join("\n") });
+      return true;
+    } catch (cause) {
+      toast.add({ type: "error", title: "Could not add dropped repositories", description: toMessage(cause) });
+      return false;
+    } finally {
+      setRepositoriesBusy(false);
+    }
+  };
+  const emptyRepositoryDropEnabled = selectedMachine?.kind === "local" && registeredRepositories?.length === 0
+    && !scan && !error && !repositoryDialogOpen && !repositoryDropsBlocked;
+  const { ref: emptyRepositoryDropRef, active: emptyRepositoryDropActive } = useRepositoryDrop(emptyRepositoryDropEnabled, addDroppedRepositories);
 
   useEffect(() => {
     if (!worktreeContext) return;
@@ -866,6 +864,8 @@ function App() {
       machine={selectedMachine}
       onAddExisting={addExistingRepository}
       onCompleted={completeRepositoryOnboarding}
+      onDropRepositories={addDroppedRepositories}
+      dropDisabled={repositoryDropsBlocked}
       onClose={() => setRepositoryDialogOpen(false)}
     />
   ) : null;
@@ -899,15 +899,6 @@ function App() {
         }}
       />
     ) : null}
-    {dropActive && (
-      <div className="pointer-events-none fixed inset-3 z-[100] grid place-items-center border-2 border-dashed border-brand bg-background/90 backdrop-blur-sm">
-        <div className="flex flex-col items-center gap-2 text-center">
-          <FolderPlusIcon className="size-8 text-brand" aria-hidden="true" />
-          <strong>Drop to add repositories</strong>
-          <span className="text-sm text-muted-foreground">Folders and files inside Git working copies are resolved to their repository roots.</span>
-        </div>
-      </div>
-    )}
     {worktreeContext && (
       <div role="menu" aria-label={`Actions for ${worktreeContext.worktree.branch ?? "detached worktree"}`} className="fixed z-[110] min-w-52 border bg-popover p-1 text-popover-foreground shadow-lg" style={{ left: Math.min(worktreeContext.x, window.innerWidth - 225), top: Math.min(worktreeContext.y, window.innerHeight - 190) }} onPointerDown={(event) => event.stopPropagation()}>
         <button role="menuitem" className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent" onClick={() => { const item = worktreeContext.worktree; setWorktreeContext(null); void launchWorktreeTool(selectedMachineId, item.path, "editor").catch((cause: unknown) => toast.add({ type: "error", title: "Could not open editor", description: toMessage(cause) })); }}><Code2Icon className="size-4" aria-hidden="true" />Open in Editor</button>
@@ -948,7 +939,7 @@ function App() {
           selectedMachine={selectedMachine ?? machines[0]}
           selectedMachineId={selectedMachineId}
           connection={selectedConnection}
-          disabled={actionBusy || bulkBusy}
+          disabled={actionBusy || bulkBusy || repositoriesBusy}
           view={workspaceView}
           onMachineChange={switchMachine}
           onRetry={() => void probeMachineConnection(selectedMachineId, true)}
@@ -1011,6 +1002,9 @@ function App() {
                 : "Add an existing Git repository, clone one, or create a new one."}
             </EmptyDescription>
           </EmptyHeader>
+          {selectedMachine?.kind === "local" ? (
+            <RepositoryDropZone ref={emptyRepositoryDropRef} active={emptyRepositoryDropActive} disabled={!emptyRepositoryDropEnabled} className="max-w-sm" />
+          ) : null}
           <Button disabled={repositoriesBusy} onClick={() => setRepositoryDialogOpen(true)}>
             {repositoriesBusy ? <Spinner data-icon="inline-start" /> : <FolderPlusIcon data-icon="inline-start" aria-hidden="true" />}
             {repositoriesBusy ? "Working…" : "Add Repository…"}
