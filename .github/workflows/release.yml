@@ -27,7 +27,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'Build installers'
     permissions:
       contents: read
+      id-token: write
     uses: ./.github/workflows/build-installers.yml
+    secrets: inherit
 
   plan:
     if: github.event_name != 'workflow_dispatch' || inputs.operation == 'Publish nightly'
@@ -188,7 +190,7 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: pnpm tauri build --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json ${{ runner.os == 'Linux' && '--no-sign' || '' }}
+        run: pnpm tauri build --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
       - name: Verify Windows release signatures
         if: runner.os == 'Windows'
         shell: pwsh

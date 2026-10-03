@@ -31,6 +31,20 @@ export function buildReleaseConfig({ environment, packageJson, tauriConfig, carg
     throw new Error("Release source must match the validated workflow metadata.");
   }
 
+  const releaseConfig = buildInstallerConfig(environment);
+  releaseConfig.plugins.updater.endpoints = [`${updateBaseUrl}/${release.channel}.json`];
+  return releaseConfig;
+}
+
+export function buildInstallerConfig(environment) {
+  const required = (name) => {
+    const value = environment[name]?.trim();
+    if (!value) throw new Error(`Release configuration requires ${name}.`);
+    return value;
+  };
+  if (required("GITHUB_REPOSITORY").toLowerCase() !== repository.toLowerCase()) {
+    throw new Error(`Installer builds are pinned to ${repository}.`);
+  }
   const publicKey = required("REPOLA_SIGNING_PUBLIC_KEY");
   required("TAURI_SIGNING_PRIVATE_KEY");
   required("TAURI_SIGNING_PRIVATE_KEY_PASSWORD");
@@ -63,7 +77,7 @@ export function buildReleaseConfig({ environment, packageJson, tauriConfig, carg
       updater: {
         pubkey: publicKey,
         requireSignedVersion: true,
-        endpoints: [`${updateBaseUrl}/${release.channel}.json`],
+        endpoints: [],
       },
     },
   };
@@ -106,11 +120,14 @@ export function buildReleaseConfig({ environment, packageJson, tauriConfig, carg
 }
 
 export async function prepareRelease(environment = process.env, metadataPath = new URL("../.release/release.json", import.meta.url)) {
-  const release = await readJson(metadataPath);
+  const installerBuild = metadataPath === "--installers";
+  const release = installerBuild ? null : await readJson(metadataPath);
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const tauriConfig = JSON.parse(await readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
   const cargoManifest = await readFile(new URL("../src-tauri/Cargo.toml", import.meta.url), "utf8");
-  const releaseConfig = buildReleaseConfig({ environment, packageJson, tauriConfig, cargoManifest, release });
+  const releaseConfig = installerBuild
+    ? buildInstallerConfig(environment)
+    : buildReleaseConfig({ environment, packageJson, tauriConfig, cargoManifest, release });
   await writeFile(
     new URL("../src-tauri/tauri.release.conf.json", import.meta.url),
     `${JSON.stringify(releaseConfig, null, 2)}\n`,

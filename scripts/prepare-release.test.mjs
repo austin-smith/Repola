@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { buildReleaseConfig } from "./prepare-release.mjs";
+import { buildReleaseConfig, buildInstallerConfig } from "./prepare-release.mjs";
 import { planRelease } from "./release-metadata.mjs";
 import { fileURLToPath } from "node:url";
 
@@ -47,6 +47,22 @@ function build(overrides = {}) {
 }
 
 describe("release trust preparation", () => {
+  it("permits a manual installer build from a branch while keeping release source restrictions", () => {
+    const branchEnvironment = environment({ GITHUB_REF: "refs/heads/release-channels", ...windowsSigning });
+    const config = buildInstallerConfig(branchEnvironment);
+    expect(config.bundle.createUpdaterArtifacts).toBe(true);
+    expect(config.bundle.windows.signCommand.cmd).toBe("pwsh");
+    expect(config.plugins.updater).toEqual({ pubkey: publicKey, requireSignedVersion: true, endpoints: [] });
+    expect(() => build({ GITHUB_REF: branchEnvironment.GITHUB_REF })).toThrow(/validated workflow metadata/);
+  });
+
+  it("requires the configured signing trust for installer tests", () => {
+    expect(() => buildInstallerConfig(environment({ GITHUB_REPOSITORY: "another/repola" }))).toThrow(/pinned/);
+    expect(() => buildInstallerConfig(environment({ TAURI_SIGNING_PRIVATE_KEY: "" }))).toThrow(/TAURI_SIGNING_PRIVATE_KEY/);
+    expect(() => buildInstallerConfig(environment({ RUNNER_OS: "macOS" }))).toThrow(/APPLE_SIGNING_IDENTITY/);
+    expect(() => buildInstallerConfig(environment({ RUNNER_OS: "Windows" }))).toThrow(/AZURE_CLIENT_ID/);
+  });
+
   it("generates the pinned updater channel for a tagged Linux release", () => {
     expect(build()).toEqual({
       bundle: {

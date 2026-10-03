@@ -4,9 +4,9 @@ Stable tags (`vX.Y.Z`) create drafts. Nightlies (`X.Y.Z-nightly.<run-number>`) p
 
 Desktop releases support macOS Apple Silicon and Intel (DMG), Linux x64 (AppImage and Debian package), and Windows x64 (NSIS), with matching agents for each target plus Linux ARM64.
 
-## Build test installers
+## Build installers
 
-Run **Release → Run workflow → <branch> → Build installers**. Download the installers from the run's **Artifacts** section. These builds do not publish releases or enable updates.
+Run **Release → Run workflow → <branch> → Build installers**. Download the installers from the run's **Artifacts** section. Builds use the release signing credentials and verify macOS/Windows signing and updater signatures. They do not publish releases or enable updates.
 
 ## Setup
 
