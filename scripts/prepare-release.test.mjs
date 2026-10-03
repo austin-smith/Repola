@@ -2,6 +2,7 @@
 import { describe, expect, it } from "vitest";
 import { buildReleaseConfig } from "./prepare-release.mjs";
 import { planRelease } from "./release-metadata.mjs";
+import { fileURLToPath } from "node:url";
 
 const rawPublicKey = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
 const publicKey = Buffer.from(`untrusted comment: minisign public key\n${rawPublicKey}\n`).toString("base64");
@@ -9,6 +10,16 @@ const packageJson = { version: "0.1.0" };
 const tauriConfig = { version: "0.1.0" };
 const cargoManifest = '[workspace]\nmembers = ["crates/repola-engine"]\n\n[workspace.package]\nversion = "0.1.0"\n\n[package]\nname = "repola"\nversion.workspace = true\n';
 const release = planRelease({ version: "0.1.0", sha: "a".repeat(40), runId: "123", pubDate: "2026-09-30T09:17:00Z", sourceRef: "refs/tags/v0.1.0", tag: "v0.1.0" });
+const windowsSigning = {
+  RUNNER_OS: "Windows",
+  AZURE_CLIENT_ID: "client-id",
+  AZURE_TENANT_ID: "tenant-id",
+  AZURE_SUBSCRIPTION_ID: "subscription-id",
+  AZURE_TRUSTED_SIGNING_ENDPOINT: "https://wus2.codesigning.azure.net",
+  AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: "signing-account",
+  AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME: "public-trust",
+  REPOLA_WINDOWS_SIGNING_DIRECTORY: "C:\\runner temp\\signing",
+};
 
 function environment(overrides = {}) {
   return {
@@ -76,12 +87,24 @@ describe("release trust preparation", () => {
     expect(() => build({ RUNNER_OS: "macOS", APPLE_SIGNING_IDENTITY: "A".repeat(40), APPLE_TEAM_ID: "bad" })).toThrow(/validated Developer ID/);
   });
 
-  it("generates Windows NSIS bundle configuration", () => {
-    expect(build({ RUNNER_OS: "Windows" }).bundle)
+  it("requires native Windows signing and preserves signing command argument boundaries", () => {
+    expect(() => build({ RUNNER_OS: "Windows" })).toThrow(/AZURE_CLIENT_ID/);
+    expect(() => build({ ...windowsSigning, REPOLA_WINDOWS_SIGNING_DIRECTORY: "" })).toThrow(/REPOLA_WINDOWS_SIGNING_DIRECTORY/);
+    expect(build(windowsSigning).bundle)
       .toEqual({
         createUpdaterArtifacts: true,
         targets: ["nsis"],
+        windows: {
+          signCommand: {
+            cmd: "pwsh",
+            args: ["-NoProfile", "-NonInteractive", "-File", fileURLToPath(new URL("./windows-signing.ps1", import.meta.url)), "-Operation", "sign", "-FilePath", "%1"],
+          },
+        },
       });
+  });
+
+  it.each(["http://wus2.codesigning.azure.net", "https://codesigning.azure.net.example.com", "https://wus2.codesigning.azure.net/other", "https://user@wus2.codesigning.azure.net", "https://wus2.codesigning.azure.net:8443"])("rejects an untrusted signing endpoint: %s", (endpoint) => {
+    expect(() => build({ ...windowsSigning, AZURE_TRUSTED_SIGNING_ENDPOINT: endpoint })).toThrow(/regional HTTPS endpoint/);
   });
 
   it("configures complete API-key notarization and explicit macOS bundles", () => {

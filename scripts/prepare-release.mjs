@@ -1,5 +1,5 @@
 import { readFile, writeFile } from "node:fs/promises";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { readJson, repository, updateBaseUrl, validateRelease } from "./release-utils.mjs";
 
 function normalizedBase64(value) {
@@ -80,7 +80,22 @@ export function buildReleaseConfig({ environment, packageJson, tauriConfig, carg
     releaseConfig.bundle.macOS = { signingIdentity, hardenedRuntime: true };
     releaseConfig.bundle.targets = ["app", "dmg"];
   } else if (runnerOs === "Windows") {
+    for (const name of ["AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_SUBSCRIPTION_ID"]) required(name);
+    const endpoint = new URL(required("AZURE_TRUSTED_SIGNING_ENDPOINT"));
+    if (endpoint.protocol !== "https:" || !endpoint.hostname.endsWith(".codesigning.azure.net")
+      || endpoint.username || endpoint.password || endpoint.port || endpoint.search || endpoint.hash || endpoint.pathname !== "/") {
+      throw new Error("Windows releases require an Azure Artifact Signing regional HTTPS endpoint.");
+    }
+    required("AZURE_TRUSTED_SIGNING_ACCOUNT_NAME");
+    required("AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME");
+    required("REPOLA_WINDOWS_SIGNING_DIRECTORY");
     releaseConfig.bundle.targets = ["nsis"];
+    releaseConfig.bundle.windows = {
+      signCommand: {
+        cmd: "pwsh",
+        args: ["-NoProfile", "-NonInteractive", "-File", fileURLToPath(new URL("./windows-signing.ps1", import.meta.url)), "-Operation", "sign", "-FilePath", "%1"],
+      },
+    };
   } else if (runnerOs === "Linux") {
     releaseConfig.bundle.targets = ["appimage", "deb"];
   } else {
