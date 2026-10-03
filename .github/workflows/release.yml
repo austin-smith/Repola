@@ -89,7 +89,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: macOS Apple Silicon
+          - label: macOS arm64
             os: macos-15
             target: aarch64-apple-darwin
             desktop: true
@@ -101,7 +101,7 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             desktop: true
-          - label: Linux ARM64 agent
+          - label: Linux arm64 agent
             os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             desktop: false

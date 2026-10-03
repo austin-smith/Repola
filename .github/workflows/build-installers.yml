@@ -31,7 +31,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: macOS Apple Silicon
+          - label: macOS arm64
             os: macos-15
             target: aarch64-apple-darwin
           - label: Linux x64
