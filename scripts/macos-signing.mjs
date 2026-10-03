@@ -138,7 +138,7 @@ export async function prepareMacosSigning({ environment = process.env, platform 
 export async function verifyMacosRelease({ environment = process.env, platform = process.platform, run = runAppleTool, bundleDirectory } = {}) {
   signingDirectory(environment, platform);
   const target = required(environment, "REPOLA_TARGET");
-  if (!["aarch64-apple-darwin", "x86_64-apple-darwin"].includes(target)) throw new Error("Unsupported macOS release target.");
+  if (target !== "aarch64-apple-darwin") throw new Error("Unsupported macOS release target.");
   const bundle = bundleDirectory ?? join(root, "src-tauri", "target", target, "release", "bundle");
   const app = join(bundle, "macos", "Repola.app");
   await run("codesign", ["--verify", "--deep", "--strict", app]);

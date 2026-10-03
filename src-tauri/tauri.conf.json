@@ -28,8 +28,7 @@
   "plugins": {
     "updater": {
       "endpoints": [],
-      "pubkey": "",
-      "windows": null
+      "pubkey": ""
     }
   },
   "bundle": {

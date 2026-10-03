@@ -2,7 +2,7 @@
 
 Stable tags (`vX.Y.Z`) create drafts. Nightlies (`X.Y.Z-nightly.<run-number>`) publish daily at 09:17 UTC or through **Release → Run workflow → main → Publish nightly**. Unchanged nightlies are skipped. Both channels require passing three-platform CI at the source commit on `main`.
 
-Desktop releases support macOS Apple Silicon and Intel (DMG), Linux x64 (AppImage and Debian package), and Windows x64 (NSIS), with matching agents for each target plus Linux ARM64.
+Desktop releases support macOS Apple Silicon (DMG), Linux x64 (AppImage and Debian package), and Windows x64 (NSIS), with matching agents for each target plus Linux ARM64.
 
 ## Build installers
 

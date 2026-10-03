@@ -49,9 +49,9 @@ describe("release versions and provenance", () => {
 });
 
 describe("complete updater manifests", () => {
-  it("pins all four platforms to immutable matching release assets", () => {
+  it("pins supported platforms to immutable matching release assets", () => {
     const manifest = createUpdaterManifest(stable, signatures, "Changes");
-    expect(Object.keys(manifest.platforms)).toEqual(["darwin-aarch64", "darwin-x86_64", "linux-x86_64", "linux-x86_64-deb", "windows-x86_64"]);
+    expect(Object.keys(manifest.platforms)).toEqual(["darwin-aarch64", "linux-x86_64", "linux-x86_64-deb", "windows-x86_64"]);
     expect(manifest.platforms["linux-x86_64-deb"].url).toMatch(/\.deb$/);
     expect(manifest.platforms["linux-x86_64"].url).toMatch(/\.AppImage$/);
     expect(manifest.platforms["windows-x86_64"].url).toContain("/releases/download/v0.1.0/Repola_0.1.0_x86_64-pc-windows-msvc-setup.exe");

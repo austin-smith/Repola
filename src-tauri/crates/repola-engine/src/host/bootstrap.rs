@@ -33,7 +33,6 @@ enum BootstrapError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RemotePlatform {
     MacArm64,
-    MacX64,
     LinuxArm64,
     LinuxX64,
     WindowsX64,
@@ -43,7 +42,6 @@ impl RemotePlatform {
     fn target(self) -> &'static str {
         match self {
             Self::MacArm64 => "aarch64-apple-darwin",
-            Self::MacX64 => "x86_64-apple-darwin",
             Self::LinuxArm64 => "aarch64-unknown-linux-gnu",
             Self::LinuxX64 => "x86_64-unknown-linux-gnu",
             Self::WindowsX64 => "x86_64-pc-windows-msvc",
@@ -53,16 +51,14 @@ impl RemotePlatform {
     fn executable_suffix(self) -> &'static str {
         match self {
             Self::WindowsX64 => ".exe",
-            Self::MacArm64 | Self::MacX64 | Self::LinuxArm64 | Self::LinuxX64 => "",
+            Self::MacArm64 | Self::LinuxArm64 | Self::LinuxX64 => "",
         }
     }
 
     fn install_command(self) -> &'static str {
         match self {
             Self::WindowsX64 => WINDOWS_INSTALL_COMMAND,
-            Self::MacArm64 | Self::MacX64 | Self::LinuxArm64 | Self::LinuxX64 => {
-                UNIX_INSTALL_COMMAND
-            }
+            Self::MacArm64 | Self::LinuxArm64 | Self::LinuxX64 => UNIX_INSTALL_COMMAND,
         }
     }
 }
@@ -90,10 +86,9 @@ pub(super) fn managed_agent_command(platform: RemotePlatform) -> &'static str {
         RemotePlatform::WindowsX64 => {
             "cmd.exe /d /s /c \"\"%LOCALAPPDATA%\\Repola\\bin\\repola-agent.exe\" --stdio\""
         }
-        RemotePlatform::MacArm64
-        | RemotePlatform::MacX64
-        | RemotePlatform::LinuxArm64
-        | RemotePlatform::LinuxX64 => "exec \"$HOME/.local/bin/repola-agent\" --stdio",
+        RemotePlatform::MacArm64 | RemotePlatform::LinuxArm64 | RemotePlatform::LinuxX64 => {
+            "exec \"$HOME/.local/bin/repola-agent\" --stdio"
+        }
     }
 }
 
@@ -124,7 +119,7 @@ pub(super) fn detect_platform(
     Err(not_ready(
         machine,
         format!(
-            "Repola could not identify a supported remote platform. POSIX probe: {unix_detail}. Windows probe: {windows_detail}. Supported targets are macOS arm64/x64, Linux arm64/x64, and Windows x64."
+            "Repola could not identify a supported remote platform. POSIX probe: {unix_detail}. Windows probe: {windows_detail}. Supported targets are macOS arm64, Linux arm64/x64, and Windows x64."
         ),
     ))
 }
@@ -190,7 +185,6 @@ fn parse_platform_output(output: &[u8]) -> Option<RemotePlatform> {
     }
     match (operating_system.as_str(), architecture.as_str()) {
         ("darwin", "arm64" | "aarch64") => Some(RemotePlatform::MacArm64),
-        ("darwin", "x86_64" | "amd64" | "x64") => Some(RemotePlatform::MacX64),
         ("linux", "arm64" | "aarch64") => Some(RemotePlatform::LinuxArm64),
         ("linux", "x86_64" | "amd64" | "x64") => Some(RemotePlatform::LinuxX64),
         ("windows", "x86_64" | "amd64" | "x64") => Some(RemotePlatform::WindowsX64),
@@ -415,6 +409,14 @@ mod tests {
             parse_platform_output(b"repola-platform:Linux:aarch64\n"),
             Some(RemotePlatform::LinuxArm64)
         );
+    }
+
+    #[test]
+    fn rejects_unsupported_macos_architectures() {
+        for architecture in ["x86_64", "amd64", "x64"] {
+            let output = format!("repola-platform:Darwin:{architecture}\n");
+            assert_eq!(parse_platform_output(output.as_bytes()), None);
+        }
     }
 
     #[test]

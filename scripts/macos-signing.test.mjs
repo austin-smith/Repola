@@ -136,6 +136,13 @@ describe("final macOS installer verification", () => {
     return { ...options, bundleDirectory, environment: { ...options.environment, REPOLA_TARGET: "aarch64-apple-darwin", APPLE_API_KEY_PATH: join(options.directory, "AuthKey.p8"), APPLE_API_KEY: secrets.APPLE_API_KEY_ID, APPLE_API_ISSUER: secrets.APPLE_API_ISSUER_ID } };
   }
 
+  it("rejects unsupported targets before invoking signing tools", async () => {
+    const options = await releaseFixture();
+    options.environment.REPOLA_TARGET = "x86_64-apple-darwin";
+    await expect(verifyMacosRelease(options)).rejects.toThrow(/Unsupported macOS release target/);
+    expect(options.run).not.toHaveBeenCalled();
+  });
+
   it("requires app verification and notarizes the final DMG before stapling and assessing it", async () => {
     const options = await releaseFixture();
     await verifyMacosRelease(options);

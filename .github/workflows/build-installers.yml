@@ -34,9 +34,6 @@ jobs:
           - label: macOS Apple Silicon
             os: macos-15
             target: aarch64-apple-darwin
-          - label: macOS Intel
-            os: macos-15-intel
-            target: x86_64-apple-darwin
           - label: Linux x64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
