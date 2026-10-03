@@ -75,13 +75,11 @@ describe("release trust preparation", () => {
     expect(() => build({ RUNNER_OS: "macOS", APPLE_SIGNING_IDENTITY: "-" })).toThrow(/ad-hoc/);
   });
 
-  it("requires the protected Windows signing command", () => {
-    expect(() => build({ RUNNER_OS: "Windows" })).toThrow(/REPOLA_WINDOWS_SIGN_COMMAND/);
-    expect(build({ RUNNER_OS: "Windows", REPOLA_WINDOWS_SIGN_COMMAND: "trusted-signer %1" }).bundle)
+  it("generates Windows NSIS bundle configuration", () => {
+    expect(build({ RUNNER_OS: "Windows" }).bundle)
       .toEqual({
         createUpdaterArtifacts: true,
         targets: ["nsis"],
-        windows: { signCommand: "trusted-signer %1" },
       });
   });
 

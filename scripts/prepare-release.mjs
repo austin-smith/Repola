@@ -87,7 +87,6 @@ export function buildReleaseConfig({ environment, packageJson, tauriConfig, carg
     releaseConfig.bundle.macOS = { signingIdentity };
     releaseConfig.bundle.targets = ["app", "dmg"];
   } else if (runnerOs === "Windows") {
-    releaseConfig.bundle.windows = { signCommand: required("REPOLA_WINDOWS_SIGN_COMMAND") };
     releaseConfig.bundle.targets = ["nsis"];
   } else if (runnerOs === "Linux") {
     releaseConfig.bundle.targets = ["appimage", "deb"];

@@ -15,11 +15,8 @@ Configure these repository secrets and variables:
 | Updater | Variable `REPOLA_SIGNING_PUBLIC_KEY`; secrets `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` |
 | Apple signing | Secrets `APPLE_CERTIFICATE` (base64 `.p12`), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY` (Developer ID Application) |
 | Apple notarization | Secrets `APPLE_ID`, `APPLE_PASSWORD` (app-specific), `APPLE_TEAM_ID`; or `APPLE_API_KEY`, `APPLE_API_ISSUER`, `APPLE_API_PRIVATE_KEY` (`.p8` contents) |
-| Windows signing | Variable `REPOLA_WINDOWS_SIGN_COMMAND` (Tauri signing command with `%1`); secret `REPOLA_WINDOWS_SIGNING_TOKEN` if the provider needs it |
 
 Generate the updater key with `pnpm tauri signer generate -w <private-key-path>`. Use the exact one-line `.pub` contents as the public-key variable and the private-key contents as its secret. Set a nonempty password and keep an offline backup.
-
-Provision the chosen Windows provider's signing tool and authentication in a Windows-only workflow step before bundling. Setting the command alone does not install its tooling. Missing signing configuration blocks releases.
 
 ## Publish stable
 

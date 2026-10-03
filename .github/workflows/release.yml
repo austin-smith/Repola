@@ -130,7 +130,6 @@ jobs:
       - name: Validate release trust and prepare native bundles
         shell: bash
         env:
-          REPOLA_WINDOWS_SIGN_COMMAND: ${{ vars.REPOLA_WINDOWS_SIGN_COMMAND }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -158,8 +157,7 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          REPOLA_WINDOWS_SIGNING_TOKEN: ${{ secrets.REPOLA_WINDOWS_SIGNING_TOKEN }}
-        run: pnpm tauri build --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
+        run: pnpm tauri build --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json ${{ runner.os != 'macOS' && '--no-sign' || '' }}
       - name: Verify macOS signature and notarization
         if: runner.os == 'macOS'
         env:
@@ -173,14 +171,6 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: node scripts/stage-release.mjs ${{ matrix.target }} "$RUNNER_TEMP/repola-release/metadata/release.json" "$RUNNER_TEMP/repola-release/assets"
-      - name: Verify Windows Authenticode signature
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $installers = @(Get-ChildItem "$env:RUNNER_TEMP/repola-release/assets/Repola_*-setup.exe")
-          if ($installers.Count -ne 1) { throw 'Expected exactly one Windows installer' }
-          $signature = Get-AuthenticodeSignature $installers[0].FullName
-          if ($signature.Status -ne 'Valid') { throw "Invalid Authenticode signature: $($signature.Status)" }
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Sign agent provenance with GitHub OIDC
         shell: bash
