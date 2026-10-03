@@ -161,6 +161,6 @@ export async function verifyMacosRelease({ environment = process.env, platform =
 if (isMain(import.meta.url)) {
   const commands = { prepare: prepareMacosSigning, verify: verifyMacosRelease, cleanup: cleanupMacosSigning };
   const command = commands[process.argv[2]];
-  if (!command) throw new Error("Usage: node scripts/macos-signing.mjs prepare|verify|cleanup");
+  if (!command) throw new Error("Usage: node scripts/release/macos-signing.mjs prepare|verify|cleanup");
   await command();
 }

@@ -62,7 +62,7 @@ jobs:
           REPOLA_SIGNING_PUBLIC_KEY: ${{ vars.REPOLA_SIGNING_PUBLIC_KEY }}
           REPOLA_TAG: ${{ inputs.tag }}
           REPOLA_CHANNEL: ${{ inputs.channel == 'nightly' && 'nightly' || 'stable' }}
-        run: node scripts/publish-release.mjs publish "$REPOLA_TAG" "$REPOLA_CHANNEL" "$RUNNER_TEMP/repola-release/verified-release" "$RUNNER_TEMP/repola-release/pages/updates"
+        run: node scripts/release/publish-release.mjs publish "$REPOLA_TAG" "$REPOLA_CHANNEL" "$RUNNER_TEMP/repola-release/verified-release" "$RUNNER_TEMP/repola-release/pages/updates"
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
       - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:

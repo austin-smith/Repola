@@ -45,7 +45,7 @@ export async function stageRelease(targetName, metadataPath, destination) {
     }
   }
   // Sign after notarization; invoke Node directly for Windows compatibility.
-  const signer = fileURLToPath(new URL("../node_modules/@tauri-apps/cli/tauri.js", import.meta.url));
+  const signer = fileURLToPath(new URL("../../node_modules/@tauri-apps/cli/tauri.js", import.meta.url));
   for (const name of artifacts) {
     const artifact = path.join(destination, name);
     await execute(process.execPath, [signer, "signer", "sign", "--app-version", release.version, artifact], { timeout: 60_000 });

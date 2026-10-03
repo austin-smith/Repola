@@ -58,7 +58,7 @@ export function isMain(importMetaUrl) {
   return process.argv[1] && pathToFileURL(process.argv[1]).href === importMetaUrl;
 }
 
-export const root = fileURLToPath(new URL("../", import.meta.url));
+export const root = fileURLToPath(new URL("../../", import.meta.url));
 
 export function githubClient(token = process.env.GH_TOKEN, fetcher = fetch) {
   if (!token) throw new Error("GitHub access requires GH_TOKEN.");

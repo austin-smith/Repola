@@ -119,17 +119,17 @@ export function buildInstallerConfig(environment) {
   return releaseConfig;
 }
 
-export async function prepareRelease(environment = process.env, metadataPath = new URL("../.release/release.json", import.meta.url)) {
+export async function prepareRelease(environment = process.env, metadataPath = new URL("../../.release/release.json", import.meta.url)) {
   const installerBuild = metadataPath === "--installers";
   const release = installerBuild ? null : await readJson(metadataPath);
-  const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-  const tauriConfig = JSON.parse(await readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
-  const cargoManifest = await readFile(new URL("../src-tauri/Cargo.toml", import.meta.url), "utf8");
+  const packageJson = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8"));
+  const tauriConfig = JSON.parse(await readFile(new URL("../../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+  const cargoManifest = await readFile(new URL("../../src-tauri/Cargo.toml", import.meta.url), "utf8");
   const releaseConfig = installerBuild
     ? buildInstallerConfig(environment)
     : buildReleaseConfig({ environment, packageJson, tauriConfig, cargoManifest, release });
   await writeFile(
-    new URL("../src-tauri/tauri.release.conf.json", import.meta.url),
+    new URL("../../src-tauri/tauri.release.conf.json", import.meta.url),
     `${JSON.stringify(releaseConfig, null, 2)}\n`,
     { mode: 0o600 },
   );
