@@ -2,7 +2,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { planRelease, resolveMetadata, stampVersions } from "./release-metadata.mjs";
 import { compareVersions, githubClient, parseVersion, publishedReleases, validateRelease } from "./release-utils.mjs";
-import { createUpdaterManifest, expectedArtifacts, validateChecksum, validateUpdaterManifest } from "./release-artifacts.mjs";
+import { createUpdaterManifest, expectedArtifacts, validateArtifactMetadata, validateChecksum, validateUpdaterManifest } from "./release-artifacts.mjs";
 
 const sha = "a".repeat(40);
 const source = { version: "0.1.0", sha, runId: "123", pubDate: "2026-09-30T09:17:00Z" };
@@ -54,8 +54,20 @@ describe("complete updater manifests", () => {
     expect(Object.keys(manifest.platforms)).toEqual(["darwin-aarch64", "linux-x86_64", "linux-x86_64-deb", "windows-x86_64"]);
     expect(manifest.platforms["linux-x86_64-deb"].url).toMatch(/\.deb$/);
     expect(manifest.platforms["linux-x86_64"].url).toMatch(/\.AppImage$/);
-    expect(manifest.platforms["windows-x86_64"].url).toContain("/releases/download/v0.1.0/Repola_0.1.0_x86_64-pc-windows-msvc-setup.exe");
+    expect(manifest.platforms["darwin-aarch64"].url).toContain("/releases/download/v0.1.0/Repola-0.1.0-arm64.app.tar.gz");
+    expect(manifest.platforms["windows-x86_64"].url).toContain("/releases/download/v0.1.0/Repola-0.1.0-x64-setup.exe");
     expect(() => validateUpdaterManifest(manifest, stable, signatures)).not.toThrow();
+  });
+
+  it("matches staged metadata by target and rejects omitted or foreign installers", () => {
+    const target = "aarch64-apple-darwin";
+    const artifacts = ["repola-agent-aarch64-apple-darwin", "Repola-0.1.0-arm64.dmg", "Repola-0.1.0-arm64.app.tar.gz"];
+    const metadata = { target, release: stable, artifacts };
+    expect(() => validateArtifactMetadata(metadata, stable, target)).not.toThrow();
+    expect(() => validateArtifactMetadata({ ...metadata, artifacts: artifacts.slice(0, 1) }, stable, target)).toThrow(/metadata/);
+    expect(() => validateArtifactMetadata({ ...metadata, artifacts: [...artifacts, "Repola-0.1.0-x64.deb"] }, stable, target)).toThrow(/metadata/);
+    expect(() => validateArtifactMetadata(metadata, nightly, target)).toThrow(/metadata/);
+    expect(() => validateArtifactMetadata(metadata, stable, "x86_64-pc-windows-msvc")).toThrow(/metadata/);
   });
 
   it("rejects missing platforms, foreign URLs, versions, and mismatched signatures", () => {

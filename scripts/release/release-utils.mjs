@@ -4,9 +4,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 export const repository = "austin-smith/Repola";
 export const updateBaseUrl = "https://austin-smith.github.io/Repola/updates";
 export const targets = [
-  { target: "aarch64-apple-darwin", platform: "darwin-aarch64", installer: ".dmg", updater: ".app.tar.gz" },
-  { target: "x86_64-unknown-linux-gnu", platform: "linux-x86_64", installer: ".deb", updater: ".AppImage", updaterVariants: { "linux-x86_64-deb": ".deb" } },
-  { target: "x86_64-pc-windows-msvc", platform: "windows-x86_64", installer: "-setup.exe", updater: "-setup.exe" },
+  { target: "aarch64-apple-darwin", platform: "darwin-aarch64", arch: "arm64", installers: [".dmg"], updater: ".app.tar.gz" },
+  { target: "x86_64-unknown-linux-gnu", platform: "linux-x86_64", arch: "x64", installers: [".deb", ".AppImage"], updater: ".AppImage", updaterVariants: { "linux-x86_64-deb": ".deb" } },
+  { target: "x86_64-pc-windows-msvc", platform: "windows-x86_64", arch: "x64", installers: ["-setup.exe"], updater: "-setup.exe" },
   { target: "aarch64-unknown-linux-gnu" },
 ];
 

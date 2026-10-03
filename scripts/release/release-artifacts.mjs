@@ -19,9 +19,17 @@ export function expectedArtifacts(release) {
   validateRelease(release);
   return targets.flatMap((target) => {
     const agent = `repola-agent-${target.target}${target.target.includes("windows") ? ".exe" : ""}`;
-    const bundles = target.platform ? [...new Set([target.installer, target.updater])].map((extension) => assetName(release.version, target.target, extension)) : [];
-    return [{ name: agent, agent: true }, ...bundles.map((name) => ({ name, agent: false }))];
+    const bundles = target.platform ? [...new Set([...target.installers, target.updater])].map((extension) => assetName(release.version, target.target, extension)) : [];
+    return [{ name: agent, agent: true, target: target.target }, ...bundles.map((name) => ({ name, agent: false, target: target.target }))];
   });
+}
+
+export function validateArtifactMetadata(metadata, release, targetName) {
+  const expected = expectedArtifacts(release).filter((entry) => entry.target === targetName).map((entry) => entry.name).sort();
+  if (!expected.length || metadata.target !== targetName || JSON.stringify(metadata.release) !== JSON.stringify(release)
+    || JSON.stringify(metadata.artifacts?.toSorted()) !== JSON.stringify(expected)) {
+    throw new Error(`Artifact metadata does not match the release for ${targetName}.`);
+  }
 }
 
 export function releaseAssetNames(release) {
@@ -83,11 +91,7 @@ export async function verifyArtifacts(directory, release, { staged = false } = {
   if (staged) {
     for (const target of targets) {
       const metadata = await readJson(path.join(directory, `${target.target}.json`));
-      const expected = artifacts.filter((entry) => entry.name.includes(target.target)).map((entry) => entry.name).sort();
-      if (metadata.target !== target.target || JSON.stringify(metadata.release) !== JSON.stringify(release)
-        || JSON.stringify(metadata.artifacts?.toSorted()) !== JSON.stringify(expected)) {
-        throw new Error(`Artifact metadata does not match the release for ${target.target}.`);
-      }
+      validateArtifactMetadata(metadata, release, target.target);
     }
   }
   await execute("cargo", ["run", "--locked", "--manifest-path", path.join(root, "src-tauri/Cargo.toml"), "--package", "repola-engine", "--example", "verify-release", "--", release.version, ...artifacts.map((entry) => path.resolve(directory, entry.name))], { timeout: 600_000, maxBuffer: 4 * 1024 * 1024 });

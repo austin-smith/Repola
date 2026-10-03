@@ -9,7 +9,9 @@ import { isMain, readJson, root, targets, validateRelease, writeJson } from "./r
 const execute = promisify(execFile);
 
 export function assetName(version, target, extension) {
-  return `Repola_${version}_${target}${extension}`;
+  const configuration = targets.find((entry) => entry.target === target && entry.platform);
+  if (!configuration) throw new Error(`Unsupported installer target: ${target}.`);
+  return `Repola-${version}-${configuration.arch}${extension}`;
 }
 
 async function filesBelow(directory) {
@@ -20,6 +22,19 @@ async function filesBelow(directory) {
     else if (entry.isFile()) files.push(fullPath);
   }
   return files;
+}
+
+export async function stageBundles(target, version, bundleDirectory, destination, { includeUpdater = true } = {}) {
+  const bundles = await filesBelow(bundleDirectory);
+  const extensions = new Set([...target.installers, ...(includeUpdater ? [target.updater] : [])]);
+  const selected = [...extensions].map((extension) => {
+    const candidates = bundles.filter((file) => file.endsWith(extension));
+    if (candidates.length !== 1) throw new Error(`Expected one ${extension} bundle for ${target.target}; found ${candidates.length}.`);
+    return { source: candidates[0], name: assetName(version, target.target, extension) };
+  });
+  await mkdir(destination, { recursive: true });
+  for (const { source, name } of selected) await copyFile(source, path.join(destination, name));
+  return selected.map(({ name }) => name);
 }
 
 export async function stageRelease(targetName, metadataPath, destination) {
@@ -35,14 +50,7 @@ export async function stageRelease(targetName, metadataPath, destination) {
   await copyFile(agentPath, path.join(destination, agentName));
   const artifacts = [agentName];
   if (target.platform) {
-    const bundles = await filesBelow(path.join(binaryDirectory, "bundle"));
-    for (const extension of new Set([target.installer, target.updater])) {
-      const candidates = bundles.filter((file) => file.endsWith(extension));
-      if (candidates.length !== 1) throw new Error(`Expected one ${extension} bundle for ${targetName}; found ${candidates.length}.`);
-      const name = assetName(release.version, targetName, extension);
-      await copyFile(candidates[0], path.join(destination, name));
-      artifacts.push(name);
-    }
+    artifacts.push(...await stageBundles(target, release.version, path.join(binaryDirectory, "bundle"), destination));
   }
   // Sign after notarization; invoke Node directly for Windows compatibility.
   const signer = fileURLToPath(new URL("../../node_modules/@tauri-apps/cli/tauri.js", import.meta.url));
