@@ -39,7 +39,6 @@ export async function resolveMetadata(environment = process.env, client = github
   if (environment.GITHUB_REPOSITORY?.toLowerCase() !== repository.toLowerCase()) throw new Error("Release workflow is restricted to the Repola repository.");
   const stableTag = environment.GITHUB_REF_TYPE === "tag" ? environment.GITHUB_REF_NAME : null;
   if (!stableTag && environment.GITHUB_REF !== "refs/heads/main") throw new Error("Nightly builds must run from main.");
-  if (environment.GITHUB_REF_TYPE !== "tag" && environment.GITHUB_REF !== "refs/heads/main") throw new Error("Manual release workflows must run from main.");
   if (stableTag && !/^v\d+\.\d+\.\d+$/.test(stableTag)) throw new Error("Stable release requires an exact vX.Y.Z tag.");
   const source = await client.request(`/commits/${encodeURIComponent(stableTag || environment.GITHUB_SHA)}`);
   const comparison = await client.request(`/compare/${source.sha}...main`);

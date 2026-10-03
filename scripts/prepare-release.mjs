@@ -14,7 +14,6 @@ export function buildReleaseConfig({ environment, packageJson, tauriConfig, carg
     return value;
   };
 
-  // The app and the engine crate inherit one version from [workspace.package] in src-tauri/Cargo.toml.
   const workspacePackage = cargoManifest.match(/^\[workspace\.package\]\s*\n([\s\S]*?)(?=^\[|(?![\s\S]))/m)?.[1] ?? "";
   const cargoVersion = workspacePackage.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
   const version = packageJson.version;
@@ -72,19 +71,13 @@ export function buildReleaseConfig({ environment, packageJson, tauriConfig, carg
   const runnerOs = required("RUNNER_OS");
   if (runnerOs === "macOS") {
     const signingIdentity = required("APPLE_SIGNING_IDENTITY");
-    if (signingIdentity === "-") throw new Error("macOS releases require a Developer ID identity, not ad-hoc signing.");
-    required("APPLE_CERTIFICATE");
-    required("APPLE_CERTIFICATE_PASSWORD");
-    const hasAppleId = Boolean(
-      environment.APPLE_ID?.trim() && environment.APPLE_PASSWORD?.trim() && environment.APPLE_TEAM_ID?.trim(),
-    );
-    const hasApiKey = Boolean(
-      environment.APPLE_API_KEY?.trim() && environment.APPLE_API_ISSUER?.trim() && environment.APPLE_API_KEY_PATH?.trim(),
-    );
-    if (!hasAppleId && !hasApiKey) {
-      throw new Error("macOS release builds require either Apple ID notarization credentials or App Store Connect API credentials.");
+    if (!/^[A-F0-9]{40}$/.test(signingIdentity) || !/^[A-Z0-9]{10}$/.test(required("APPLE_TEAM_ID"))) {
+      throw new Error("macOS releases require the validated Developer ID certificate fingerprint and team, not ad-hoc signing.");
     }
-    releaseConfig.bundle.macOS = { signingIdentity };
+    required("APPLE_API_KEY");
+    required("APPLE_API_ISSUER");
+    required("APPLE_API_KEY_PATH");
+    releaseConfig.bundle.macOS = { signingIdentity, hardenedRuntime: true };
     releaseConfig.bundle.targets = ["app", "dmg"];
   } else if (runnerOs === "Windows") {
     releaseConfig.bundle.targets = ["nsis"];

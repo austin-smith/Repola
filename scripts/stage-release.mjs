@@ -44,8 +44,7 @@ export async function stageRelease(targetName, metadataPath, destination) {
       artifacts.push(name);
     }
   }
-  // Sign the final bytes, after native code signing and notarization. Use Node to
-  // launch the project's locked CLI, avoiding pnpm.cmd / shell differences.
+  // Sign after notarization; invoke Node directly for Windows compatibility.
   const signer = fileURLToPath(new URL("../node_modules/@tauri-apps/cli/tauri.js", import.meta.url));
   for (const name of artifacts) {
     const artifact = path.join(destination, name);

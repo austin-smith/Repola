@@ -8,6 +8,13 @@ import { isMain, readJson, repository, root, targets, validateRelease, writeJson
 
 const execute = promisify(execFile);
 
+function updaterEntries(release) {
+  return targets.filter((target) => target.platform).flatMap((target) =>
+    Object.entries({ [target.platform]: target.updater, ...target.updaterVariants })
+      .map(([platform, extension]) => ({ platform, name: assetName(release.version, target.target, extension) })),
+  );
+}
+
 export function expectedArtifacts(release) {
   validateRelease(release);
   return targets.flatMap((target) => {
@@ -31,16 +38,13 @@ export function validateChecksum(bytes, checksum, name) {
 export function createUpdaterManifest(release, signatures, notes) {
   validateRelease(release);
   const platforms = {};
-  for (const target of targets.filter((entry) => entry.platform)) {
-    for (const [platform, extension] of Object.entries({ [target.platform]: target.updater, ...target.updaterVariants })) {
-      const name = assetName(release.version, target.target, extension);
-      const signature = signatures[name]?.trim();
-      if (!signature) throw new Error(`Missing updater signature for ${platform}.`);
-      platforms[platform] = {
-        signature,
-        url: `https://github.com/${repository}/releases/download/${release.tag}/${encodeURIComponent(name)}`,
-      };
-    }
+  for (const { platform, name } of updaterEntries(release)) {
+    const signature = signatures[name]?.trim();
+    if (!signature) throw new Error(`Missing updater signature for ${platform}.`);
+    platforms[platform] = {
+      signature,
+      url: `https://github.com/${repository}/releases/download/${release.tag}/${encodeURIComponent(name)}`,
+    };
   }
   return { version: release.version, notes, pub_date: release.pubDate, platforms };
 }
@@ -86,7 +90,6 @@ export async function verifyArtifacts(directory, release, { staged = false } = {
       }
     }
   }
-  // Verify bytes, not just the presence or shape of the signature envelope.
   await execute("cargo", ["run", "--locked", "--manifest-path", path.join(root, "src-tauri/Cargo.toml"), "--package", "repola-engine", "--example", "verify-release", "--", release.version, ...artifacts.map((entry) => path.resolve(directory, entry.name))], { timeout: 600_000, maxBuffer: 4 * 1024 * 1024 });
   for (const artifact of artifacts.filter((entry) => entry.agent)) {
     await execute("cosign", ["verify-blob", "--bundle", path.join(directory, `${artifact.name}.sigstore.json`), "--certificate-identity", `https://github.com/${repository}/.github/workflows/release.yml@${release.sourceRef}`, "--certificate-oidc-issuer", "https://token.actions.githubusercontent.com", path.join(directory, artifact.name)], { timeout: 120_000 });
@@ -98,18 +101,37 @@ export async function assembleRelease(directory, metadataPath) {
   const release = validateRelease(await readJson(metadataPath));
   const signatures = await verifyArtifacts(directory, release, { staged: true });
   await writeJson(path.join(directory, "release.json"), release);
-  await writeJson(path.join(directory, "latest.json"), createUpdaterManifest(release, signatures, `Repola ${release.version}\nSource: ${release.sha}\nhttps://github.com/${repository}/actions/runs/${release.runId}`));
+  await writeJson(path.join(directory, "latest.json"), createUpdaterManifest(release, signatures, `Repola ${release.version}`));
 }
 
-export async function downloadRelease(client, githubRelease, directory) {
-  await mkdir(directory, { recursive: true });
+async function readReleaseMetadata(client, githubRelease) {
   const assets = await client.list(`/releases/${githubRelease.id}/assets`);
   const metadata = assets.find((asset) => asset.name === "release.json");
   if (!metadata) throw new Error("Release has no verified build metadata.");
   const release = validateRelease(JSON.parse((await client.request(`/releases/assets/${metadata.id}`, { binary: true })).toString("utf8")));
   if (githubRelease.tag_name !== release.tag || githubRelease.prerelease !== (release.channel === "nightly")) throw new Error("GitHub release disagrees with its build metadata.");
   const expected = new Set(releaseAssetNames(release));
-  if (assets.length !== expected.size || assets.some((asset) => !expected.has(asset.name))) throw new Error("Release assets are incomplete or unexpected.");
+  if (assets.length !== expected.size || new Set(assets.map((asset) => asset.name)).size !== expected.size
+    || assets.some((asset) => !expected.has(asset.name))) throw new Error("Release assets are incomplete or unexpected.");
+  return { release, assets };
+}
+
+// Published assets were already verified; clients verify bytes when downloading.
+export async function readPublishedManifest(client, githubRelease) {
+  if (githubRelease.draft) throw new Error("Update feeds require a published release.");
+  const { release, assets } = await readReleaseMetadata(client, githubRelease);
+  const readAsset = (name) => client.request(`/releases/assets/${assets.find((asset) => asset.name === name).id}`, { binary: true });
+  const manifest = JSON.parse((await readAsset("latest.json")).toString("utf8"));
+  const signatures = Object.fromEntries(await Promise.all([...new Set(updaterEntries(release).map(({ name }) => name))].map(async (name) =>
+    [name, (await readAsset(`${name}.sig`)).toString("utf8")],
+  )));
+  validateUpdaterManifest(manifest, release, signatures);
+  return { ...manifest, notes: githubRelease.body || manifest.notes };
+}
+
+export async function downloadRelease(client, githubRelease, directory) {
+  const { release, assets } = await readReleaseMetadata(client, githubRelease);
+  await mkdir(directory, { recursive: true });
   for (const asset of assets) await writeFile(path.join(directory, asset.name), await client.request(`/releases/assets/${asset.id}`, { binary: true }));
   return release;
 }

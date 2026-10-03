@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
+import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { downloadRelease, releaseAssetNames, validateUpdaterManifest, verifyArtifacts } from "./release-artifacts.mjs";
+import { downloadRelease, readPublishedManifest, releaseAssetNames, validateUpdaterManifest, verifyArtifacts } from "./release-artifacts.mjs";
 import { compareVersions, githubClient, isMain, publishedReleases, readJson, repository, validateRelease, writeJson } from "./release-utils.mjs";
 
 const execute = promisify(execFile);
@@ -29,13 +30,15 @@ export async function createDraft(client, directory) {
   const manifest = await readJson(path.join(directory, "latest.json"));
   await writeJson(path.join(directory, "latest.json"), { ...manifest, notes: draft.body || manifest.notes });
   const names = releaseAssetNames(release);
-  // Only drafts may be resumed. Never replace an asset in a published release.
   await execute("gh", ["release", "upload", release.tag, ...names.map((name) => path.join(directory, name)), "--repo", repository, "--clobber"], { timeout: 600_000, maxBuffer: 1024 * 1024 });
   console.log(`Draft ready: ${draft.html_url}`);
   return draft;
 }
 
-export async function publishRelease(client, tag, channel, directory) {
+export async function publishRelease(client, tag, channel, directory, feedDirectory) {
+  if (!tag || !["stable", "nightly"].includes(channel) || !directory || !feedDirectory) {
+    throw new Error("Publication requires a tag, stable/nightly channel, artifact directory, and feed directory.");
+  }
   const githubRelease = await client.request(`/releases/tags/${encodeURIComponent(tag)}`);
   const release = await downloadRelease(client, githubRelease, directory);
   if (release.channel !== channel) throw new Error("Publication workflow channel does not match the release.");
@@ -49,7 +52,8 @@ export async function publishRelease(client, tag, channel, directory) {
     throw new Error("Release was not produced by the expected successful build workflow.");
   }
   const signatures = await verifyArtifacts(directory, release);
-  validateUpdaterManifest(await readJson(path.join(directory, "latest.json")), release, signatures);
+  const manifest = await readJson(path.join(directory, "latest.json"));
+  validateUpdaterManifest(manifest, release, signatures);
   const releases = await client.list("/releases");
   const latest = publishedReleases(releases, channel)[0];
   if (latest && compareVersions(latest.tag_name.slice(1), release.version) > 0) throw new Error("A newer release is already published; channel regression is refused.");
@@ -61,12 +65,23 @@ export async function publishRelease(client, tag, channel, directory) {
     const response = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(120_000) });
     if (!response.ok) throw new Error(`Published artifact is unavailable: ${name} (${response.status}). Rerun publication after GitHub propagation.`);
   }
+  await writeFeeds(client, feedDirectory, release, { ...manifest, notes: githubRelease.body || manifest.notes }, releases);
   return release;
+}
+
+export async function writeFeeds(client, directory, verifiedRelease, verifiedManifest, releases) {
+  releases ??= await client.list("/releases");
+  const otherChannel = verifiedRelease.channel === "stable" ? "nightly" : "stable";
+  const latest = publishedReleases(releases, otherChannel)[0];
+  const otherManifest = latest ? await readPublishedManifest(client, latest) : null;
+  await mkdir(directory, { recursive: true });
+  await writeJson(path.join(directory, `${verifiedRelease.channel}.json`), verifiedManifest);
+  if (otherManifest) await writeJson(path.join(directory, `${otherChannel}.json`), otherManifest);
 }
 
 if (isMain(import.meta.url)) {
   const client = githubClient();
   if (process.argv[2] === "draft") await createDraft(client, process.argv[3]);
-  else if (process.argv[2] === "publish") await publishRelease(client, process.argv[3], process.argv[4], process.argv[5]);
-  else throw new Error("Usage: publish-release.mjs draft <directory> | publish <tag> <channel> <directory>");
+  else if (process.argv[2] === "publish") await publishRelease(client, process.argv[3], process.argv[4], process.argv[5], process.argv[6]);
+  else throw new Error("Usage: publish-release.mjs draft <directory> | publish <tag> <channel> <artifacts-directory> <feeds-directory>");
 }

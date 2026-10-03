@@ -68,11 +68,12 @@ describe("release trust preparation", () => {
     expect(() => build({ RUNNER_OS: "macOS" })).toThrow(/APPLE_SIGNING_IDENTITY/);
     expect(() => build({
       RUNNER_OS: "macOS",
-      APPLE_SIGNING_IDENTITY: "Developer ID Application: Example",
-      APPLE_CERTIFICATE: "certificate",
-      APPLE_CERTIFICATE_PASSWORD: "password",
-    })).toThrow(/notarization credentials/);
+      APPLE_SIGNING_IDENTITY: "A".repeat(40),
+      APPLE_TEAM_ID: "ABCDEFGHIJ",
+    })).toThrow(/APPLE_API_KEY/);
     expect(() => build({ RUNNER_OS: "macOS", APPLE_SIGNING_IDENTITY: "-" })).toThrow(/ad-hoc/);
+    expect(() => build({ RUNNER_OS: "macOS", APPLE_SIGNING_IDENTITY: "Apple Development: Example" })).toThrow(/validated Developer ID/);
+    expect(() => build({ RUNNER_OS: "macOS", APPLE_SIGNING_IDENTITY: "A".repeat(40), APPLE_TEAM_ID: "bad" })).toThrow(/validated Developer ID/);
   });
 
   it("generates Windows NSIS bundle configuration", () => {
@@ -84,8 +85,8 @@ describe("release trust preparation", () => {
   });
 
   it("configures complete API-key notarization and explicit macOS bundles", () => {
-    const config = build({ RUNNER_OS: "macOS", APPLE_SIGNING_IDENTITY: "Developer ID Application: Example", APPLE_CERTIFICATE: "certificate", APPLE_CERTIFICATE_PASSWORD: "password", APPLE_API_KEY: "key-id", APPLE_API_ISSUER: "issuer", APPLE_API_KEY_PATH: "/runner/key.p8" });
-    expect(config.bundle).toEqual({ createUpdaterArtifacts: true, targets: ["app", "dmg"], macOS: { signingIdentity: "Developer ID Application: Example" } });
+    const config = build({ RUNNER_OS: "macOS", APPLE_SIGNING_IDENTITY: "A".repeat(40), APPLE_TEAM_ID: "ABCDEFGHIJ", APPLE_API_KEY: "key-id", APPLE_API_ISSUER: "issuer", APPLE_API_KEY_PATH: "/runner/key.p8" });
+    expect(config.bundle).toEqual({ createUpdaterArtifacts: true, targets: ["app", "dmg"], macOS: { signingIdentity: "A".repeat(40), hardenedRuntime: true } });
   });
 
   it("isolates nightly builds from the stable feed", () => {

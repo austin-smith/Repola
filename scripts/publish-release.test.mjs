@@ -1,12 +1,11 @@
 // @vitest-environment node
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { planRelease } from "./release-metadata.mjs";
 import { createUpdaterManifest, expectedArtifacts, releaseAssetNames } from "./release-artifacts.mjs";
-import { createDraft, publishRelease } from "./publish-release.mjs";
-import { buildFeeds } from "./release-feeds.mjs";
+import { createDraft, publishRelease, writeFeeds } from "./publish-release.mjs";
 import { readJson, writeJson } from "./release-utils.mjs";
 
 const mocks = vi.hoisted(() => ({ verify: vi.fn(), execute: vi.fn() }));
@@ -66,15 +65,23 @@ afterEach(async () => {
 describe("verified release publication", () => {
   it("publishes stable only after complete asset, signature, manifest, and build checks", async () => {
     const { client } = fakeGitHub();
-    await publishRelease(client, stable.tag, "stable", directory);
+    await publishRelease(client, stable.tag, "stable", directory, path.join(directory, "updates"));
     expect(mocks.verify).toHaveBeenCalledOnce();
     expect(client.request).toHaveBeenCalledWith("/releases/1", { method: "PATCH", body: { draft: false, make_latest: "true" } });
     expect(fetch).toHaveBeenCalledTimes(releaseAssetNames(stable).length);
+    expect((await readJson(path.join(directory, "updates/stable.json"))).version).toBe(stable.version);
+    expect(client.list.mock.calls.filter(([url]) => url === "/releases")).toHaveLength(1);
+  });
+
+  it("rejects missing publication arguments before contacting GitHub", async () => {
+    const { client } = fakeGitHub();
+    await expect(publishRelease(client, stable.tag, "stable", directory)).rejects.toThrow(/feed directory/);
+    expect(client.request).not.toHaveBeenCalled();
   });
 
   it("publishes nightly without becoming GitHub's latest stable release", async () => {
     const { client } = fakeGitHub(nightly);
-    await publishRelease(client, nightly.tag, "nightly", directory);
+    await publishRelease(client, nightly.tag, "nightly", directory, path.join(directory, "updates"));
     expect(client.request).toHaveBeenCalledWith("/releases/1", { method: "PATCH", body: { draft: false, make_latest: "false" } });
   });
 
@@ -85,23 +92,40 @@ describe("verified release publication", () => {
     { options: { additional: [{ id: 2, tag_name: "v0.2.0", draft: false, prerelease: false }] }, error: /newer release/ },
   ])("refuses publication when validation fails ($error)", async ({ options, error }) => {
     const { client } = fakeGitHub(stable, options);
-    await expect(publishRelease(client, stable.tag, "stable", directory)).rejects.toThrow(error);
+    await expect(publishRelease(client, stable.tag, "stable", directory, path.join(directory, "updates"))).rejects.toThrow(error);
     expect(client.request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
   });
 
   it("refuses invalid signatures and channel mismatches", async () => {
     const { client } = fakeGitHub();
     mocks.verify.mockRejectedValue(new Error("invalid artifact signature"));
-    await expect(publishRelease(client, stable.tag, "stable", directory)).rejects.toThrow(/invalid artifact signature/);
+    await expect(publishRelease(client, stable.tag, "stable", directory, path.join(directory, "updates"))).rejects.toThrow(/invalid artifact signature/);
     expect(client.request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
-    await expect(publishRelease(client, stable.tag, "nightly", directory)).rejects.toThrow(/channel/);
+    await expect(publishRelease(client, stable.tag, "nightly", directory, path.join(directory, "updates"))).rejects.toThrow(/channel/);
   });
 
   it("repairs publication without mutating published releases or uploading assets", async () => {
     const { client } = fakeGitHub(stable, { published: true });
-    await publishRelease(client, stable.tag, "stable", directory);
+    await publishRelease(client, stable.tag, "stable", directory, path.join(directory, "updates"));
     expect(client.request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
     expect(mocks.execute).not.toHaveBeenCalled();
+    expect((await readJson(path.join(directory, "updates/stable.json"))).version).toBe(stable.version);
+  });
+
+  it("withholds feeds until every published artifact is available", async () => {
+    const { client } = fakeGitHub();
+    fetch.mockResolvedValueOnce({ ok: false, status: 404 });
+    await expect(publishRelease(client, stable.tag, "stable", directory, path.join(directory, "updates"))).rejects.toThrow(/propagation/);
+    await expect(readJson(path.join(directory, "updates/stable.json"))).rejects.toThrow();
+  });
+
+  it("rejects duplicated assets that conceal a missing artifact", async () => {
+    const { client } = fakeGitHub();
+    const assets = await client.list("/releases/1/assets");
+    assets[assets.length - 1] = assets[assets.length - 2];
+    await expect(publishRelease(client, stable.tag, "stable", directory, path.join(directory, "updates"))).rejects.toThrow(/incomplete/);
+    expect(mocks.verify).not.toHaveBeenCalled();
+    expect(client.request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
   });
 
   it("never replaces assets in a published release or moves a mismatched tag", async () => {
@@ -131,21 +155,42 @@ describe("verified release publication", () => {
 describe("channel feed reconstruction", () => {
   it("writes a verified published feed and excludes an unpublished channel", async () => {
     const { client } = fakeGitHub(stable, { published: true });
-    await buildFeeds(client, path.join(directory, "updates"), path.join(directory, "verified"));
+    await writeFeeds(client, path.join(directory, "updates"), stable, createUpdaterManifest(stable, Object.fromEntries(expectedArtifacts(stable).map((entry) => [entry.name, "signature"])), "Changes"));
     expect((await readJson(path.join(directory, "updates/stable.json"))).version).toBe(stable.version);
     await expect(readJson(path.join(directory, "updates/nightly.json"))).rejects.toThrow();
+    expect(client.request).not.toHaveBeenCalled();
   });
 
-  it("preserves both channels in one deployment and rechecks the other channel's signatures", async () => {
+  it("preserves both channels using only metadata and updater signatures for the other release", async () => {
     const a = fakeGitHub(stable, { published: true, id: 1 });
     const b = fakeGitHub(nightly, { published: true, id: 2 });
     const client = {
       request: (url, options) => (Number(url.split("/").at(-1)) < 200 ? a.client : b.client).request(url, options),
       list: (url) => url === "/releases" ? [a.githubRelease, b.githubRelease] : (url.includes("/releases/1/") ? a.client : b.client).list(url),
     };
-    await buildFeeds(client, path.join(directory, "updates"), path.join(directory, "verified"));
+    await writeFeeds(client, path.join(directory, "updates"), stable, createUpdaterManifest(stable, Object.fromEntries(expectedArtifacts(stable).map((entry) => [entry.name, "signature"])), "Changes"));
     expect((await readJson(path.join(directory, "updates/stable.json"))).version).toBe(stable.version);
     expect((await readJson(path.join(directory, "updates/nightly.json"))).version).toBe(nightly.version);
-    expect(mocks.verify).toHaveBeenCalledTimes(2);
+    expect(mocks.verify).not.toHaveBeenCalled();
+    expect(a.client.request).not.toHaveBeenCalled();
+    const assets = await b.client.list("/releases/2/assets");
+    const downloaded = b.client.request.mock.calls.map(([url]) => assets.find((asset) => url === `/releases/assets/${asset.id}`)?.name);
+    const manifest = JSON.parse(b.contents["latest.json"]);
+    const updaterSignatures = [...new Set(Object.values(manifest.platforms).map(({ url }) => `${decodeURIComponent(url.split("/").at(-1))}.sig`))];
+    expect(downloaded.toSorted()).toEqual(["release.json", "latest.json", ...updaterSignatures].toSorted());
+  });
+
+  it.each(["url", "signature"])("rejects an invalid other-channel %s before changing either feed", async (field) => {
+    const b = fakeGitHub(nightly, { published: true, id: 2 });
+    const manifest = JSON.parse(b.contents["latest.json"]);
+    manifest.platforms["linux-x86_64"][field] = "invalid";
+    b.contents["latest.json"] = JSON.stringify(manifest);
+    const previous = { version: "previous" };
+    await mkdir(path.join(directory, "updates"));
+    await writeJson(path.join(directory, "updates/stable.json"), previous);
+    await writeJson(path.join(directory, "updates/nightly.json"), previous);
+    await expect(writeFeeds(b.client, path.join(directory, "updates"), stable, { version: stable.version })).rejects.toThrow(/unexpected URL or signature/);
+    expect(await readJson(path.join(directory, "updates/stable.json"))).toEqual(previous);
+    expect(await readJson(path.join(directory, "updates/nightly.json"))).toEqual(previous);
   });
 });
