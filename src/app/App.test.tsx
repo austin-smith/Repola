@@ -54,14 +54,24 @@ function dropOn(target: HTMLElement, paths = ["dropped folder"]) {
 function renderApp() {
   return render(<TooltipProvider><App /></TooltipProvider>);
 }
+async function findReadyDropTarget() {
+  return waitFor(() => {
+    const target = screen.getByRole("region", { name: "Drop repositories" });
+    expect(target).toHaveAttribute("aria-disabled", "false");
+    expect(listeners.size).toBe(1);
+    return target;
+  });
+}
 
 describe("repository drop entry points", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     listeners = new Set();
-    mocks.subscribe.mockImplementation((callback: EventCallback<DragDropEvent>) => {
-      listeners.add(callback);
-      return Promise.resolve(() => listeners.delete(callback));
+    mocks.subscribe.mockImplementation(async (callback: EventCallback<DragDropEvent>) => {
+      const subscribedListeners = listeners;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      subscribedListeners.add(callback);
+      return () => subscribedListeners.delete(callback);
     });
     mocks.loadMachines.mockResolvedValue([local, remote]);
     mocks.loadContext.mockResolvedValue(context);
@@ -93,7 +103,7 @@ describe("repository drop entry points", () => {
 
   it("adds a repository from the empty-screen target and then removes that target", async () => {
     renderApp();
-    const target = await screen.findByRole("region", { name: "Drop repositories" });
+    const target = await findReadyDropTarget();
     await act(async () => dropOn(target));
     expect(mocks.resolve).toHaveBeenCalledExactlyOnceWith("dropped folder");
     expect(mocks.register).toHaveBeenCalledExactlyOnceWith("local", "repository");
@@ -103,7 +113,7 @@ describe("repository drop entry points", () => {
 
   it("disables the background target while the repository dialog is open and only accepts Add Existing drops", async () => {
     renderApp();
-    const background = await screen.findByRole("region", { name: "Drop repositories" });
+    const background = await findReadyDropTarget();
     fireEvent.click(screen.getByRole("button", { name: "Add Repository…" }));
     await screen.findByRole("heading", { name: "Add Repository" });
     await waitFor(() => expect(listeners.size).toBe(1));
@@ -115,9 +125,8 @@ describe("repository drop entry points", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create" }));
     expect(listeners.size).toBe(0);
     fireEvent.click(screen.getByRole("button", { name: "Add Existing" }));
-    await waitFor(() => expect(listeners.size).toBe(1));
-    const target = screen.getAllByRole("region", { name: "Drop repositories", hidden: true }).find((item) => item !== background);
-    if (!target) throw new Error("Missing dialog drop target");
+    const target = await findReadyDropTarget();
+    expect(target).not.toBe(background);
     await act(async () => dropOn(target));
     expect(mocks.register).toHaveBeenCalledExactlyOnceWith("local", "repository");
     expect(screen.queryByRole("heading", { name: "Add Repository" })).not.toBeInTheDocument();
@@ -125,7 +134,7 @@ describe("repository drop entry points", () => {
 
   it("disables onboarding drops while Settings is open", async () => {
     renderApp();
-    const target = await screen.findByRole("region", { name: "Drop repositories" });
+    const target = await findReadyDropTarget();
     fireEvent.keyDown(window, { key: ",", ctrlKey: true });
     await waitFor(() => expect(listeners.size).toBe(0));
     expect(target).toHaveAttribute("aria-disabled", "true");
@@ -137,7 +146,7 @@ describe("repository drop entry points", () => {
     let complete!: (repository: string) => void;
     mocks.resolve.mockImplementationOnce(() => new Promise<string>((resolve) => { complete = resolve; }));
     renderApp();
-    const target = await screen.findByRole("region", { name: "Drop repositories" });
+    const target = await findReadyDropTarget();
     act(() => dropOn(target));
     expect(target).toHaveAttribute("aria-disabled", "true");
     expect(screen.getByRole("combobox", { name: "Current machine" })).toBeDisabled();
@@ -153,7 +162,7 @@ describe("repository drop entry points", () => {
       return "repository";
     });
     renderApp();
-    const target = await screen.findByRole("region", { name: "Drop repositories" });
+    const target = await findReadyDropTarget();
     await act(async () => dropOn(target, ["folder", "file in that folder", "invalid item"]));
     expect(mocks.register).toHaveBeenCalledExactlyOnceWith("local", "repository");
     expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({ title: "Repository added" }));
@@ -166,7 +175,7 @@ describe("repository drop entry points", () => {
     renderApp();
     await screen.findByText("No repositories yet");
     fireEvent.click(screen.getByRole("button", { name: "Add Repository…" }));
-    const target = await screen.findByRole("region", { name: "Drop repositories" });
+    const target = await findReadyDropTarget();
     act(() => dropOn(target));
     expect(screen.queryByRole("button", { name: "Cancel operation" })).not.toBeInTheDocument();
     expect(screen.getByText("Repository addition continues in the workspace after you close this dialog.")).toHaveAttribute("role", "status");
@@ -195,16 +204,20 @@ describe("repository drop entry points", () => {
   });
 
   it("keeps the dialog open and permits retry when a dropped item is not a repository", async () => {
-    mocks.resolve.mockRejectedValue(new Error("Not a Git working copy"));
+    mocks.resolve.mockRejectedValueOnce(new Error("Not a Git working copy"));
     renderApp();
     await screen.findByText("No repositories yet");
     fireEvent.click(screen.getByRole("button", { name: "Add Repository…" }));
-    const target = await screen.findByRole("region", { name: "Drop repositories" });
+    const target = await findReadyDropTarget();
     await act(async () => dropOn(target));
     expect(mocks.register).not.toHaveBeenCalled();
     expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({ title: "No Git repository was added" }));
     expect(screen.getByRole("heading", { name: "Add Repository" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Choose Repository…" })).toBeEnabled();
-    expect(listeners.size).toBe(1);
+    const retryTarget = await findReadyDropTarget();
+    await act(async () => dropOn(retryTarget));
+    expect(mocks.resolve).toHaveBeenCalledTimes(2);
+    expect(mocks.register).toHaveBeenCalledExactlyOnceWith("local", "repository");
+    await screen.findByText("No working copy selected");
   });
 });
