@@ -294,12 +294,15 @@ export function HistoryWorkbench() {
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
-            <div className="flex h-11 shrink-0 items-center border-b px-4"><strong className="text-sm">Changed files</strong>{files ? <Badge variant="secondary" className="ml-2">{files.length}</Badge> : <Spinner className="ml-auto size-4" />}</div>
-            {kindCounts.length > 1 ? (
-              <div className="shrink-0 border-b px-3 py-2">
-                <ChangeKindFilter counts={kindCounts} value={activeKinds} onValueChange={setKindFilter} />
-              </div>
-            ) : null}
+            <div className="flex h-11 shrink-0 items-center border-b px-4">
+              <strong className="text-sm">Changed files</strong>
+              {files ? <Badge variant="secondary" className="ml-2">{files.length}</Badge> : <Spinner className="ml-auto size-4" />}
+              {kindCounts.length > 1 ? (
+                <div className="ml-auto text-muted-foreground">
+                  <ChangeKindFilter counts={kindCounts} value={activeKinds} onValueChange={setKindFilter} />
+                </div>
+              ) : null}
+            </div>
             <div className="min-h-0 flex-1 overflow-y-auto">
               {listedFiles.map((file) => (
                 <button key={file.id} type="button" className={cn("flex w-full items-center gap-2 border-b px-3 py-1 text-left", selectedFile?.id === file.id && "bg-accent")} onClick={() => setSelectedFileId(file.id)}>

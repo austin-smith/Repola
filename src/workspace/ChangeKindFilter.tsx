@@ -1,4 +1,5 @@
 import type { LucideIcon } from "lucide-react";
+import type { ReactNode } from "react";
 import {
   AlertTriangleIcon,
   EyeOffIcon,
@@ -9,13 +10,15 @@ import {
   FilesIcon,
   FileSymlinkIcon,
   FileTypeIcon,
+  ListFilterIcon,
 } from "lucide-react";
-import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { Button } from "@/components/ui/button";
+import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuGroup, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { InputGroupButton } from "@/components/ui/input-group";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import {
   changeKindFilterKind,
-  isChangeKindFilterKind,
   type ChangeKindCount,
   type ChangeKindFilterKind,
 } from "../domain/change-kind-filter";
@@ -44,31 +47,53 @@ interface ChangeKindFilterProps {
   counts: readonly ChangeKindCount[];
   value: readonly ChangeKindFilterKind[];
   onValueChange: (value: ChangeKindFilterKind[]) => void;
-  className?: string;
+  children?: ReactNode;
 }
 
-/** Toggles that narrow a changed-file list to the pressed kinds; none pressed shows every kind. */
-export function ChangeKindFilter({ counts, value, onValueChange, className }: ChangeKindFilterProps) {
+export function ChangeKindFilterTrigger({ value, inInput = false }: { value: readonly ChangeKindFilterKind[]; inInput?: boolean }) {
+  const label = value.length === 0 ? "Filter by change type" : `Filter by change type: ${value.map((kind) => changeKindLabels[kind]).join(", ")}`;
+  const trigger = inInput
+    ? <InputGroupButton size="icon-xs" className="relative" aria-label={label} />
+    : <Button variant="ghost" size="icon-sm" className="relative" aria-label={label} />;
   return (
-    <ToggleGroup
-      multiple
-      variant="outline"
-      size="sm"
-      spacing={0}
-      aria-label="Filter by change type"
-      value={[...value]}
-      onValueChange={(next) => onValueChange(next.filter(isChangeKindFilterKind))}
-      className={className}
-    >
-      {counts.map(({ kind, count }) => (
-        <Tooltip key={kind}>
-          <TooltipTrigger render={<ToggleGroupItem value={kind} aria-label={`${changeKindLabels[kind]} (${count})`} />}>
-            <ChangeKindIcon kind={kind} />
-            <span className="tabular-nums">{count}</span>
-          </TooltipTrigger>
-          <TooltipContent>{changeKindLabels[kind]}</TooltipContent>
-        </Tooltip>
-      ))}
-    </ToggleGroup>
+    <Tooltip>
+      <TooltipTrigger render={<DropdownMenuTrigger render={trigger} />}>
+        <ListFilterIcon aria-hidden="true" />
+        {value.length > 0 ? <span aria-hidden="true" className="absolute right-1 top-1 size-1 rounded-full bg-brand" /> : null}
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+/** A quiet menu for narrowing a file list; no selected kinds shows every kind. */
+export function ChangeKindFilter({ counts, value, onValueChange, children }: ChangeKindFilterProps) {
+  return (
+    <DropdownMenu>
+      {children ?? <ChangeKindFilterTrigger value={value} />}
+      <DropdownMenuContent align="end" className="w-48">
+        <DropdownMenuGroup>
+          <DropdownMenuLabel>Change type</DropdownMenuLabel>
+          <DropdownMenuCheckboxItem checked={value.length === 0} onCheckedChange={() => onValueChange([])} closeOnClick={false}>
+            All change types
+          </DropdownMenuCheckboxItem>
+        </DropdownMenuGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuGroup>
+          {counts.map(({ kind, count }) => (
+            <DropdownMenuCheckboxItem
+              key={kind}
+              checked={value.includes(kind)}
+              closeOnClick={false}
+              aria-label={`${changeKindLabels[kind]} (${count})`}
+              onCheckedChange={(checked) => onValueChange(checked ? [...value, kind] : value.filter((entry) => entry !== kind))}
+            >
+              {changeKindLabels[kind]}
+              <span className="ml-auto tabular-nums text-muted-foreground">{count}</span>
+            </DropdownMenuCheckboxItem>
+          ))}
+        </DropdownMenuGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }

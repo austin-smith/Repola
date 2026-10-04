@@ -71,7 +71,7 @@ import {
   watchWorktree,
 } from "../ipc/worktrees";
 import type { CommitSigning, ConflictResolutionKind, DiscardScope, FileChange, FileDiff, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../ipc/types";
-import { ChangeKindFilter, ChangeKindIcon } from "./ChangeKindFilter";
+import { ChangeKindFilter, ChangeKindFilterTrigger, ChangeKindIcon } from "./ChangeKindFilter";
 import { parseCommitPeople, parseCommitTrailers } from "./commit-form";
 import { useWorkingCopy } from "./context";
 import { sectionHeadingClass, signingItems } from "./labels";
@@ -600,18 +600,24 @@ export function ChangesWorkbench() {
             <Button variant="destructive" size="sm" className="ml-2" disabled={syncBusy || snapshot.operation !== null} onClick={() => setPendingForcePush(true)}>Force…</Button>
           ) : null}
         </div>
-        <div className="flex shrink-0 items-center gap-2 border-b px-3 py-2">
-          <InputGroup className="h-7 flex-1">
-            <InputGroupAddon><SearchIcon aria-hidden="true" /></InputGroupAddon>
-            <InputGroupInput
-              value={changeFilter}
-              onChange={(event) => setChangeFilter(event.currentTarget.value)}
-              placeholder="Filter changed files"
-              aria-label="Filter changed files"
-              className="text-[0.8rem]"
-            />
-          </InputGroup>
-          {kindCounts.length > 1 ? <ChangeKindFilter counts={kindCounts} value={activeKinds} onValueChange={setKindFilter} /> : null}
+        <div className="shrink-0 border-b px-3 py-2">
+          <ChangeKindFilter counts={kindCounts} value={activeKinds} onValueChange={setKindFilter}>
+            <InputGroup className="h-7">
+              <InputGroupInput
+                value={changeFilter}
+                onChange={(event) => setChangeFilter(event.currentTarget.value)}
+                placeholder="Filter changed files"
+                aria-label="Filter changed files"
+                className="text-[0.8rem]"
+              />
+              <InputGroupAddon><SearchIcon aria-hidden="true" /></InputGroupAddon>
+              {kindCounts.length > 1 ? (
+                <InputGroupAddon align="inline-end">
+                  <ChangeKindFilterTrigger value={activeKinds} inInput />
+                </InputGroupAddon>
+              ) : null}
+            </InputGroup>
+          </ChangeKindFilter>
         </div>
         {snapshot?.operation ? (
           <div className="border-b bg-warning/10 px-4 py-3">

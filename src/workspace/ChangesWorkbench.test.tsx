@@ -238,6 +238,18 @@ describe("change type filter", () => {
     return view;
   };
 
+  const openTypeMenu = async () => {
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: /Filter by change type/ })));
+  };
+  const closeTypeMenu = async () => {
+    await act(async () => fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" }));
+  };
+  const chooseType = async (name: string) => {
+    await openTypeMenu();
+    await act(async () => fireEvent.click(screen.getByRole("menuitemcheckbox", { name })));
+    await closeTypeMenu();
+  };
+
   afterEach(cleanup);
   beforeEach(() => {
     vi.clearAllMocks();
@@ -251,25 +263,31 @@ describe("change type filter", () => {
     ipc.fetchWorkingCopy.mockResolvedValue(snapshot);
     await renderWorkbench();
     expect(screen.getByText("file", { selector: "strong" })).toBeInTheDocument();
-    expect(screen.queryByRole("group", { name: "Filter by change type" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Filter by change type/ })).not.toBeInTheDocument();
   });
 
   it("lists only the pressed types, previews a listed file, and keeps hidden files in the commit", async () => {
     const { container } = await renderWorkbench();
-    const added = screen.getByRole("button", { name: "Added (1)" });
-    expect(screen.getByRole("button", { name: "Modified (1)" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitemcheckbox")).not.toBeInTheDocument();
+    await openTypeMenu();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Modified (1)" })).toBeInTheDocument();
+    await closeTypeMenu();
     expect(screen.getByText("src/app.ts", { selector: "strong" })).toBeInTheDocument();
 
-    fireEvent.click(added);
+    await chooseType("Added (1)");
     expect(listedIds(container)).toEqual(["new.txt"]);
     expect(screen.getByText("new.txt", { selector: "strong" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Commit 3 files to main" })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Deleted (1)" }));
+    await chooseType("Deleted (1)");
     expect(listedIds(container)).toEqual(["new.txt", "old.txt"]);
 
-    fireEvent.click(added);
-    fireEvent.click(screen.getByRole("button", { name: "Deleted (1)" }));
+    await openTypeMenu();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Added (1)" })).toBeChecked();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Deleted (1)" })).toBeChecked();
+    await act(async () => fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "All change types" })));
+    expect(screen.getByRole("menuitemcheckbox", { name: "All change types" })).toBeChecked();
+    await closeTypeMenu();
     expect(listedIds(container)).toEqual(["src/app.ts", "new.txt", "old.txt"]);
   });
 
@@ -278,11 +296,11 @@ describe("change type filter", () => {
     const list = container.querySelector<HTMLElement>("[aria-keyshortcuts]");
     if (!list) throw new Error("changes list missing");
     fireEvent.keyDown(list, { key: "a", metaKey: true });
-    fireEvent.click(screen.getByRole("button", { name: "Added (1)" }));
+    await chooseType("Added (1)");
     fireEvent.keyDown(list, { key: " " });
     expect(listedIds(container)).toEqual(["new.txt"]);
     expect(screen.getByRole("button", { name: "Commit 2 files to main" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Added (1)" }));
+    await chooseType("Added (1)");
     expect(screen.getByRole("checkbox", { name: "Exclude src/app.ts from commit" })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: "Exclude old.txt from commit" })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: "Include new.txt in commit" })).not.toBeChecked();
@@ -292,12 +310,13 @@ describe("change type filter", () => {
     let notify!: (event: { machineId: string }) => void;
     ipc.onWorktreeChanged.mockImplementation(async (listener) => { notify = listener; return () => undefined; });
     const { container } = await renderWorkbench();
-    fireEvent.click(screen.getByRole("button", { name: "Deleted (1)" }));
+    await chooseType("Deleted (1)");
     expect(listedIds(container)).toEqual(["old.txt"]);
 
     ipc.fetchWorkingCopy.mockResolvedValue({ ...mixed, changes: mixed.changes.filter((entry) => entry.kind !== "deleted") });
     await act(async () => notify({ machineId: "local" }));
     expect(listedIds(container)).toEqual(["src/app.ts", "new.txt"]);
-    expect(screen.queryByRole("button", { name: /^Deleted/ })).not.toBeInTheDocument();
+    await openTypeMenu();
+    expect(screen.queryByRole("menuitemcheckbox", { name: /^Deleted/ })).not.toBeInTheDocument();
   });
 });

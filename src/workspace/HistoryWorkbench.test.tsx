@@ -33,6 +33,11 @@ async function renderHistory() {
 }
 
 describe("commit file type filter", () => {
+  const chooseType = async (name: string) => {
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: /Filter by change type/ })));
+    await act(async () => fireEvent.click(screen.getByRole("menuitemcheckbox", { name })));
+    await act(async () => fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" }));
+  };
   afterEach(cleanup);
   beforeEach(() => {
     vi.clearAllMocks();
@@ -45,12 +50,12 @@ describe("commit file type filter", () => {
     await renderHistory();
     expect(screen.getByText("Diff of src/app.ts")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Added (1)" }));
+    await chooseType("Added (1)");
     expect(screen.getByText("Diff of new.txt")).toBeInTheDocument();
     expect(screen.queryByTitle("src/app.ts")).not.toBeInTheDocument();
     expect(screen.queryByTitle("old.txt")).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Added (1)" }));
+    await chooseType("Added (1)");
     expect(screen.getByTitle("src/app.ts")).toBeInTheDocument();
     expect(screen.getByTitle("old.txt")).toBeInTheDocument();
   });
@@ -58,14 +63,15 @@ describe("commit file type filter", () => {
   it("keeps the filter while browsing commits and ignores types a commit lacks", async () => {
     await renderHistory();
     expect(screen.getByText("Diff of src/app.ts")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Deleted (1)" }));
-    fireEvent.click(screen.getByRole("button", { name: "Added (1)" }));
+    await chooseType("Deleted (1)");
+    await chooseType("Added (1)");
     expect(screen.getByTitle("new.txt")).toBeInTheDocument();
     expect(screen.getByTitle("old.txt")).toBeInTheDocument();
 
     await act(async () => fireEvent.click(screen.getByText("Second commit")));
     expect(screen.getByText("Diff of another.txt")).toBeInTheDocument();
     expect(screen.queryByTitle("other.ts")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /^Deleted/ })).not.toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: /Filter by change type/ })));
+    expect(screen.queryByRole("menuitemcheckbox", { name: /^Deleted/ })).not.toBeInTheDocument();
   });
 });
