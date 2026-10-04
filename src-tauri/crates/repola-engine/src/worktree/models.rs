@@ -867,6 +867,9 @@ pub enum RestoreEffect {
     Create,
     Replace,
     Remove,
+    /// A folder stood at the path when it was saved; whatever is there now is
+    /// removed and the folder comes back.
+    CreateFolder,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

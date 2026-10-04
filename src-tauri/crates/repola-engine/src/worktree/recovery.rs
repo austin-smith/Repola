@@ -81,6 +81,10 @@ pub(super) struct PathState {
     /// appears after a review invalidates it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub directory: bool,
+    /// That folder's permission bits, so a restore brings it back as it was.
+    /// Unix only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_permissions: Option<u32>,
     /// How many of the path's parent folders exist, counted from the top. A
     /// restore removes only the folders below these, so folders that existed
     /// before, even empty ones, stay.
@@ -114,11 +118,13 @@ impl PathState {
         !self.index.is_empty() || self.worktree.is_some()
     }
 
-    /// Whether restoring `saved` over this state changes anything. A
-    /// directory is never restored, so only index entries and the working-tree
-    /// entry count.
+    /// Whether restoring `saved` over this state changes anything: its index
+    /// entries, its file, or the folder that stood at the path. A folder there
+    /// now is never removed by a restore.
     fn differs_from(&self, saved: &PathState) -> bool {
-        self.index != saved.index || self.worktree != saved.worktree
+        self.index != saved.index
+            || self.worktree != saved.worktree
+            || saved.directory && !self.directory
     }
 }
 
@@ -426,6 +432,7 @@ pub(super) fn observe_paths(
         index: Vec<IndexEntry>,
         entry: Option<(WorktreeEntryKind, u64, Option<u32>, Source)>,
         directory: bool,
+        folder_permissions: Option<u32>,
         chain: ParentChain,
     }
     let mut observed = Vec::with_capacity(paths.len());
@@ -436,6 +443,7 @@ pub(super) fn observe_paths(
             index: index.remove(&valid.bytes).unwrap_or_default(),
             entry: None,
             directory: false,
+            folder_permissions: None,
             chain,
         };
         let location = match inspect_path(worktree, valid)? {
@@ -456,6 +464,7 @@ pub(super) fn observe_paths(
         let file_type = metadata.file_type();
         if file_type.is_dir() {
             item.directory = true;
+            item.folder_permissions = permission_bits(&metadata);
             observed.push(item);
             continue;
         }
@@ -527,6 +536,7 @@ pub(super) fn observe_paths(
             index: item.index,
             worktree: worktree_entry,
             directory: item.directory,
+            folder_permissions: item.folder_permissions,
             parents: item.chain.existing,
             parent_permissions: item.chain.permissions,
             blocked: item.chain.blocked,
@@ -1521,7 +1531,7 @@ pub fn plan_recovery_restore(request: RecoveryPointRequest) -> Result<RecoveryRe
         .zip(&current)
         .map(|(saved, current)| RecoveryRestoreEntry {
             path: saved.path.clone(),
-            worktree: restore_effect(saved.worktree.as_ref(), current.worktree.as_ref()),
+            worktree: restore_effect(saved, current),
             index_changes: saved.index != current.index,
         })
         .collect();
@@ -1628,6 +1638,7 @@ pub(super) fn file_folder_conflict(display: &str) -> String {
 /// recorded, and the index entries.
 fn restore_writes(saved: &PathState, current: &PathState) -> (bool, bool) {
     let writes_disk = saved.worktree.is_some() && saved.worktree != current.worktree
+        || saved.directory && !current.directory
         || saved.worktree.is_none()
             && saved.index != current.index
             && saved.index.iter().any(|entry| entry.intent_to_add);
@@ -1674,8 +1685,11 @@ fn refuse_unsafe_restore(
     Ok(())
 }
 
-fn restore_effect(saved: Option<&WorktreeEntry>, current: Option<&WorktreeEntry>) -> RestoreEffect {
-    match (saved, current) {
+fn restore_effect(saved: &PathState, current: &PathState) -> RestoreEffect {
+    if saved.directory && !current.directory {
+        return RestoreEffect::CreateFolder;
+    }
+    match (saved.worktree.as_ref(), current.worktree.as_ref()) {
         (saved, current) if saved == current => RestoreEffect::Unchanged,
         (Some(_), None) => RestoreEffect::Create,
         (Some(_), Some(_)) => RestoreEffect::Replace,
@@ -1781,6 +1795,11 @@ fn apply_restore(
     for (saved, current) in changed {
         if restore_writes(saved, current).0 && current.directory {
             remove_empty_directory(worktree, &saved.path)?;
+        }
+    }
+    for (saved, current) in changed {
+        if saved.directory && !current.directory {
+            restore_folder(worktree, saved, &mut folders)?;
         }
     }
     for (saved, current) in changed {
@@ -1910,6 +1929,30 @@ fn config_bool(worktree: &Path, key: &str, default: bool) -> Result<bool, String
         Some(1) => Ok(default),
         _ => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
     }
+}
+
+/// Recreates the folder that stood at `saved`, adding it and any parents it
+/// needs, with the permissions they had, to `folders`.
+fn restore_folder(
+    worktree: &Path,
+    saved: &PathState,
+    folders: &mut Vec<(PathBuf, u32)>,
+) -> Result<(), String> {
+    let valid = WorktreePath::new(&saved.path)?;
+    let mut created = Vec::new();
+    let target = prepare_path(worktree, &valid, &saved.path.display, &mut created)?;
+    let first = valid.components.len() - 1 - created.len();
+    for (depth, folder) in (first..).zip(created) {
+        if let Some(mode) = saved.parent_permissions.get(depth) {
+            folders.push((folder, *mode));
+        }
+    }
+    fs::create_dir(&target)
+        .map_err(|error| format!("{} could not be restored: {error}", saved.path.display))?;
+    if let Some(mode) = saved.folder_permissions {
+        folders.push((target, mode));
+    }
+    Ok(())
 }
 
 /// Writes `saved` back, adding the folders it recreates, with the
@@ -2591,6 +2634,7 @@ mod tests {
                 permissions: None,
             }),
             directory: false,
+            folder_permissions: None,
             parents: 0,
             parent_permissions: Vec::new(),
             blocked: false,
@@ -2812,6 +2856,7 @@ mod tests {
                     permissions: None,
                 }),
                 directory: false,
+                folder_permissions: None,
                 parents: 0,
                 parent_permissions: Vec::new(),
                 blocked: false,
@@ -2859,6 +2904,7 @@ mod tests {
                 permissions: None,
             }),
             directory: false,
+            folder_permissions: None,
             parents: 0,
             parent_permissions: Vec::new(),
             blocked: false,

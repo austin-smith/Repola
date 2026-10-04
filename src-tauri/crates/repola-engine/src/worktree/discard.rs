@@ -1753,6 +1753,38 @@ mod tests {
         assert!(!path.join("other.txt").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_folder_a_discard_replaces_comes_back_on_restore() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = repository();
+        let path = root(&directory);
+        write(&path, "f", b"committed\n");
+        git(&path, &["add", "."]);
+        git(&path, &["commit", "-m", "base"]);
+        std::fs::remove_file(path.join("f")).expect("remove file");
+        std::fs::create_dir(path.join("f")).expect("empty folder");
+        std::fs::set_permissions(path.join("f"), std::fs::Permissions::from_mode(0o700))
+            .expect("private");
+        let before = exact_state(&path);
+
+        let discarded = discard(&path, file(&path, "f"));
+        assert_eq!(
+            std::fs::read(path.join("f")).expect("restored"),
+            b"committed\n"
+        );
+        restore(&path, &discarded.recovery_point);
+        assert_eq!(exact_state(&path), before);
+        let folder = std::fs::metadata(path.join("f")).expect("folder");
+        assert!(folder.is_dir());
+        assert_eq!(folder.permissions().mode() & 0o777, 0o700);
+
+        // The folder alone is enough to restore, with nothing at the path.
+        std::fs::remove_dir(path.join("f")).expect("remove folder");
+        restore(&path, &discarded.recovery_point);
+        assert!(path.join("f").is_dir());
+    }
+
     fn effect_of(plan: &DiscardPlan, display: &str) -> DiscardEffect {
         plan.entries
             .iter()

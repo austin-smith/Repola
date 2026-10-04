@@ -418,7 +418,7 @@ export interface RecoveryPointReference {
   oid: string;
 }
 
-export type RestoreEffect = "unchanged" | "create" | "replace" | "remove";
+export type RestoreEffect = "unchanged" | "create" | "replace" | "remove" | "createFolder";
 
 export interface RecoveryRestoreEntry {
   path: GitPath;
