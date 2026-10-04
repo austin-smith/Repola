@@ -1557,6 +1557,13 @@ impl AuditEntry {
                     steps.iter().all(|step| step.succeeded),
                     true,
                     std::iter::once(result.message.clone())
+                        // Why a step failed, in Git's words.
+                        .chain(
+                            steps
+                                .iter()
+                                .filter(|step| !step.succeeded && !step.output.is_empty())
+                                .map(|step| step.output.clone()),
+                        )
                         .chain(steps.iter().filter_map(|step| step.warning.clone()))
                         .chain((!finish.is_empty()).then(|| format!("To finish: {finish}")))
                         .chain((!restore.is_empty()).then(|| format!("To restore: {restore}")))
@@ -1923,13 +1930,26 @@ mod audit_tests {
                     "git -C /work/repository config --local --add branch.feature.remote https://alice:hunter2@example.com/repo.git".into(),
                 ],
             }),
-            remote: None,
+            remote: Some(worktree::BranchDeletionStep {
+                target: "origin/feature".into(),
+                deleted_oid: "a".repeat(40),
+                succeeded: false,
+                output: "! (delete):refs/heads/feature [rejected] (stale info)".into(),
+                warning: None,
+                finish_commands: Vec::new(),
+                recovery_commands: Vec::new(),
+            }),
             audit_path: None,
             audit_warning: None,
         };
 
         let entry = AuditEntry::branch_deletion_outcome("local", &execution, &Ok(result));
-        assert!(entry.succeeded);
+        assert!(!entry.succeeded);
+        assert!(
+            entry.outcome.contains("[rejected] (stale info)"),
+            "{}",
+            entry.outcome
+        );
         assert!(
             entry.outcome.contains(
                 "To finish: git -C /work/repository config --local --remove-section branch.feature"

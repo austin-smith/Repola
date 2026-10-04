@@ -291,10 +291,12 @@ fn review(
     if request.delete_remote {
         match &remote {
             Some(remote) => {
+                // The local record can be stale either way; the remote itself
+                // is asked right before deleting, and that answer decides.
                 if remote.is_remote_default_branch {
-                    blockers.push(format!(
-                        "{} is the default branch of {}. Repola does not delete a remote's default branch.",
-                        remote.display_name, remote.remote
+                    warnings.push(format!(
+                        "{} was the default branch of {} when it was last fetched. Repola asks {} before deleting and does not delete its default branch.",
+                        remote.display_name, remote.remote, remote.remote
                     ));
                 }
                 if !remote.tracked_by.is_empty() {
@@ -3329,11 +3331,39 @@ mod tests {
         let remote = plan.remote.as_ref().expect("remote details");
         assert!(remote.is_remote_default_branch);
         assert!(plan
-            .blockers
+            .warnings
             .iter()
-            .any(|blocker| blocker.contains("default branch")));
-        execute(&plan, None).expect_err("the remote default branch is protected");
+            .any(|warning| warning.contains("default branch")));
+        let error = execute(&plan, None).expect_err("the remote default branch is protected");
+        assert!(error.contains("is the default branch of origin"), "{error}");
         assert!(fixture.remote_has_branch("main"));
+    }
+
+    #[test]
+    fn a_stale_local_default_branch_record_does_not_block_the_deletion() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "former"]);
+        git(&fixture.repository, &["push", "origin", "former"]);
+        // The last fetch recorded `former` as the default; the remote says `main`.
+        git(
+            &fixture.repository,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/former",
+            ],
+        );
+        let plan = fixture.plan("refs/remotes/origin/former", false, true);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert!(
+            plan.remote
+                .as_ref()
+                .expect("remote details")
+                .is_remote_default_branch
+        );
+
+        execute(&plan, None).expect("the remote says former is not its default");
+        assert!(!fixture.remote_has_branch("former"));
     }
 
     #[test]
