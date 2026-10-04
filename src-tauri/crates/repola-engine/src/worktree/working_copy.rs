@@ -970,16 +970,25 @@ fn discard_tracked_path(
     let output = command::git_at(worktree, reset).map_err(|error| error.to_string())?;
     ensure_success(output, "reset the selected path in the index")?;
 
+    // Once the index matches HEAD, `git restore --worktree` can only bring back
+    // a path HEAD records; a path HEAD lacks is removed instead. Rename and copy
+    // records report HEAD's mode for the original path, so they decide by kind.
     match change.kind {
-        FileChangeKind::Added | FileChangeKind::Copied => clean_path(worktree, current),
+        FileChangeKind::Copied => clean_path(worktree, current),
         FileChangeKind::Renamed => {
             let previous = previous
                 .ok_or_else(|| "The renamed path lost its original filename.".to_string())?;
             restore_worktree_path(worktree, previous)?;
             clean_path(worktree, current)
         }
+        _ if absent_from_head(change) => clean_path(worktree, current),
         _ => restore_worktree_path(worktree, current),
     }
+}
+
+/// Porcelain v2 reports an all-zero mode for a side that lacks the entry.
+fn absent_from_head(change: &FileChange) -> bool {
+    change.head_mode.as_deref() == Some("000000")
 }
 
 fn restore_worktree_path(worktree: &Path, path: OsString) -> Result<(), String> {
@@ -2589,8 +2598,15 @@ fn classify_mode_change(from: &str, to: &str) -> Option<FileModeChange> {
     Some(FileModeChange::Other)
 }
 
+/// Classifies the change from HEAD to the working tree. A file HEAD lacks is
+/// added however it changed after staging; only its removal from disk, which
+/// leaves nothing to add, outranks that.
 fn kind_for(index: char, worktree: char) -> FileChangeKind {
-    let status = if worktree != '.' { worktree } else { index };
+    let status = match (index, worktree) {
+        ('A', worktree) if worktree != 'D' => 'A',
+        (index, '.') => index,
+        (_, worktree) => worktree,
+    };
     match status {
         'A' => FileChangeKind::Added,
         'M' => FileChangeKind::Modified,
@@ -3247,6 +3263,28 @@ mod tests {
             .changes
             .iter()
             .any(|change| change.mode_change == Some(FileModeChange::Symlink)));
+    }
+
+    #[test]
+    fn classifies_ordinary_records_by_their_change_from_head_to_the_working_tree() {
+        let cases = [
+            ("A.", "000000 100644 100644", FileChangeKind::Added),
+            ("AM", "000000 100644 100644", FileChangeKind::Added),
+            ("AT", "000000 100644 120000", FileChangeKind::Added),
+            ("AD", "000000 100644 000000", FileChangeKind::Deleted),
+            ("M.", "100644 100644 100644", FileChangeKind::Modified),
+            ("MM", "100644 100644 100644", FileChangeKind::Modified),
+            (".M", "100644 100644 100644", FileChangeKind::Modified),
+            ("MD", "100644 100644 000000", FileChangeKind::Deleted),
+            (".D", "100644 100644 000000", FileChangeKind::Deleted),
+            ("D.", "100644 000000 000000", FileChangeKind::Deleted),
+            (".T", "100644 100644 120000", FileChangeKind::TypeChanged),
+        ];
+        for (status, modes, expected) in cases {
+            let record = format!("1 {status} N... {modes} abc def file.txt\0");
+            let snapshot = parse_status(record.as_bytes()).expect("valid porcelain");
+            assert_eq!(snapshot.changes[0].kind, expected, "{status}");
+        }
     }
 
     #[test]
@@ -3930,6 +3968,48 @@ mod tests {
         assert!(repository.path().join("rename-me.txt").is_file());
         assert!(!repository.path().join("renamed.txt").exists());
         assert!(!repository.path().join("untracked.txt").exists());
+    }
+
+    #[test]
+    fn discards_staged_new_files_that_changed_after_staging() {
+        let repository = repository();
+        std::fs::write(repository.path().join("base.txt"), "base\n").expect("base");
+        command::successful_git_at(repository.path(), ["add", "."]).expect("add base");
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).expect("commit");
+        std::fs::write(repository.path().join("edited.txt"), "staged\n").expect("edited");
+        std::fs::write(repository.path().join("removed.txt"), "staged\n").expect("removed");
+        command::successful_git_at(repository.path(), ["add", "edited.txt", "removed.txt"])
+            .expect("stage new files");
+        std::fs::write(repository.path().join("edited.txt"), "staged\nedited\n")
+            .expect("edit after staging");
+        std::fs::remove_file(repository.path().join("removed.txt")).expect("remove after staging");
+
+        let mut snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
+        for (name, kind) in [
+            ("edited.txt", FileChangeKind::Added),
+            ("removed.txt", FileChangeKind::Deleted),
+        ] {
+            let change = snapshot
+                .changes
+                .iter()
+                .find(|change| change.path.display == name)
+                .expect("change")
+                .clone();
+            assert_eq!(change.kind, kind, "{name}");
+            snapshot = discard_file(DiscardFileRequest {
+                repository_path: snapshot.repository_path.clone(),
+                worktree_path: snapshot.worktree_path.clone(),
+                path: change.path,
+                scope: DiscardScope::All,
+                expected_head: snapshot.head.clone(),
+                expected_index_status: change.index_status,
+                expected_worktree_status: change.worktree_status,
+            })
+            .expect("discard");
+        }
+        assert!(snapshot.changes.is_empty());
+        assert!(!repository.path().join("edited.txt").exists());
+        assert!(!repository.path().join("removed.txt").exists());
     }
 
     #[test]
