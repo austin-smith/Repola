@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="src-tauri/icons/128x128@2x.png" alt="Repola icon" width="128" height="128">
+  <img src="src-tauri/assets/icons/128x128@2x.png" alt="Repola icon" width="128" height="128">
   <br><span style="font-family: monospace;">Repola</span>
 </h1>
 
