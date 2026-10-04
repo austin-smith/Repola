@@ -18,9 +18,12 @@ const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const STANDARD_TIMEOUT: Duration = Duration::from_secs(120);
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-/// Planning and running a discard or restore hash working-copy content of any
-/// size; a deadline mid-run would report failure for a change already made.
-const RECOVERY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Planning a discard or restore hashes working-copy content of any size.
+const RECOVERY_PLAN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Discarding and restoring save and rewrite content of any size. Ending the
+/// session does not stop the agent, so running out of time is reported as
+/// unconfirmed rather than failed.
+const RECOVERY_CHANGE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const EXIT_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 pub(super) fn execute<F>(
@@ -82,7 +85,6 @@ where
         return Err(HostError::InvalidProfile(machine.name.clone()));
     }
     let arguments = arguments_for_command(machine, remote_command)?;
-    let timeout = operation_timeout(&request.request);
     let mut child = command::spawn_piped("ssh", &arguments)
         .map_err(|error| HostError::Launch(error.to_string()))?;
     let request_id = request.request_id.clone();
@@ -93,25 +95,31 @@ where
         .ok_or_else(|| HostError::Transport("OpenSSH stdin was not available".into()))?;
     let handshake_id = format!("{}:handshake", request.request_id);
     let preflight = !matches!(&request.request, AgentRequest::Handshake { .. });
-    if preflight {
-        let handshake = RequestEnvelope::current(
+    // The request is sent only once the agent's handshake checks out, so an
+    // agent of another build never starts it, and closing input afterwards
+    // tells the agent nothing more is coming.
+    let first = if preflight {
+        RequestEnvelope::current(
             handshake_id.clone(),
             AgentRequest::Handshake {
                 client_version: env!("CARGO_PKG_VERSION").into(),
                 minimum_protocol_version: PROTOCOL_VERSION,
                 maximum_protocol_version: PROTOCOL_VERSION,
             },
-        );
-        if let Err(error) = write_frame(&mut input, &handshake) {
-            terminate(&mut child);
-            return Err(HostError::Transport(error.to_string()));
-        }
-    }
-    if let Err(error) = write_frame(&mut input, &request) {
+        )
+    } else {
+        request.clone()
+    };
+    if let Err(error) = write_frame(&mut input, &first) {
         terminate(&mut child);
         return Err(HostError::Transport(error.to_string()));
     }
-    drop(input);
+    let mut pending_input = if preflight {
+        Some(input)
+    } else {
+        drop(input);
+        None
+    };
 
     let mut output = child
         .stdout()
@@ -137,15 +145,27 @@ where
 
     let started = Instant::now();
     let mut awaiting_handshake = preflight;
+    // Set when the agent answered the handshake and Repola turned it down.
+    let mut declined = false;
     let terminal = loop {
         if token.is_cancelled() {
             break Err(HostError::Cancelled(machine.name.clone()));
         }
-        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
-            break Err(HostError::Timeout {
-                machine: machine.name.clone(),
-                seconds: timeout.as_secs(),
-            });
+        let limit = phase_timeout(&request.request, awaiting_handshake);
+        let Some(remaining) = limit.checked_sub(started.elapsed()) else {
+            break Err(
+                if !awaiting_handshake && changes_working_copy(&request.request) {
+                    HostError::Unconfirmed {
+                        machine: machine.name.clone(),
+                        minutes: limit.as_secs() / 60,
+                    }
+                } else {
+                    HostError::Timeout {
+                        machine: machine.name.clone(),
+                        seconds: limit.as_secs(),
+                    }
+                },
+            );
         };
         let response = match wire_receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
             Ok(Ok(Some(response))) => response,
@@ -167,6 +187,7 @@ where
                 "agent responded with protocol version {}; expected {}",
                 response.protocol_version, PROTOCOL_VERSION
             );
+            declined = awaiting_handshake;
             break Err(if awaiting_handshake {
                 preflight_protocol_error(machine, detail)
             } else {
@@ -191,16 +212,26 @@ where
                 } => match validate_handshake(agent, &request.request, &machine.name) {
                     Ok(()) => {
                         awaiting_handshake = false;
+                        if let Some(mut input) = pending_input.take() {
+                            if let Err(error) = write_frame(&mut input, &request) {
+                                break Err(HostError::Transport(error.to_string()));
+                            }
+                        }
                         continue;
                     }
-                    Err(error) => break Err(error),
+                    Err(error) => {
+                        declined = true;
+                        break Err(error);
+                    }
                 },
                 ResponseBody::Success { .. } | ResponseBody::Event { .. } => {
+                    declined = true;
                     break Err(HostError::Protocol(
                         "the agent returned an invalid handshake response".into(),
                     ));
                 }
                 ResponseBody::Failure { error } => {
+                    declined = true;
                     break Err(if error.kind == AgentErrorKind::Protocol {
                         preflight_protocol_error(machine, error.summary.clone())
                     } else {
@@ -223,7 +254,11 @@ where
         }
     };
 
-    if terminal.is_err() {
+    // An agent whose handshake was turned down is waiting for a request it
+    // will never get; closing its input lets it exit on its own, and the
+    // reason it was turned down is the answer.
+    drop(pending_input);
+    if terminal.is_err() && !declined {
         terminate(&mut child);
     }
     let status = wait_for_exit(&mut child, EXIT_GRACE_PERIOD)?;
@@ -231,16 +266,42 @@ where
     let diagnostics = diagnostic_reader
         .join()
         .unwrap_or_else(|_| "OpenSSH diagnostic reader failed".into());
-    if matches!(
-        terminal,
-        Err(HostError::Timeout { .. } | HostError::Cancelled(_))
-    ) {
+    if declined
+        || matches!(
+            terminal,
+            Err(HostError::Timeout { .. }
+                | HostError::Unconfirmed { .. }
+                | HostError::Cancelled(_))
+        )
+    {
         return terminal;
     }
     if !status.success() {
         return Err(ssh_exit_error(machine, status, diagnostics));
     }
     terminal
+}
+
+/// How long the exchange may run so far: an agent that has not answered the
+/// handshake gets the handshake's time whatever the request is.
+fn phase_timeout(request: &AgentRequest, awaiting_handshake: bool) -> Duration {
+    let timeout = operation_timeout(request);
+    if awaiting_handshake {
+        timeout.min(HANDSHAKE_TIMEOUT)
+    } else {
+        timeout
+    }
+}
+
+/// Requests that change files or recovery points, which the agent finishes
+/// even after Repola stops waiting.
+fn changes_working_copy(request: &AgentRequest) -> bool {
+    matches!(
+        request,
+        AgentRequest::Discard { .. }
+            | AgentRequest::RestoreRecoveryPoint { .. }
+            | AgentRequest::DeleteRecoveryPoints { .. }
+    )
 }
 
 fn agent_recovery_allowed(error: &HostError) -> bool {
@@ -347,6 +408,9 @@ fn validate_handshake(
 
 fn operation_timeout(request: &AgentRequest) -> Duration {
     match request {
+        AgentRequest::Discard { .. } | AgentRequest::RestoreRecoveryPoint { .. } => {
+            RECOVERY_CHANGE_TIMEOUT
+        }
         AgentRequest::Handshake { .. } => HANDSHAKE_TIMEOUT,
         AgentRequest::ScanWorktrees { .. } => SCAN_TIMEOUT,
         AgentRequest::GenerateCommitMessage { request } => {
@@ -364,10 +428,9 @@ fn operation_timeout(request: &AgentRequest) -> Duration {
         AgentRequest::TextGenerationStatus { provider } => (HANDSHAKE_TIMEOUT
             + crate::worktree::text_generation_status_timeout(*provider))
         .max(STANDARD_TIMEOUT),
-        AgentRequest::PlanDiscard { .. }
-        | AgentRequest::Discard { .. }
-        | AgentRequest::PlanRecoveryRestore { .. }
-        | AgentRequest::RestoreRecoveryPoint { .. } => RECOVERY_TIMEOUT,
+        AgentRequest::PlanDiscard { .. } | AgentRequest::PlanRecoveryRestore { .. } => {
+            RECOVERY_PLAN_TIMEOUT
+        }
         AgentRequest::ResolveRepository { .. }
         | AgentRequest::FetchPullRequests { .. }
         | AgentRequest::MutatePullRequest { .. }
@@ -453,6 +516,12 @@ pub(super) fn arguments_for_command(
         OsString::from("ClearAllForwardings=yes"),
         OsString::from("-o"),
         OsString::from("ConnectTimeout=15"),
+        // A connection that stops answering is noticed within a minute, even
+        // for requests that wait without a deadline.
+        OsString::from("-o"),
+        OsString::from("ServerAliveInterval=15"),
+        OsString::from("-o"),
+        OsString::from("ServerAliveCountMax=4"),
     ];
     if let Some(port) = ssh.port {
         arguments.push(OsString::from("-p"));
@@ -547,6 +616,10 @@ mod tests {
                 "ClearAllForwardings=yes",
                 "-o",
                 "ConnectTimeout=15",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=4",
                 "-p",
                 "2222",
                 "-l",
@@ -574,6 +647,48 @@ mod tests {
         let input = vec![b'x'; MAX_DIAGNOSTIC_BYTES + 10_000];
         let result = bounded_diagnostics(input.as_slice());
         assert_eq!(result.len(), MAX_DIAGNOSTIC_BYTES);
+    }
+
+    #[test]
+    fn changes_wait_long_but_never_on_an_unanswered_handshake() {
+        use crate::worktree::{
+            DeleteRecoveryPointsRequest, DiscardRequest, DiscardTarget, RecoveryPointReference,
+            RecoveryRestoreRequest,
+        };
+        let point = RecoveryPointReference {
+            id: "refs/repola/discarded/x".into(),
+            oid: "0".repeat(40),
+        };
+        let discard = AgentRequest::Discard {
+            request: DiscardRequest {
+                repository_path: "repo".into(),
+                worktree_path: "repo".into(),
+                target: DiscardTarget::All,
+                fingerprint: String::new(),
+            },
+        };
+        let restore = AgentRequest::RestoreRecoveryPoint {
+            request: RecoveryRestoreRequest {
+                repository_path: "repo".into(),
+                worktree_path: "repo".into(),
+                point: point.clone(),
+                fingerprint: String::new(),
+            },
+        };
+        let delete = AgentRequest::DeleteRecoveryPoints {
+            request: DeleteRecoveryPointsRequest {
+                repository_path: "repo".into(),
+                worktree_path: "repo".into(),
+                points: vec![point],
+            },
+        };
+        for request in [&discard, &restore, &delete] {
+            assert_eq!(phase_timeout(request, true), HANDSHAKE_TIMEOUT);
+            assert!(changes_working_copy(request));
+        }
+        assert_eq!(phase_timeout(&discard, false), RECOVERY_CHANGE_TIMEOUT);
+        assert_eq!(phase_timeout(&restore, false), RECOVERY_CHANGE_TIMEOUT);
+        assert_eq!(phase_timeout(&delete, false), STANDARD_TIMEOUT);
     }
 
     #[test]
