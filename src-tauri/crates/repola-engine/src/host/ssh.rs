@@ -18,6 +18,9 @@ const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const STANDARD_TIMEOUT: Duration = Duration::from_secs(120);
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Planning and running a discard or restore hash working-copy content of any
+/// size; a deadline mid-run would report failure for a change already made.
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const EXIT_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 pub(super) fn execute<F>(
@@ -364,6 +367,10 @@ fn operation_timeout(request: &AgentRequest) -> Duration {
         AgentRequest::TextGenerationStatus { provider } => (HANDSHAKE_TIMEOUT
             + crate::worktree::text_generation_status_timeout(*provider))
         .max(STANDARD_TIMEOUT),
+        AgentRequest::PlanDiscard { .. }
+        | AgentRequest::Discard { .. }
+        | AgentRequest::PlanRecoveryRestore { .. }
+        | AgentRequest::RestoreRecoveryPoint { .. } => RECOVERY_TIMEOUT,
         AgentRequest::ResolveRepository { .. }
         | AgentRequest::FetchPullRequests { .. }
         | AgentRequest::MutatePullRequest { .. }
@@ -373,11 +380,7 @@ fn operation_timeout(request: &AgentRequest) -> Duration {
         | AgentRequest::SetFileStaging { .. }
         | AgentRequest::ResolveConflict { .. }
         | AgentRequest::ConflictFile { .. }
-        | AgentRequest::PlanDiscard { .. }
-        | AgentRequest::Discard { .. }
         | AgentRequest::RecoveryPoints { .. }
-        | AgentRequest::PlanRecoveryRestore { .. }
-        | AgentRequest::RestoreRecoveryPoint { .. }
         | AgentRequest::RecoveryFileDiff { .. }
         | AgentRequest::DeleteRecoveryPoints { .. }
         | AgentRequest::ApplyPatchHunk { .. }
