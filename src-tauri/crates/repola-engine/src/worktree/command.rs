@@ -242,6 +242,14 @@ fn command(program: &str) -> Result<Command, CommandError> {
     let path = resolve_program(program)?;
     #[allow(unused_mut)]
     let mut command = Command::new(path);
+    if program == "git" {
+        // Repola marks exact paths with `:(literal)`. An inherited literal mode
+        // would make that prefix part of the name, and an inherited icase mode
+        // would widen it to paths differing only in case.
+        for variable in INHERITED_PATHSPEC_MODES {
+            command.env_remove(variable);
+        }
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -249,6 +257,8 @@ fn command(program: &str) -> Result<Command, CommandError> {
     }
     Ok(command)
 }
+
+const INHERITED_PATHSPEC_MODES: [&str; 2] = ["GIT_LITERAL_PATHSPECS", "GIT_ICASE_PATHSPECS"];
 
 fn launch(program: &str, command: Command, input: Option<&[u8]>) -> Result<Output, CommandError> {
     launch_with_timeout(program, command, input, COMMAND_TIMEOUT)
@@ -622,6 +632,22 @@ mod tests {
         output("git", ["--version"]).expect("git is required for the test suite");
         let cache = resolved_programs().lock().expect("cache lock");
         assert!(cache.get("git").is_some_and(|path| path.is_absolute()));
+    }
+
+    #[test]
+    fn git_commands_drop_inherited_pathspec_modes() {
+        let removed = |program| {
+            command(program)
+                .expect("git is required for the test suite")
+                .get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(key, _)| key.to_owned())
+                .collect::<Vec<_>>()
+        };
+        for variable in INHERITED_PATHSPEC_MODES {
+            assert!(removed("git").iter().any(|key| key == variable));
+        }
+        assert!(removed("cargo").is_empty());
     }
 
     #[test]

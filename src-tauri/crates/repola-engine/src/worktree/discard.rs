@@ -275,7 +275,6 @@ fn execute(worktree: &Path, head: Option<&str>, selection: &Selection) -> Result
         let output = command::git_at_with_input(
             worktree,
             [
-                "--literal-pathspecs",
                 "restore",
                 "--worktree",
                 "--pathspec-from-file=-",
@@ -302,7 +301,7 @@ fn reset_to_head(
     if paths.is_empty() {
         return Ok(());
     }
-    let mut args = vec![OsString::from("--literal-pathspecs")];
+    let mut args = Vec::new();
     match head {
         Some(head) => {
             args.extend([
@@ -336,9 +335,12 @@ fn reset_to_head(
     )
 }
 
+/// Exact paths for `--pathspec-from-file`, each marked literal so glob
+/// characters in a name never widen it.
 fn pathspec_input(paths: &[GitPath]) -> Result<Vec<u8>, String> {
     let mut input = Vec::new();
     for path in paths {
+        input.extend_from_slice(b":(literal)");
         input.extend(decode_path_token_bytes(&path.token)?);
         input.push(0);
     }
@@ -652,30 +654,78 @@ mod tests {
     }
 
     #[test]
-    fn pathspec_characters_in_file_names_never_widen_a_discard() {
-        let directory = repository();
-        let path = root(&directory);
-        write(&path, "[ab].txt", b"pattern\n");
-        write(&path, "a.txt", b"literal\n");
-        git(&path, &["add", "."]);
-        git(&path, &["commit", "-m", "base"]);
-        write(&path, "[ab].txt", b"pattern changed\n");
-        write(&path, "a.txt", b"literal changed\n");
-        discard(
-            &path,
-            DiscardTarget::File {
-                path: path_of(&path, "[ab].txt"),
-                scope: DiscardScope::All,
-            },
-        );
-        assert_eq!(
-            std::fs::read(path.join("[ab].txt")).expect("read"),
-            b"pattern\n"
-        );
-        assert_eq!(
-            std::fs::read(path.join("a.txt")).expect("read"),
-            b"literal changed\n"
-        );
+    fn glob_characters_in_file_names_never_widen_a_discard() {
+        // Read as a glob, each `[c].txt` would also match its neighbour `c.txt`.
+        for unborn in [false, true] {
+            let directory = repository();
+            let path = root(&directory);
+            let mut targets = vec![
+                ("[a].txt", DiscardScope::All),
+                ("[g].txt", DiscardScope::All),
+                ("[u].txt", DiscardScope::Unstaged),
+            ];
+            if !unborn {
+                for name in ["[x].txt", "x.txt", "old.txt"] {
+                    write(&path, name, b"original\n");
+                }
+                git(&path, &["add", "."]);
+                git(&path, &["commit", "-m", "base"]);
+                for name in ["[x].txt", "x.txt"] {
+                    write(&path, name, b"staged\n");
+                    git(&path, &["add", "--", name]);
+                    write(&path, name, b"unstaged\n");
+                }
+                git(&path, &["mv", "old.txt", "[n].txt"]);
+                write(&path, "n.txt", b"keep\n");
+                targets.extend([
+                    ("[x].txt", DiscardScope::Unstaged),
+                    ("[x].txt", DiscardScope::All),
+                    ("[n].txt", DiscardScope::All),
+                ]);
+            }
+            for name in ["[a].txt", "a.txt", "[g].txt", "g.txt"] {
+                write(&path, name, b"added\n");
+                git(&path, &["add", "--", name]);
+            }
+            // Deleted after staging, so discarding it only unstages it.
+            std::fs::remove_file(path.join("[g].txt")).expect("delete after staging");
+            write(&path, "[u].txt", b"reviewed\n");
+            write(&path, "u.txt", b"keep\n");
+            let before = exact_state(&path);
+
+            let mut points = Vec::new();
+            for (name, scope) in targets {
+                let target = DiscardTarget::File {
+                    path: path_of(&path, name),
+                    scope,
+                };
+                points.push(discard(&path, target).recovery_point);
+            }
+            assert!(!path.join("[a].txt").exists());
+            assert!(!path.join("[u].txt").exists());
+            assert_eq!(git(&path, &["show", ":a.txt"]), "added\n");
+            assert_eq!(git(&path, &["show", ":g.txt"]), "added\n");
+            assert_eq!(std::fs::read(path.join("u.txt")).expect("read"), b"keep\n");
+            if !unborn {
+                assert_eq!(
+                    std::fs::read(path.join("[x].txt")).expect("read"),
+                    b"original\n"
+                );
+                assert_eq!(git(&path, &["show", ":x.txt"]), "staged\n");
+                assert_eq!(
+                    std::fs::read(path.join("x.txt")).expect("read"),
+                    b"unstaged\n"
+                );
+                assert!(path.join("old.txt").is_file());
+                assert!(!path.join("[n].txt").exists());
+                assert_eq!(std::fs::read(path.join("n.txt")).expect("read"), b"keep\n");
+            }
+
+            for point in points.iter().rev() {
+                restore(&path, point);
+            }
+            assert_eq!(exact_state(&path), before, "unborn: {unborn}");
+        }
     }
 
     #[test]

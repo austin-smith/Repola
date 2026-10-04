@@ -33,8 +33,8 @@ use super::models::{
     RestoreEffect, WorkingCopyRequest,
 };
 use super::working_copy::{
-    decode_path_token_bytes, hex, null_device, os_string_from_path_bytes, truncate_file_patch,
-    working_copy_snapshot,
+    decode_path_token_bytes, hex, literal_pathspec, null_device, os_string_from_path_bytes,
+    truncate_file_patch, working_copy_snapshot,
 };
 
 const RECOVERY_REF_NAMESPACE: &str = "refs/repola/discarded";
@@ -458,12 +458,11 @@ fn index_entries(
     let wanted: HashSet<&[u8]> = paths.iter().map(|path| path.bytes.as_slice()).collect();
     let arguments = paths
         .iter()
-        .map(|path| os_string_from_path_bytes(path.bytes.clone()))
+        .map(|path| os_string_from_path_bytes(path.bytes.clone()).map(literal_pathspec))
         .collect::<Result<Vec<_>, _>>()?;
     let mut entries: HashMap<Vec<u8>, Vec<IndexEntry>> = HashMap::new();
     for chunk in argument_chunks(arguments) {
         let mut args = vec![
-            OsString::from("--literal-pathspecs"),
             OsString::from("ls-files"),
             OsString::from("--stage"),
             OsString::from("-z"),
