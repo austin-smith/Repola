@@ -186,7 +186,6 @@ fn removal_revalidates_cleanliness_and_preserves_the_branch() {
         kind: ActionKind::Remove,
         repository_path: repository.to_string_lossy().into_owned(),
         worktree_path: worktree.to_string_lossy().into_owned(),
-        branch: None,
     };
     let reviewed = prepare_action(request.clone()).expect("clean worktree is removable");
 
@@ -226,7 +225,7 @@ fn removal_revalidates_cleanliness_and_preserves_the_branch() {
 
     std::fs::remove_file(worktree.join("untracked.txt")).expect("remove test fixture");
     let reviewed = prepare_action(request).expect("clean worktree is removable after re-review");
-    execute_action(ActionExecutionRequest {
+    let removed = execute_action(ActionExecutionRequest {
         kind: reviewed.kind,
         repository_path: reviewed.repository_path,
         worktree_path: reviewed.worktree_path,
@@ -243,6 +242,73 @@ fn removal_revalidates_cleanliness_and_preserves_the_branch() {
         .output()
         .expect("query branch");
     assert!(branch.status.success(), "removal must preserve the branch");
+    let follow_up = removed
+        .follow_up
+        .expect("the retained branch is offered for review");
+    assert_eq!(follow_up.branch, "old-work");
+    assert_eq!(
+        Path::new(&follow_up.worktree_path),
+        repository,
+        "the retained branch is reviewed from the primary checkout"
+    );
+}
+
+#[test]
+fn removal_in_a_bare_repository_reviews_the_branch_from_a_remaining_checkout() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let root = dunce::canonicalize(temp.path()).expect("canonical temp path");
+    let source = fixture_repository(&root);
+    let bare = root.join("bare.git");
+    let kept = root.join("kept");
+    let linked = root.join("linked");
+    git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            source.to_str().expect("UTF-8 source path"),
+            bare.to_str().expect("UTF-8 bare path"),
+        ],
+    );
+    git(
+        &bare,
+        &["worktree", "add", kept.to_str().expect("UTF-8"), "main"],
+    );
+    git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "old-work",
+            linked.to_str().expect("UTF-8"),
+        ],
+    );
+
+    let reviewed = prepare_action(ActionRequest {
+        kind: ActionKind::Remove,
+        repository_path: bare.to_string_lossy().into_owned(),
+        worktree_path: linked.to_string_lossy().into_owned(),
+    })
+    .expect("clean worktree is removable");
+    let removed = execute_action(ActionExecutionRequest {
+        kind: reviewed.kind,
+        repository_path: reviewed.repository_path,
+        worktree_path: reviewed.worktree_path,
+        expected_head: reviewed.expected_head,
+        expected_branch: reviewed.branch,
+        expected_affected_paths: reviewed.affected_paths,
+    })
+    .expect("normal Git removal succeeds");
+
+    let follow_up = removed
+        .follow_up
+        .expect("the retained branch is offered for review");
+    assert_eq!(
+        Path::new(&follow_up.worktree_path),
+        kept,
+        "a bare repository has no checkout of its own to review from"
+    );
 }
 
 fn fixture_repository(root: &Path) -> std::path::PathBuf {
@@ -334,85 +400,6 @@ fn counts_commits_missing_from_every_remote() {
         "unpushed commits must surface in the review signal: {:?}",
         record.safety.reasons
     );
-}
-
-#[test]
-fn branch_deletion_requires_containment_and_release_from_worktrees() {
-    let temp = tempfile::tempdir().expect("temp directory");
-    let root = dunce::canonicalize(temp.path()).expect("canonical temp path");
-    let repository = fixture_repository(&root);
-    fixture_remote(&root, &repository);
-    let worktree = root.join("linked");
-    git(
-        &repository,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            "feature",
-            worktree.to_str().expect("UTF-8 worktree path"),
-        ],
-    );
-
-    let branch_request = |branch: &str| ActionRequest {
-        kind: ActionKind::DeleteBranch,
-        repository_path: repository.to_string_lossy().into_owned(),
-        worktree_path: String::new(),
-        branch: Some(branch.to_string()),
-    };
-
-    let checked_out = prepare_action(branch_request("feature"));
-    assert!(
-        checked_out.is_err(),
-        "a branch checked out in a worktree must not be deletable"
-    );
-
-    git(
-        &repository,
-        &["worktree", "remove", worktree.to_str().expect("UTF-8")],
-    );
-    std::fs::write(repository.join("ahead.txt"), "ahead\n").expect("fixture file");
-    git(&repository, &["add", "ahead.txt"]);
-    git(
-        &repository,
-        &["commit", "-m", "advance feature beyond origin"],
-    );
-    git(&repository, &["branch", "-f", "feature", "HEAD"]);
-    git(&repository, &["checkout", "-q", "main~0"]);
-    git(&repository, &["branch", "-f", "main", "origin/main"]);
-    git(&repository, &["checkout", "-q", "main"]);
-
-    let unmerged = prepare_action(branch_request("feature"));
-    assert!(
-        unmerged.is_err(),
-        "a branch tip missing from the default target must be blocked"
-    );
-
-    git(&repository, &["branch", "-f", "feature", "origin/main"]);
-    let reviewed =
-        prepare_action(branch_request("feature")).expect("contained branch is deletable");
-    assert!(reviewed.command_display.contains("branch -d"));
-    assert!(
-        !reviewed.command_display.contains("-D"),
-        "branch deletion must never use --force"
-    );
-
-    execute_action(ActionExecutionRequest {
-        kind: reviewed.kind,
-        repository_path: reviewed.repository_path,
-        worktree_path: reviewed.worktree_path,
-        expected_head: reviewed.expected_head,
-        expected_branch: reviewed.branch,
-        expected_affected_paths: reviewed.affected_paths,
-    })
-    .expect("safe branch deletion succeeds");
-
-    let gone = Command::new("git")
-        .current_dir(&repository)
-        .args(["show-ref", "--verify", "refs/heads/feature"])
-        .output()
-        .expect("query branch");
-    assert!(!gone.status.success(), "the branch ref must be deleted");
 }
 
 #[test]

@@ -175,7 +175,7 @@ export interface ScanResult {
   warnings: string[];
 }
 
-export type ActionKind = "remove" | "repair" | "unlock" | "pruneRepository" | "deleteBranch";
+export type ActionKind = "remove" | "repair" | "unlock" | "pruneRepository";
 
 export interface ActionPlan {
   kind: ActionKind;
@@ -199,9 +199,10 @@ export interface ActionResult {
   followUp: FollowUpAction | null;
 }
 
+/** A branch a removed worktree left behind, reviewed for deletion from `worktreePath`. */
 export interface FollowUpAction {
-  kind: ActionKind;
   repositoryPath: string;
+  worktreePath: string;
   branch: string;
   description: string;
 }

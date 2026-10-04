@@ -22,13 +22,16 @@ import {
 } from "../domain/branch-deletion";
 import { shortSha } from "../domain/format";
 import { executeBranchDeletion, prepareBranchDeletionReview } from "../ipc/worktrees";
-import type { BranchDeletionPlan, BranchDeletionResult, BranchInfo, RepositorySummary, WorktreeRecord } from "../ipc/types";
+import type { BranchDeletionPlan, BranchDeletionResult, BranchInfo } from "../ipc/types";
 
 interface DeleteBranchDialogProps {
   machineId: string;
-  repository: RepositorySummary;
-  worktree: WorktreeRecord;
+  repositoryPath: string;
+  /** The worktree whose HEAD Git compares a branch with when it has no upstream. */
+  worktreePath: string;
   branches: BranchInfo[];
+  /** Opens on this branch, or on no branch once it is gone, instead of the first one that is free to delete. */
+  initialBranchRef?: string;
   onClose: () => void;
   onDeleted: (result: BranchDeletionResult) => void | Promise<void>;
 }
@@ -42,16 +45,26 @@ interface Review {
   error: string | null;
 }
 
-export default function DeleteBranchDialog({ machineId, repository, worktree, branches, onClose, onDeleted }: DeleteBranchDialogProps) {
-  const [branchRef, setBranchRef] = useState(() => initialDeletionBranch(branches, worktree.path)?.fullName ?? null);
+export default function DeleteBranchDialog({
+  machineId,
+  repositoryPath,
+  worktreePath,
+  branches,
+  initialBranchRef,
+  onClose,
+  onDeleted,
+}: DeleteBranchDialogProps) {
+  const [branchRef, setBranchRef] = useState(() => (initialBranchRef === undefined
+    ? initialDeletionBranch(branches, worktreePath)
+    : branches.find((branch) => branch.fullName === initialBranchRef))?.fullName ?? null);
   const selected = branches.find((branch) => branch.fullName === branchRef) ?? null;
-  const [scope, setScope] = useState<DeletionScope>(() => (selected ? initialScope(selected, worktree.path) : noScope));
+  const [scope, setScope] = useState<DeletionScope>(() => (selected ? initialScope(selected, worktreePath) : noScope));
   const [revision, setRevision] = useState(0);
   const [review, setReview] = useState<Review | null>(null);
   const [typed, setTyped] = useState("");
   const [busy, setBusy] = useState(false);
   const [executeError, setExecuteError] = useState<string | null>(null);
-  const options = selected ? scopeOptions(selected, worktree.path) : null;
+  const options = selected ? scopeOptions(selected, worktreePath) : null;
   const items = useMemo(() => Object.fromEntries(branches.map((branch) => [branch.fullName, branch.name])), [branches]);
   const { deleteLocal, deleteRemote } = scope;
   const reviewKey = branchRef && hasScope(scope) ? `${branchRef}\0${deleteLocal}\0${deleteRemote}\0${revision}` : null;
@@ -64,8 +77,8 @@ export default function DeleteBranchDialog({ machineId, repository, worktree, br
     if (!branchRef || reviewKey === null) return;
     const controller = new AbortController();
     void prepareBranchDeletionReview(machineId, {
-      repositoryPath: repository.path,
-      worktreePath: worktree.path,
+      repositoryPath,
+      worktreePath,
       branchRef,
       deleteLocal,
       deleteRemote,
@@ -75,7 +88,7 @@ export default function DeleteBranchDialog({ machineId, repository, worktree, br
         if (!controller.signal.aborted) setReview({ key: reviewKey, plan: null, error: toMessage(cause) });
       });
     return () => controller.abort();
-  }, [branchRef, deleteLocal, deleteRemote, machineId, repository.path, reviewKey, worktree.path]);
+  }, [branchRef, deleteLocal, deleteRemote, machineId, repositoryPath, reviewKey, worktreePath]);
 
   const changeScope = (next: DeletionScope) => {
     setScope(next);
@@ -87,7 +100,7 @@ export default function DeleteBranchDialog({ machineId, repository, worktree, br
     const branch = branches.find((item) => item.fullName === fullName);
     if (!branch) return;
     setBranchRef(branch.fullName);
-    changeScope(initialScope(branch, worktree.path));
+    changeScope(initialScope(branch, worktreePath));
   };
 
   const run = async () => {

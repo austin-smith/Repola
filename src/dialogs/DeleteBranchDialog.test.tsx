@@ -6,9 +6,7 @@ import type {
   BranchDeletionRequest,
   BranchDeletionResult,
   BranchInfo,
-  RepositorySummary,
   WorkingCopySnapshot,
-  WorktreeRecord,
 } from "../ipc/types";
 
 const ipc = vi.hoisted(() => ({
@@ -17,43 +15,6 @@ const ipc = vi.hoisted(() => ({
 }));
 
 vi.mock("../ipc/worktrees", () => ipc);
-
-const repository: RepositorySummary = {
-  id: "repo-1",
-  name: "repola",
-  path: "/repos/repola",
-  remoteUrl: null,
-  provider: "none",
-  worktreeCount: 1,
-  attentionCount: 0,
-  conflictedCount: 0,
-  allocatedBytes: 1024,
-  allocationIncomplete: false,
-};
-
-const worktree: WorktreeRecord = {
-  id: "/repos/repola",
-  repositoryName: "repola",
-  repositoryPath: "/repos/repola",
-  path: "/repos/repola",
-  branch: "main",
-  head: "1".repeat(40),
-  detached: false,
-  isPrimary: true,
-  exists: true,
-  createdAtMs: null,
-  headCommitAtMs: null,
-  lastActivityAtMs: null,
-  headSubject: null,
-  unpushedCommitCount: null,
-  sizeBytes: null,
-  sizeIncomplete: false,
-  origin: { kind: "unattributed", id: "primary", label: "Primary" },
-  status: { available: true, total: 0, staged: 0, unstaged: 0, untracked: 0, conflicted: 0 },
-  registration: { kind: "healthy", reason: null },
-  integration: { kind: "headContained", target: "main", summary: "" },
-  safety: { level: "review", label: "", reasons: [] },
-};
 
 function branch(overrides: Partial<BranchInfo>): BranchInfo {
   return {
@@ -73,6 +34,7 @@ function branch(overrides: Partial<BranchInfo>): BranchInfo {
 const branches = [
   branch({ name: "main", fullName: "refs/heads/main", current: true, occupiedWorktreePath: "/repos/repola", upstream: "origin/main" }),
   branch({}),
+  branch({ name: "old-work", fullName: "refs/heads/old-work", upstream: null }),
   branch({ name: "origin/feature", fullName: "refs/remotes/origin/feature", remote: true, upstream: null }),
 ];
 
@@ -160,13 +122,14 @@ const result: BranchDeletionResult = {
   auditWarning: null,
 };
 
-function renderDialog(onDeleted = vi.fn(), onClose = vi.fn()) {
+function renderDialog(onDeleted = vi.fn(), onClose = vi.fn(), initialBranchRef?: string) {
   render(
     <DeleteBranchDialog
       machineId="local"
-      repository={repository}
-      worktree={worktree}
+      repositoryPath="/repos/repola"
+      worktreePath="/repos/repola"
       branches={branches}
+      initialBranchRef={initialBranchRef}
       onClose={onClose}
       onDeleted={onDeleted}
     />,
@@ -204,6 +167,17 @@ describe("DeleteBranchDialog", () => {
     await waitFor(() => expect(onDeleted).toHaveBeenCalledWith(result));
     expect(ipc.executeBranchDeletion).toHaveBeenCalledWith("local", expect.objectContaining({ deleteLocal: true, deleteRemote: false }), null);
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it("opens on the branch it was asked to review", async () => {
+    renderDialog(vi.fn(), vi.fn(), "refs/heads/old-work");
+
+    await waitFor(() => expect(ipc.prepareBranchDeletionReview).toHaveBeenCalledWith(
+      "local",
+      expect.objectContaining({ branchRef: "refs/heads/old-work", deleteLocal: true, deleteRemote: false }),
+      expect.any(AbortSignal),
+    ));
+    expect(screen.getByRole("checkbox", { name: "Local branch old-work" })).toBeChecked();
   });
 
   it("requires the exact branch name before deleting both copies", async () => {

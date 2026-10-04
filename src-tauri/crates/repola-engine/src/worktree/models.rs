@@ -171,7 +171,6 @@ pub enum ActionKind {
     Repair,
     Unlock,
     PruneRepository,
-    DeleteBranch,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -180,8 +179,6 @@ pub struct ActionRequest {
     pub kind: ActionKind,
     pub repository_path: String,
     pub worktree_path: String,
-    #[serde(default)]
-    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -222,11 +219,13 @@ pub struct ActionResult {
     pub follow_up: Option<FollowUpAction>,
 }
 
+/// A branch a removed worktree left behind, reviewed for deletion from
+/// `worktree_path`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FollowUpAction {
-    pub kind: ActionKind,
     pub repository_path: String,
+    pub worktree_path: String,
     pub branch: String,
     pub description: String,
 }

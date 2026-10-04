@@ -635,17 +635,6 @@ export function prepareWorktreeAction(
   });
 }
 
-export function prepareBranchDeletion(
-  machineId: string,
-  repositoryPath: string,
-  branch: string,
-): Promise<ActionPlan> {
-  return invokeOperation<ActionPlan>("prepare_worktree_action", {
-    machineId,
-    request: { kind: "deleteBranch", repositoryPath, worktreePath: "", branch },
-  });
-}
-
 export function executeWorktreeAction(machineId: string, plan: ActionPlan): Promise<ActionResult> {
   return invokeOperation<ActionResult>("execute_worktree_action", {
     machineId,

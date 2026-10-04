@@ -1,36 +1,19 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BulkActionDialog, type BulkItem, type BulkStage } from "./BulkActionDialog";
-import type { ActionPlan } from "../ipc/types";
 
-// BulkActionDialog is presentational: preflight (prepareWorktreeAction per
-// item) and sequential execution live in App.tsx's reviewBulkRemoval /
-// executeBulk, which feed `items` and `stage` back into this dialog. These
+// BulkActionDialog is presentational: preflight (one review per item) and
+// sequential execution live in App.tsx's reviewBulkRemoval,
+// reviewBulkBranchDeletion, and executeBulk, which feed `items` and `stage` back into this dialog. These
 // tests pin down the contract the dialog exposes for that flow.
-
-function plan(worktreePath: string, warnings: string[] = []): ActionPlan {
-  return {
-    kind: "remove",
-    title: "Remove Worktree",
-    summary: "Git will remove the linked directory and retain its branch.",
-    repositoryPath: "/tmp/repository",
-    worktreePath,
-    branch: null,
-    expectedHead: "1234567890abcdef",
-    commandDisplay: `git worktree remove -- ${worktreePath}`,
-    affectedPaths: [worktreePath],
-    warnings,
-    confirmationText: "REMOVE",
-    destructive: true,
-  };
-}
 
 const ready = (key: string, warnings?: string[]): BulkItem => ({
   key,
   title: key,
   subtitle: `/tmp/${key}`,
   sizeLabel: "12 MiB",
-  plan: plan(`/tmp/${key}`, warnings),
+  command: `git worktree remove -- /tmp/${key}`,
+  warnings: warnings ?? [],
   error: null,
   done: false,
 });
@@ -39,7 +22,8 @@ const blocked = (key: string, error: string): BulkItem => ({
   key,
   title: key,
   subtitle: `/tmp/${key}`,
-  plan: null,
+  command: null,
+  warnings: [],
   error,
   done: false,
 });
@@ -142,7 +126,7 @@ describe("BulkActionDialog", () => {
       { ...ready("beta"), error: "fatal: worktree is locked" },
       { ...ready("gamma"), done: true },
     ];
-    const { onCancel, onFollowUp } = renderDialog("done", items, "Delete 2 integrated branches");
+    const { onCancel, onFollowUp } = renderDialog("done", items, "Review 2 branch deletions…");
 
     expect(screen.getByText("2 completed · 1 not completed")).toBeInTheDocument();
     expect(screen.queryByLabelText("Type REMOVE to confirm")).not.toBeInTheDocument();
@@ -151,7 +135,7 @@ describe("BulkActionDialog", () => {
     expect(within(rows[1]).getByText("Failed")).toBeInTheDocument();
     expect(within(rows[1]).getByText("fatal: worktree is locked")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Delete 2 integrated branches" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review 2 branch deletions…" }));
     expect(onFollowUp).toHaveBeenCalledOnce();
     // The dialog also renders an icon-only "Close" (X); target the footer button by its visible text.
     fireEvent.click(screen.getAllByRole("button", { name: "Close" }).find((button) => button.textContent === "Close")!);

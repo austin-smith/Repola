@@ -43,11 +43,15 @@ import { useShortPath } from "./environment";
 import { formatAge, formatBytes, formatMeasuredBytes } from "../domain/format";
 import { performFocusedSelectAll } from "../domain/select-all";
 import { actionForWorktree, computeTotals, filterAndSortWorktrees, isRemovable } from "../domain/inventory";
+import { batchDeletionRefusal, deletionNotice } from "../domain/branch-deletion-outcomes";
 import type { AgeFilter, StateFilter } from "../domain/inventory";
 import type {
   ActionKind,
   ActionPlan,
   AgentInfo,
+  BranchDeletionPlan,
+  BranchDeletionResult,
+  BranchInfo,
   FollowUpAction,
   MachineProfile,
   MachineProfileInput,
@@ -65,11 +69,13 @@ import { loadWorkspaceContext, saveWorkspaceContext } from "../ipc/preferences";
 import { launchWorktreeTool } from "../ipc/app-preferences";
 import { restoreAndTrackWindow } from "./window-state";
 import {
+  executeBranchDeletion,
   executeWorktreeAction,
   fetchPullRequests,
+  loadBranches,
   loadRegisteredRepositories,
   pickRepositoryRoot,
-  prepareBranchDeletion,
+  prepareBranchDeletionReview,
   prepareWorktreeAction,
   revealAuditLog,
   resolveDroppedRepository,
@@ -85,7 +91,7 @@ import { HistoryWorkbench } from "../workspace/HistoryWorkbench";
 import { WorktreeDetails, type PullState } from "../workspace/WorktreeDetails";
 import { PaneResizeHandle } from "../workspace/PaneResizeHandle";
 import { LazyDialog } from "../workspace/LazyDialog";
-import { DiffDialog } from "../workspace/lazy";
+import { DeleteBranchDialog, DiffDialog } from "../workspace/lazy";
 import { RepositoryDropZone } from "../components/RepositoryDropZone";
 import { useRepositoryDrop } from "./use-repository-drop";
 
@@ -97,11 +103,26 @@ const stateOptions: { value: StateFilter; label: string }[] = [
 ];
 const stateItems = Object.fromEntries(stateOptions.map((option) => [option.value, option.label]));
 
+type BulkPlan = { kind: "remove"; plan: ActionPlan } | { kind: "deleteBranch"; plan: BranchDeletionPlan };
+
+interface BulkEntry extends BulkItem {
+  plan: BulkPlan | null;
+}
+
 interface BulkState {
-  kind: "remove" | "deleteBranch";
+  kind: BulkPlan["kind"];
   stage: BulkStage;
-  items: BulkItem[];
+  items: BulkEntry[];
   followUps: FollowUpAction[];
+}
+
+const unreviewed = (error: string) => ({ plan: null, command: null, warnings: [], error });
+
+/** A branch a removed worktree left behind, open in the branch deletion review. */
+interface BranchReview {
+  machineId: string;
+  followUp: FollowUpAction;
+  branches: BranchInfo[];
 }
 
 function App() {
@@ -137,6 +158,7 @@ function App() {
   const [bulk, setBulk] = useState<BulkState | null>(null);
   const [bulkBusy, setBulkBusy] = useState(false);
   const [actionPlan, setActionPlan] = useState<ActionPlan | null>(null);
+  const [branchReview, setBranchReview] = useState<BranchReview | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [pullEvidence, setPullEvidence] = useState<Record<string, PullState>>({});
@@ -354,6 +376,7 @@ function App() {
     setPullEvidence({});
     setActionPlan(null);
     setActionError(null);
+    setBranchReview(null);
     setDiffWorktree(null);
     const location = workspaceLocations[machineId];
     const filters = workspaceFilters[machineId];
@@ -547,10 +570,9 @@ function App() {
     const machineId = activeMachineId.current;
     setActionBusy(true);
     try {
-      const plan = await prepareBranchDeletion(machineId, followUp.repositoryPath, followUp.branch);
+      const branches = await loadBranches(machineId, followUp.repositoryPath, followUp.worktreePath);
       if (activeMachineId.current !== machineId) return;
-      setActionError(null);
-      setActionPlan(plan);
+      setBranchReview({ machineId, followUp, branches });
     } catch (cause) {
       toast.add({
         type: "error",
@@ -562,11 +584,17 @@ function App() {
     }
   };
 
+  const followUpBranchDeleted = async (result: BranchDeletionResult) => {
+    if (result.auditPath) setAuditPath(result.auditPath);
+    toast.add(deletionNotice(result));
+    await refreshWorkspace();
+  };
+
   const reviewBulkRemoval = async () => {
     if (checkedRecords.length === 0) return;
     setBulkBusy(true);
     try {
-      const items = await Promise.all(checkedRecords.map(async (worktree): Promise<BulkItem> => {
+      const items = await Promise.all(checkedRecords.map(async (worktree): Promise<BulkEntry> => {
         const base = {
           key: worktree.id,
           title: worktree.branch ?? worktree.path,
@@ -576,9 +604,9 @@ function App() {
         };
         try {
           const plan = await prepareWorktreeAction(selectedMachineId, "remove", worktree.repositoryPath, worktree.path);
-          return { ...base, plan, error: null };
+          return { ...base, plan: { kind: "remove", plan }, command: plan.commandDisplay, warnings: plan.warnings, error: null };
         } catch (cause) {
-          return { ...base, plan: null, error: toMessage(cause) };
+          return { ...base, ...unreviewed(toMessage(cause)) };
         }
       }));
       setBulk({ kind: "remove", stage: "review", items, followUps: [] });
@@ -590,7 +618,7 @@ function App() {
   const reviewBulkBranchDeletion = async (followUps: FollowUpAction[]) => {
     setBulkBusy(true);
     try {
-      const items = await Promise.all(followUps.map(async (followUp): Promise<BulkItem> => {
+      const items = await Promise.all(followUps.map(async (followUp): Promise<BulkEntry> => {
         const base = {
           key: `${followUp.repositoryPath}::${followUp.branch}`,
           title: followUp.branch,
@@ -598,10 +626,18 @@ function App() {
           done: false,
         };
         try {
-          const plan = await prepareBranchDeletion(selectedMachineId, followUp.repositoryPath, followUp.branch);
-          return { ...base, plan, error: null };
+          const plan = await prepareBranchDeletionReview(selectedMachineId, {
+            repositoryPath: followUp.repositoryPath,
+            worktreePath: followUp.worktreePath,
+            branchRef: `refs/heads/${followUp.branch}`,
+            deleteLocal: true,
+            deleteRemote: false,
+          });
+          const refusal = batchDeletionRefusal(plan);
+          if (refusal) return { ...base, ...unreviewed(refusal) };
+          return { ...base, plan: { kind: "deleteBranch", plan }, command: plan.commands.join("\n"), warnings: plan.warnings, error: null };
         } catch (cause) {
-          return { ...base, plan: null, error: toMessage(cause) };
+          return { ...base, ...unreviewed(toMessage(cause)) };
         }
       }));
       setBulk({ kind: "deleteBranch", stage: "review", items, followUps: [] });
@@ -620,10 +656,15 @@ function App() {
       const item = items[index];
       if (!item.plan || item.error || item.done) continue;
       try {
-        const result = await executeWorktreeAction(selectedMachineId, item.plan);
+        if (item.plan.kind === "remove") {
+          const result = await executeWorktreeAction(selectedMachineId, item.plan.plan);
+          if (result.auditPath) setAuditPath(result.auditPath);
+          if (result.followUp) followUps.push(result.followUp);
+        } else {
+          const result = await executeBranchDeletion(selectedMachineId, item.plan.plan, null);
+          if (result.auditPath) setAuditPath(result.auditPath);
+        }
         items[index] = { ...item, done: true };
-        if (result.auditPath) setAuditPath(result.auditPath);
-        if (result.followUp) followUps.push(result.followUp);
       } catch (cause) {
         items[index] = { ...item, error: toMessage(cause) };
       }
@@ -794,7 +835,7 @@ function App() {
   }, [performMenuAction]);
 
   const repositoryDropsBlocked = loading || repositoriesBusy || machinesBusy || actionBusy || bulkBusy
-    || settingsOpen || commandPaletteOpen || createWorktreeOpen || bulk !== null || actionPlan !== null || diffWorktree !== null;
+    || settingsOpen || commandPaletteOpen || createWorktreeOpen || bulk !== null || actionPlan !== null || branchReview !== null || diffWorktree !== null;
   const addDroppedRepositories = async (paths: string[]): Promise<boolean> => {
     if (selectedMachine?.kind !== "local" || repositoryDropsBlocked) return false;
     setRepositoriesBusy(true);
@@ -1268,10 +1309,10 @@ function App() {
       {actionPlan && <ActionDialog plan={actionPlan} busy={actionBusy} error={actionError} onCancel={() => { setActionPlan(null); setActionError(null); }} onConfirm={() => void executeAction()} />}
       {bulk && (
         <BulkActionDialog
-          title={bulk.kind === "remove" ? `Remove ${bulk.items.length} clean worktree${bulk.items.length === 1 ? "" : "s"}?` : `Delete ${bulk.items.length} integrated branch${bulk.items.length === 1 ? "" : "es"}?`}
+          title={bulk.kind === "remove" ? `Remove ${bulk.items.length} clean worktree${bulk.items.length === 1 ? "" : "s"}?` : `Delete ${bulk.items.length} retained branch${bulk.items.length === 1 ? "" : "es"}?`}
           summary={bulk.kind === "remove"
             ? "Each worktree passed its own preflight moments ago and is revalidated again at execution. Branches are always retained."
-            : "Each branch tip is contained in its repository's default remote target. Git deletes only local branch refs with branch -d."}
+            : "Each branch is reviewed again before Git deletes it with branch -d, which refuses unmerged work. Remote branches are untouched."}
           confirmationText={bulk.kind === "remove" ? "REMOVE" : "DELETE"}
           stage={bulk.stage}
           items={bulk.items}
@@ -1281,6 +1322,19 @@ function App() {
           onFollowUp={() => void reviewBulkBranchDeletion(bulk.followUps)}
         />
       )}
+      {branchReview ? (
+        <LazyDialog onClose={() => setBranchReview(null)}>
+          <DeleteBranchDialog
+            machineId={branchReview.machineId}
+            repositoryPath={branchReview.followUp.repositoryPath}
+            worktreePath={branchReview.followUp.worktreePath}
+            branches={branchReview.branches}
+            initialBranchRef={`refs/heads/${branchReview.followUp.branch}`}
+            onClose={() => setBranchReview(null)}
+            onDeleted={followUpBranchDeleted}
+          />
+        </LazyDialog>
+      ) : null}
       {diffWorktree ? (
         <LazyDialog onClose={() => setDiffWorktree(null)}>
           <DiffDialog machineId={selectedMachineId} worktree={diffWorktree} onClose={() => setDiffWorktree(null)} />

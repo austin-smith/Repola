@@ -1404,7 +1404,7 @@ fn cancel_operation(
 #[serde(rename_all = "camelCase")]
 struct AuditEntry {
     timestamp_ms: u64,
-    action: ActionKind,
+    action: AuditAction,
     machine_id: String,
     repository_path: String,
     worktree_path: String,
@@ -1415,6 +1415,29 @@ struct AuditEntry {
     outcome: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     branch_deletion: Option<BranchDeletionAudit>,
+}
+
+/// Worktree actions keep their `ActionKind` names. Branch deletions, including
+/// those earlier versions ran as a worktree action, are `deleteBranch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum AuditAction {
+    Remove,
+    Repair,
+    Unlock,
+    PruneRepository,
+    DeleteBranch,
+}
+
+impl From<ActionKind> for AuditAction {
+    fn from(kind: ActionKind) -> Self {
+        match kind {
+            ActionKind::Remove => Self::Remove,
+            ActionKind::Repair => Self::Repair,
+            ActionKind::Unlock => Self::Unlock,
+            ActionKind::PruneRepository => Self::PruneRepository,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -1438,7 +1461,7 @@ impl AuditEntry {
     ) -> Self {
         Self {
             timestamp_ms: now_ms(),
-            action: request.kind,
+            action: request.kind.into(),
             machine_id: machine_id.to_string(),
             repository_path: request.repository_path.clone(),
             worktree_path: request.worktree_path.clone(),
@@ -1472,7 +1495,7 @@ impl AuditEntry {
         }
         Self {
             timestamp_ms: now_ms(),
-            action: ActionKind::DeleteBranch,
+            action: AuditAction::DeleteBranch,
             machine_id: machine_id.to_string(),
             repository_path: request.repository_path.clone(),
             worktree_path: request.worktree_path.clone(),
@@ -1639,7 +1662,7 @@ mod audit_tests {
     #[test]
     fn entries_written_by_earlier_versions_still_decode() {
         let entry: AuditEntry = serde_json::from_str(LEGACY_ENTRY).expect("legacy audit entry");
-        assert_eq!(entry.action, ActionKind::Remove);
+        assert_eq!(entry.action, AuditAction::Remove);
         assert_eq!(entry.expected_branch.as_deref(), Some("feature"));
         assert_eq!(entry.affected_paths, vec!["/work/linked".to_string()]);
         assert!(entry.branch_deletion.is_none());
@@ -1648,6 +1671,14 @@ mod audit_tests {
             LEGACY_ENTRY,
             "worktree actions keep writing the same line format"
         );
+    }
+
+    #[test]
+    fn branch_deletions_written_as_worktree_actions_still_decode() {
+        let line = r#"{"timestampMs":1700000000000,"action":"deleteBranch","machineId":"local","repositoryPath":"/work/repository","worktreePath":"","expectedHead":"0123456789abcdef0123456789abcdef01234567","expectedBranch":"feature","affectedPaths":["refs/heads/feature"],"succeeded":true,"outcome":"Branch feature deleted with git branch -d."}"#;
+        let entry: AuditEntry = serde_json::from_str(line).expect("legacy branch deletion entry");
+        assert_eq!(entry.action, AuditAction::DeleteBranch);
+        assert!(entry.branch_deletion.is_none());
     }
 
     #[test]
@@ -1673,7 +1704,7 @@ mod audit_tests {
             typed_confirmation: Some("feature".into()),
         };
         let entry = AuditEntry::branch_deletion("local", &execution, false, "partial".into());
-        assert_eq!(entry.action, ActionKind::DeleteBranch);
+        assert_eq!(entry.action, AuditAction::DeleteBranch);
         assert_eq!(
             entry.affected_paths,
             vec![

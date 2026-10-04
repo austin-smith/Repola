@@ -8,14 +8,15 @@ import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
-import type { ActionPlan } from "../ipc/types";
 
 export interface BulkItem {
   key: string;
   title: string;
   subtitle: string;
   sizeLabel?: string;
-  plan: ActionPlan | null;
+  /** The reviewed command, or null when the item could not be reviewed. */
+  command: string | null;
+  warnings: string[];
   error: string | null;
   done: boolean;
 }
@@ -56,10 +57,10 @@ export function BulkActionDialog({
   const inputRef = useRef<HTMLInputElement>(null);
   const busy = stage === "running";
 
-  const readyCount = items.filter((item) => item.plan && !item.error && !item.done).length;
+  const readyCount = items.filter((item) => item.command !== null && !item.error && !item.done).length;
   const doneCount = items.filter((item) => item.done).length;
   const failedCount = items.filter((item) => item.error).length;
-  const warnings = Array.from(new Set(items.flatMap((item) => item.plan?.warnings ?? [])));
+  const warnings = Array.from(new Set(items.flatMap((item) => item.warnings)));
   const confirmed = confirmation === confirmationText;
 
   return (
@@ -91,9 +92,9 @@ export function BulkActionDialog({
                 </div>
                 <code className="font-mono text-xs break-all text-muted-foreground">{item.subtitle}</code>
                 {item.error && <p className="text-xs wrap-anywhere text-destructive">{item.error}</p>}
-                {!item.error && item.plan && (
+                {!item.error && item.command !== null && (
                   <code className="border-l-2 border-foreground bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap break-all">
-                    {item.plan.commandDisplay}
+                    {item.command}
                   </code>
                 )}
               </div>
