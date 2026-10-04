@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useReducer, useState, type FormEvent } from "react";
 import {
   ChevronRightIcon,
   DatabaseIcon,
@@ -259,6 +259,7 @@ function BranchControl() {
   const [historyActionsOpen, setHistoryActionsOpen] = useState(false);
   const [tagsOpen, setTagsOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [branchesRevision, reloadBranches] = useReducer((revision: number) => revision + 1, 0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -268,7 +269,7 @@ function BranchControl() {
         if (!controller.signal.aborted) setError(toMessage(cause));
       });
     return () => controller.abort();
-  }, [machineId, repository.path, worktree.id, worktree.path, worktree.head]);
+  }, [machineId, repository.path, worktree.id, worktree.path, worktree.head, branchesRevision]);
 
   const current = branches?.find((branch) => branch.current && !branch.remote) ?? null;
   const localBranches = branches?.filter((branch) => !branch.remote) ?? [];
@@ -319,9 +320,9 @@ function BranchControl() {
   };
 
   const branchDeleted = async (result: BranchDeletionResult) => {
-    setBranches(result.branches);
-    await onChanged();
     toast.add(deletionNotice(result));
+    reloadBranches();
+    await onChanged();
   };
 
   const selectBranch = (fullName: string | null) => {

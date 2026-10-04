@@ -202,7 +202,7 @@ export default function DeleteBranchDialog({
               onChange={(event) => setTyped(event.currentTarget.value)}
             />
             <FieldDescription>
-              {plan.requiresForce ? "This deletion uses git branch -D and discards commits that no other ref contains." : "Commits on the remote branch exist in no ref that remains after this deletion."}
+              {plan.requiresForce ? "This forced deletion discards commits that no other ref contains." : "Commits on the remote branch exist in no ref that remains after this deletion."}
             </FieldDescription>
           </Field>
         ) : null}

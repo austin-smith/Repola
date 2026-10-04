@@ -6,7 +6,6 @@ import type {
   BranchDeletionRequest,
   BranchDeletionResult,
   BranchInfo,
-  WorkingCopySnapshot,
 } from "../ipc/types";
 
 const ipc = vi.hoisted(() => ({
@@ -98,26 +97,10 @@ function planFor(request: BranchDeletionRequest, overrides: Partial<BranchDeleti
   };
 }
 
-const snapshot: WorkingCopySnapshot = {
-  repositoryPath: "/repos/repola",
-  worktreePath: "/repos/repola",
-  head: "1".repeat(40),
-  branch: "main",
-  upstream: "origin/main",
-  upstreamHead: "1".repeat(40),
-  remote: "origin",
-  ahead: 0,
-  behind: 0,
-  changes: [],
-  operation: null,
-};
-
 const result: BranchDeletionResult = {
   message: "Deleted local branch feature.",
   local: { target: "feature", deletedOid: "a".repeat(40), succeeded: true, output: "", recoveryCommand: "git -C /repos/repola branch -- feature aaaa" },
   remote: null,
-  branches: [],
-  snapshot,
   auditPath: null,
   auditWarning: null,
 };

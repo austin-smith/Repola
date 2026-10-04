@@ -651,8 +651,6 @@ export interface BranchDeletionResult {
   message: string;
   local: BranchDeletionStep | null;
   remote: BranchDeletionStep | null;
-  branches: BranchInfo[];
-  snapshot: WorkingCopySnapshot;
   auditPath: string | null;
   auditWarning: string | null;
 }

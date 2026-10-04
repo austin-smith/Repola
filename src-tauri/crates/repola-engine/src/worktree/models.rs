@@ -1172,8 +1172,6 @@ pub struct BranchDeletionResult {
     pub message: String,
     pub local: Option<BranchDeletionStep>,
     pub remote: Option<BranchDeletionStep>,
-    pub branches: Vec<BranchInfo>,
-    pub snapshot: WorkingCopySnapshot,
     pub audit_path: Option<String>,
     pub audit_warning: Option<String>,
 }
