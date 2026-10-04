@@ -2,6 +2,7 @@ import { Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, us
 import {
   AlertTriangleIcon,
   ArchiveIcon,
+  ArchiveRestoreIcon,
   CopyIcon,
   ExternalLinkIcon,
   FolderOpenIcon,
@@ -32,7 +33,6 @@ import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/toast";
-import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 import { toMessage } from "@/lib/errors";
 import { ActionableGitError } from "../components/ActionableGitError";
@@ -51,6 +51,7 @@ import {
   type FileCommitSelection,
 } from "../domain/commit-selection";
 import { changeDiffKey, retainDiffEntries, workingCopySnapshotsEqual } from "../domain/diff-cache";
+import { fileDiscardBlocker, recoveryLocation } from "../domain/discard";
 import { resolveAvailableToolId } from "../domain/external-tools";
 import { fileManagerName, machinePathSeparator } from "../domain/platform";
 import { shortSha } from "../domain/format";
@@ -59,9 +60,7 @@ import { usePathSeparator } from "../app/environment";
 import { loadAppPreferences, loadExternalTools, openFileInEditor } from "../ipc/app-preferences";
 import {
   commitWorkingCopy,
-  discardAll,
   showFileInFileManager,
-  discardFile,
   fetchWorkingCopy,
   generateCommitMessage,
   mutateRepositoryOperation,
@@ -71,13 +70,13 @@ import {
   unwatchWorktree,
   watchWorktree,
 } from "../ipc/worktrees";
-import type { CommitSigning, ConflictResolutionKind, DiscardScope, FileChange, FileDiff, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../ipc/types";
+import type { CommitSigning, ConflictResolutionKind, DiscardResult, FileChange, FileDiff, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../ipc/types";
 import { ChangeKindFilter, ChangeKindFilterTrigger, ChangeKindIcon } from "./ChangeKindFilter";
 import { parseCommitPeople, parseCommitTrailers } from "./commit-form";
 import { useWorkingCopy } from "./context";
 import { sectionHeadingClass, signingItems } from "./labels";
 import { LazyDialog } from "./LazyDialog";
-import { ConflictResolutionDialog, DiffDialog, InlineFileDiff } from "./lazy";
+import { ConflictResolutionDialog, DiffDialog, DiscardDialog, DiscardedChangesDialog, InlineFileDiff } from "./lazy";
 import { operationGuidance, operationLabel, operationSupportsSkip } from "./operations";
 
 export function ChangesWorkbench() {
@@ -119,13 +118,13 @@ export function ChangesWorkbench() {
   const [changeSelection, setChangeSelection] = useState(emptyChangeSelection);
   const [commitSelections, setCommitSelections] = useState<CommitSelectionMap>(() => new Map());
   const changesListRef = useRef<HTMLDivElement>(null);
-  const [busyPath, setBusyPath] = useState<string | null>(null);
+  // A discard or restore is running in one of the dialogs.
+  const [discardBusy, setDiscardBusy] = useState(false);
   const [commitBusy, setCommitBusy] = useState(false);
   const [syncBusy, setSyncBusy] = useState(false);
   const [operationBusy, setOperationBusy] = useState(false);
   const [pendingForcePush, setPendingForcePush] = useState(false);
   const [pendingUndo, setPendingUndo] = useState(false);
-  const [pendingDiscardAll, setPendingDiscardAll] = useState(false);
   const [summary, setSummary] = useState("");
   const [description, setDescription] = useState("");
   const [amend, setAmend] = useState(false);
@@ -144,10 +143,9 @@ export function ChangesWorkbench() {
     kind: ConflictResolutionKind;
     change: WorkingCopySnapshot["changes"][number];
   } | null>(null);
-  const [pendingDiscard, setPendingDiscard] = useState<{
-    change: WorkingCopySnapshot["changes"][number];
-    scope: DiscardScope;
-  } | null>(null);
+  // The file to discard, or null for every change; the review dialog plans the rest.
+  const [pendingDiscard, setPendingDiscard] = useState<{ change: FileChange | null } | null>(null);
+  const [recoveryOpen, setRecoveryOpen] = useState<{ pointId: string | null } | null>(null);
   const [pendingOperationAction, setPendingOperationAction] = useState<RepositoryOperationAction | null>(null);
 
   useEffect(() => {
@@ -180,7 +178,7 @@ export function ChangesWorkbench() {
 
   // Mutations replace the snapshot with their own result, so a disk-triggered reload
   // while one is running would only race it.
-  const mutating = busyPath !== null || commitBusy || syncBusy || operationBusy;
+  const mutating = discardBusy || commitBusy || syncBusy || operationBusy;
   const mutatingRef = useRef(mutating);
   useEffect(() => { mutatingRef.current = mutating; }, [mutating]);
   const reloadController = useRef<AbortController | null>(null);
@@ -280,7 +278,6 @@ export function ChangesWorkbench() {
   // rows to the element as soon as it exists.
   const [diffScroller, setDiffScroller] = useState<HTMLDivElement | null>(null);
   const includedCount = includedChangeCount(visibleChanges, commitSelections);
-  const gitStagedCount = visibleChanges.filter((change) => change.staged).length;
   const allChangesIncluded = visibleChanges.length > 0 && includedCount === visibleChanges.length;
   const syncKind: SyncKind = !snapshot?.upstream
     ? "publish"
@@ -313,7 +310,7 @@ export function ChangesWorkbench() {
   }, [snapshot]);
 
   const toggleSelectedCommitInclusion = () => {
-    if (busyPath !== null || commitBusy || generateBusy) return;
+    if (discardBusy || commitBusy || generateBusy) return;
     const selectedChanges = visibleChanges.filter((change) => (
       listedSelection.selectedIds.has(change.id) && !change.conflicted
     ));
@@ -485,47 +482,16 @@ export function ChangesWorkbench() {
     }
   };
 
-  const applyDiscard = async () => {
-    if (!snapshot || !pendingDiscard) return;
-    setBusyPath(pendingDiscard.change.id);
-    setError(null);
-    try {
-      const next = await discardFile(
-        machineId,
-        repository.path,
-        worktree.path,
-        pendingDiscard.change,
-        pendingDiscard.scope,
-        snapshot.head,
-      );
-      setSnapshot(next);
-      setPendingDiscard(null);
-      toast.add({ type: "success", title: "Changes discarded", description: pendingDiscard.change.path.display });
-    } catch (cause) {
-      setError(toMessage(cause));
-    } finally {
-      setBusyPath(null);
-    }
-  };
-
-  const applyDiscardAll = async () => {
-    if (!snapshot) return;
-    setCommitBusy(true);
-    setError(null);
-    try {
-      const next = await discardAll(machineId, snapshot);
-      setSnapshot(next);
-      setPendingDiscardAll(false);
-      toast.add({
-        type: "success",
-        title: "All changes discarded",
-        description: "Tracked files were restored and reviewed untracked files were removed.",
-      });
-    } catch (cause) {
-      setError(toMessage(cause));
-    } finally {
-      setCommitBusy(false);
-    }
+  const completeDiscard = (result: DiscardResult) => {
+    setSnapshot(result.snapshot);
+    setPendingDiscard(null);
+    const point = result.recoveryPoint;
+    toast.add({
+      type: "success",
+      title: point.kind === "discardAll" ? "All changes discarded" : "Changes discarded",
+      description: `Saved as a recovery point ${recoveryLocation(machineKind)}.`,
+      actionProps: { children: "Show", onClick: () => setRecoveryOpen({ pointId: point.id }) },
+    });
   };
 
   const runOperationAction = async (action: RepositoryOperationAction) => {
@@ -568,7 +534,7 @@ export function ChangesWorkbench() {
           <Checkbox
             checked={allChangesIncluded}
             indeterminate={includedCount > 0 && !allChangesIncluded}
-            disabled={visibleChanges.length === 0 || commitBusy || generateBusy || busyPath !== null}
+            disabled={visibleChanges.length === 0 || commitBusy || generateBusy || discardBusy}
             onCheckedChange={(checked) => setCommitSelections((current) => setChangesIncluded(
               current,
               new Set(visibleChanges.filter((change) => !change.conflicted).map((change) => change.id)),
@@ -589,14 +555,18 @@ export function ChangesWorkbench() {
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-52">
                 <DropdownMenuGroup>
-                  <DropdownMenuItem disabled={!snapshot || commitBusy || busyPath !== null || snapshot.operation !== null} onClick={() => setStashOpen(true)}>
+                  <DropdownMenuItem disabled={!snapshot || commitBusy || discardBusy || snapshot.operation !== null} onClick={() => setStashOpen(true)}>
                     <ArchiveIcon aria-hidden="true" />
                     Stashes
+                  </DropdownMenuItem>
+                  <DropdownMenuItem disabled={!snapshot || commitBusy || discardBusy} onClick={() => setRecoveryOpen({ pointId: null })}>
+                    <ArchiveRestoreIcon aria-hidden="true" />
+                    Discarded changes…
                   </DropdownMenuItem>
                 </DropdownMenuGroup>
                 <DropdownMenuSeparator />
                 <DropdownMenuGroup>
-                  <DropdownMenuItem variant="destructive" disabled={!snapshot || visibleChanges.length === 0 || commitBusy || busyPath !== null || snapshot.operation !== null} onClick={() => setPendingDiscardAll(true)}>
+                  <DropdownMenuItem variant="destructive" disabled={!snapshot || visibleChanges.length === 0 || commitBusy || discardBusy || snapshot.operation !== null} onClick={() => setPendingDiscard({ change: null })}>
                     <Trash2Icon aria-hidden="true" />
                     Discard all changes…
                   </DropdownMenuItem>
@@ -699,7 +669,7 @@ export function ChangesWorkbench() {
                   checked={isIncludedInCommit(commitSelectionFor(commitSelections, change.id))}
                   indeterminate={commitSelectionFor(commitSelections, change.id).kind === "partial"}
                   aria-label={`${isIncludedInCommit(commitSelectionFor(commitSelections, change.id)) ? "Exclude" : "Include"} ${change.path.display} ${isIncludedInCommit(commitSelectionFor(commitSelections, change.id)) ? "from" : "in"} commit`}
-                  disabled={busyPath !== null || commitBusy || generateBusy || change.conflicted}
+                  disabled={discardBusy || commitBusy || generateBusy || change.conflicted}
                   onCheckedChange={(checked) => setCommitSelections((current) => setChangesIncluded(
                     current,
                     new Set([change.id]),
@@ -744,8 +714,9 @@ export function ChangesWorkbench() {
               <ContextMenuContent className="min-w-52">
                 <ContextMenuItem
                   variant="destructive"
-                  disabled={busyPath !== null || commitBusy || generateBusy || change.conflicted || snapshot?.operation !== null}
-                  onClick={() => setPendingDiscard({ change, scope: change.unstaged || change.untracked ? "unstaged" : "all" })}
+                  disabled={discardBusy || commitBusy || generateBusy || snapshot?.operation !== null || fileDiscardBlocker(change) !== null}
+                  title={fileDiscardBlocker(change) ?? undefined}
+                  onClick={() => setPendingDiscard({ change })}
                 >
                   <Trash2Icon aria-hidden="true" />
                   Discard changes…
@@ -861,11 +832,11 @@ export function ChangesWorkbench() {
           <div className="flex shrink-0 items-center gap-2 border-b bg-destructive/8 px-4 py-2">
             <AlertTriangleIcon className="size-4 text-destructive" aria-hidden="true" />
             <strong className="mr-auto text-xs">Resolve this conflict</strong>
-            <Button variant="outline" size="xs" disabled={busyPath !== null} onClick={() => setPendingResolution({ kind: "ours", change: selectedChange })}>Use ours…</Button>
-            <Button variant="outline" size="xs" disabled={busyPath !== null} onClick={() => setPendingResolution({ kind: "theirs", change: selectedChange })}>Use theirs…</Button>
-            <Button variant="outline" size="xs" disabled={busyPath !== null} onClick={() => setPendingResolution({ kind: "both", change: selectedChange })}>Keep both…</Button>
-            <Button variant="outline" size="xs" disabled={busyPath !== null} onClick={() => setPendingResolution({ kind: "manual", change: selectedChange })}>Edit manually…</Button>
-            <Button variant="destructive" size="xs" disabled={busyPath !== null} onClick={() => setPendingResolution({ kind: "remove", change: selectedChange })}>Remove…</Button>
+            <Button variant="outline" size="xs" disabled={discardBusy} onClick={() => setPendingResolution({ kind: "ours", change: selectedChange })}>Use ours…</Button>
+            <Button variant="outline" size="xs" disabled={discardBusy} onClick={() => setPendingResolution({ kind: "theirs", change: selectedChange })}>Use theirs…</Button>
+            <Button variant="outline" size="xs" disabled={discardBusy} onClick={() => setPendingResolution({ kind: "both", change: selectedChange })}>Keep both…</Button>
+            <Button variant="outline" size="xs" disabled={discardBusy} onClick={() => setPendingResolution({ kind: "manual", change: selectedChange })}>Edit manually…</Button>
+            <Button variant="destructive" size="xs" disabled={discardBusy} onClick={() => setPendingResolution({ kind: "remove", change: selectedChange })}>Remove…</Button>
           </div>
         ) : null}
         <div ref={setDiffScroller} className="min-h-0 flex-1 overflow-auto">
@@ -880,7 +851,7 @@ export function ChangesWorkbench() {
                 cache={diffCache}
                 scrollElement={diffScroller}
                 selection={commitSelectionFor(commitSelections, diffChange.id)}
-                selectionDisabled={generateBusy || commitBusy || busyPath !== null}
+                selectionDisabled={generateBusy || commitBusy || discardBusy}
                 onSelectionChange={(selection: FileCommitSelection) => setCommitSelections((current) => {
                   const next = new Map(current);
                   next.set(diffChange.id, selection);
@@ -924,64 +895,32 @@ export function ChangesWorkbench() {
         </LazyDialog>
       ) : null}
       {pendingDiscard ? (
-        <Dialog open onOpenChange={(open) => { if (!open && busyPath === null) setPendingDiscard(null); }}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Discard changes to this file?</DialogTitle>
-              <DialogDescription>This cannot be undone by Repola. Git will revalidate the exact path and status immediately before changing it.</DialogDescription>
-            </DialogHeader>
-            <code className="rounded-md border bg-muted p-3 font-mono text-xs break-all">{pendingDiscard.change.path.display}</code>
-            {pendingDiscard.change.staged && pendingDiscard.change.unstaged ? (
-              <ToggleGroup value={[pendingDiscard.scope]} onValueChange={(value) => { if (value[0]) setPendingDiscard((current) => current ? { ...current, scope: value[0] as DiscardScope } : null); }} className="grid grid-cols-2">
-                <ToggleGroupItem value="unstaged">Unstaged edits only</ToggleGroupItem>
-                <ToggleGroupItem value="all">Staged and unstaged</ToggleGroupItem>
-              </ToggleGroup>
-            ) : null}
-            <Alert variant="destructive">
-              <AlertTriangleIcon aria-hidden="true" />
-              <AlertDescription>
-                {pendingDiscard.change.untracked
-                  ? "This untracked file will be deleted from disk. It is not recoverable from Git."
-                  : pendingDiscard.scope === "all"
-                    ? "Both staged and unstaged changes for this file will be replaced by the current commit."
-                    : "Only unstaged edits will be replaced by the staged version; staged changes are preserved."}
-              </AlertDescription>
-            </Alert>
-            <DialogFooter>
-              <Button variant="outline" disabled={busyPath !== null} onClick={() => setPendingDiscard(null)}>Cancel</Button>
-              <Button variant="destructive" disabled={busyPath !== null} onClick={() => void applyDiscard()}>
-                {busyPath !== null ? <Spinner data-icon="inline-start" /> : <Trash2Icon data-icon="inline-start" aria-hidden="true" />}
-                {busyPath !== null ? "Discarding…" : "Discard Changes"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+        <LazyDialog onClose={() => setPendingDiscard(null)}>
+          <DiscardDialog
+            machineId={machineId}
+            machineKind={machineKind}
+            repositoryPath={repository.path}
+            worktreePath={worktree.path}
+            change={pendingDiscard.change}
+            onBusyChange={setDiscardBusy}
+            onClose={() => setPendingDiscard(null)}
+            onDiscarded={completeDiscard}
+          />
+        </LazyDialog>
       ) : null}
-      {pendingDiscardAll && snapshot ? (
-        <Dialog open onOpenChange={(open) => { if (!open && !commitBusy) setPendingDiscardAll(false); }}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Discard all {visibleChanges.length} changed files?</DialogTitle>
-              <DialogDescription>Repola will revalidate HEAD and the complete reviewed path/status set immediately before Git changes anything.</DialogDescription>
-            </DialogHeader>
-            <div className="grid grid-cols-3 border bg-muted/35">
-              <div className="border-r p-3 text-center"><strong className="block font-mono text-lg">{gitStagedCount}</strong><span className="text-xs text-muted-foreground">staged</span></div>
-              <div className="border-r p-3 text-center"><strong className="block font-mono text-lg">{visibleChanges.filter((change) => change.unstaged && !change.untracked).length}</strong><span className="text-xs text-muted-foreground">unstaged</span></div>
-              <div className="p-3 text-center"><strong className="block font-mono text-lg">{visibleChanges.filter((change) => change.untracked).length}</strong><span className="text-xs text-muted-foreground">untracked</span></div>
-            </div>
-            <Alert variant="destructive">
-              <AlertTriangleIcon aria-hidden="true" />
-              <AlertDescription>Every tracked change will be restored to HEAD. Untracked files and nested untracked repositories in this working copy will be deleted from disk. Ignored files are preserved. Repola cannot undo this action.</AlertDescription>
-            </Alert>
-            <DialogFooter>
-              <Button variant="outline" disabled={commitBusy} onClick={() => setPendingDiscardAll(false)}>Keep Changes</Button>
-              <Button variant="destructive" disabled={commitBusy} onClick={() => void applyDiscardAll()}>
-                {commitBusy ? <Spinner data-icon="inline-start" /> : <Trash2Icon data-icon="inline-start" aria-hidden="true" />}
-                {commitBusy ? "Discarding…" : "Discard Everything"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+      {recoveryOpen ? (
+        <LazyDialog onClose={() => setRecoveryOpen(null)}>
+          <DiscardedChangesDialog
+            machineId={machineId}
+            machineKind={machineKind}
+            repositoryPath={repository.path}
+            worktreePath={worktree.path}
+            initialPointId={recoveryOpen.pointId}
+            onBusyChange={setDiscardBusy}
+            onSnapshot={setSnapshot}
+            onClose={() => setRecoveryOpen(null)}
+          />
+        </LazyDialog>
       ) : null}
       {pendingOperationAction && snapshot?.operation ? (
         <Dialog open onOpenChange={(open) => { if (!open && !operationBusy) setPendingOperationAction(null); }}>

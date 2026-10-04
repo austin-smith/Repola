@@ -5,6 +5,7 @@ mod claude;
 mod codex;
 pub(crate) mod command;
 mod create_worktree;
+mod discard;
 mod discovery;
 mod external_tools;
 mod history;
@@ -16,6 +17,7 @@ mod model_catalog;
 mod models;
 mod operations;
 mod providers;
+mod recovery;
 mod repository;
 mod stash;
 mod sync;
@@ -28,6 +30,7 @@ pub use crate::preferences::{TextGenerationProvider, TextGenerationSelection};
 pub use actions::{execute_action, prepare_action};
 pub use branches::{branches, mutate_branch};
 pub use create_worktree::create_worktree;
+pub use discard::{discard_changes, plan_discard};
 pub use discovery::{resolve_repository, scan, scan_streaming, ScanError};
 pub use external_tools::{
     available_external_tools, launch_worktree_tool, open_file_in_editor, working_copy_entry_path,
@@ -41,21 +44,29 @@ pub use models::{
     ApplyPatchHunkRequest, BranchInfo, BranchMutationRequest, BranchMutationResult, BranchRequest,
     CloneRepositoryRequest, CommitChangedFile, CommitFileDiffRequest, CommitFilesRequest,
     CommitRequest, CommitResult, ConflictFile, ConflictFileRequest, CreateRepositoryRequest,
-    CreateWorktreeRequest, CreateWorktreeResult, DiscardAllRequest, DiscardFileRequest,
-    DiscardScope, FileDiff, FileDiffRequest, GenerateCommitMessageRequest, GeneratedCommitMessage,
-    HistoryMutationKind, HistoryMutationRequest, HistoryMutationResult, HistoryPage,
-    HistoryRequest, PatchHunk, PatchHunkAction, PullRequestEvidence, PullRequestMutationKind,
-    PullRequestMutationRequest, PullRequestMutationResult, ReasoningEffort, ReflogEntry,
-    ReflogRequest, RepositoryOperationAction, RepositoryOperationMutationResult,
-    RepositoryOperationRequest, RepositoryOperationResult, ResolveConflictRequest,
-    ReviewedFileChange, ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry,
-    StashMutationRequest, StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo,
-    TagMutationKind, TagMutationRequest, TagMutationResult, TagRequest, TextGenerationModel,
-    TextGenerationStatus, TextGenerationStatusKind, UndoCommitRequest, UndoCommitResult,
-    WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges,
+    CreateWorktreeRequest, CreateWorktreeResult, DeleteRecoveryPointsRequest, DiscardEffect,
+    DiscardPlan, DiscardPlanEntry, DiscardPlanRequest, DiscardRequest, DiscardResult, DiscardScope,
+    DiscardTarget, FileDiff, FileDiffRequest, GenerateCommitMessageRequest, GeneratedCommitMessage,
+    GitPath, HistoryMutationKind, HistoryMutationRequest, HistoryMutationResult, HistoryPage,
+    HistoryRequest, KeptChange, KeptChangeReason, PatchHunk, PatchHunkAction, PullRequestEvidence,
+    PullRequestMutationKind, PullRequestMutationRequest, PullRequestMutationResult,
+    ReasoningEffort, RecoveryFileDiff, RecoveryFileDiffRequest, RecoveryPoint, RecoveryPointKind,
+    RecoveryPointReference, RecoveryPointRequest, RecoveryRestoreEntry, RecoveryRestorePlan,
+    RecoveryRestoreRequest, RecoveryRestoreResult, ReflogEntry, ReflogRequest,
+    RepositoryOperationAction, RepositoryOperationMutationResult, RepositoryOperationRequest,
+    RepositoryOperationResult, ResolveConflictRequest, RestoreEffect, ReviewedFileChange,
+    ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry, StashMutationRequest,
+    StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo, TagMutationKind,
+    TagMutationRequest, TagMutationResult, TagRequest, TextGenerationModel, TextGenerationStatus,
+    TextGenerationStatusKind, UndoCommitRequest, UndoCommitResult, WorkingCopyRequest,
+    WorkingCopySnapshot, WorktreeChanges,
 };
 pub use operations::mutate_operation;
 pub use providers::{fetch_pull_requests, mutate_pull_request};
+pub use recovery::{
+    delete_recovery_points, list_recovery_points, plan_recovery_restore, recovery_file_diff,
+    restore_recovery_point,
+};
 pub use repository::{clone_repository, create_repository};
 pub use stash::{list_stashes, mutate_stash};
 pub use sync::synchronize;
@@ -64,8 +75,8 @@ pub(crate) use text_generation::{commit_message_provider_timeout, text_generatio
 pub use text_generation::{generate_commit_message, text_generation_status};
 pub use watch::{WorktreeChangeEvent, WorktreeWatcher};
 pub use working_copy::{
-    apply_patch_hunk, commit, conflict_file, discard_all, discard_file, file_diff,
-    resolve_conflict, set_file_staging, undo_commit, working_copy_snapshot,
+    apply_patch_hunk, commit, conflict_file, file_diff, resolve_conflict, set_file_staging,
+    undo_commit, working_copy_snapshot,
 };
 
 pub(crate) fn git_version() -> Result<String, String> {

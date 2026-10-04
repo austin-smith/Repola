@@ -19,6 +19,8 @@ vi.mock("./context", () => ({ useWorkingCopy: () => ({
 }) }));
 vi.mock("./lazy", () => ({
   InlineFileDiff: ({ selectionDisabled }: { selectionDisabled: boolean }) => <input type="checkbox" aria-label="Select diff line" disabled={selectionDisabled} />,
+  DiscardDialog: ({ change }: { change: { path: { display: string } } | null }) => <div role="dialog" aria-label="Discard review">{change ? change.path.display : "every change"}</div>,
+  DiscardedChangesDialog: ({ initialPointId }: { initialPointId: string | null }) => <div role="dialog" aria-label="Discarded changes">{initialPointId ?? "no point"}</div>,
 }));
 
 const snapshot: WorkingCopySnapshot = {
@@ -60,7 +62,14 @@ describe("commit-message generation", () => {
     expect(screen.getByRole("menuitem", { name: "Stashes" })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: "Force push…" })).not.toBeInTheDocument();
     await act(async () => fireEvent.click(screen.getByRole("menuitem", { name: "Discard all changes…" })));
-    expect(screen.getByRole("dialog", { name: "Discard all 1 changed files?" })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Discard review" })).toHaveTextContent("every change");
+  });
+
+  it("opens the discarded changes from the menu", async () => {
+    await act(async () => { render(<ChangesWorkbench />); });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "More change actions" })));
+    await act(async () => fireEvent.click(screen.getByRole("menuitem", { name: "Discarded changes…" })));
+    expect(screen.getByRole("dialog", { name: "Discarded changes" })).toHaveTextContent("no point");
   });
 
   it("offers force push for diverged branches through its existing confirmation", async () => {

@@ -188,11 +188,30 @@ where
         AgentRequest::ConflictFile { request } => worktree::conflict_file(request)
             .map(|file| AgentResult::ConflictFile { file })
             .map_err(AgentError::operation),
-        AgentRequest::DiscardFile { request } => worktree::discard_file(request)
-            .map(|snapshot| AgentResult::WorkingCopyUpdated { snapshot })
+        AgentRequest::PlanDiscard { request } => worktree::plan_discard(request)
+            .map(|plan| AgentResult::DiscardPlan { plan })
             .map_err(AgentError::operation),
-        AgentRequest::DiscardAll { request } => worktree::discard_all(request)
-            .map(|snapshot| AgentResult::WorkingCopyUpdated { snapshot })
+        AgentRequest::Discard { request } => worktree::discard_changes(request)
+            .map(|result| AgentResult::Discarded {
+                result: Box::new(result),
+            })
+            .map_err(AgentError::operation),
+        AgentRequest::RecoveryPoints { request } => worktree::list_recovery_points(request)
+            .map(|points| AgentResult::RecoveryPoints { points })
+            .map_err(AgentError::operation),
+        AgentRequest::PlanRecoveryRestore { request } => worktree::plan_recovery_restore(request)
+            .map(|plan| AgentResult::RecoveryRestorePlan { plan })
+            .map_err(AgentError::operation),
+        AgentRequest::RestoreRecoveryPoint { request } => worktree::restore_recovery_point(request)
+            .map(|result| AgentResult::RecoveryRestored {
+                result: Box::new(result),
+            })
+            .map_err(AgentError::operation),
+        AgentRequest::RecoveryFileDiff { request } => worktree::recovery_file_diff(request)
+            .map(|diff| AgentResult::RecoveryFileDiff { diff })
+            .map_err(AgentError::operation),
+        AgentRequest::DeleteRecoveryPoints { request } => worktree::delete_recovery_points(request)
+            .map(|points| AgentResult::RecoveryPoints { points })
             .map_err(AgentError::operation),
         AgentRequest::ApplyPatchHunk { request } => worktree::apply_patch_hunk(request)
             .map(|snapshot| AgentResult::WorkingCopyUpdated { snapshot })

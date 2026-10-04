@@ -345,6 +345,94 @@ export interface ConflictFile {
 }
 export type DiscardScope = "unstaged" | "all";
 
+/** What a discard covers. Every discard is planned, then executed against the plan's fingerprint. */
+export type DiscardTarget =
+  | { kind: "file"; path: GitPath; scope: DiscardScope }
+  | { kind: "all" };
+
+export type DiscardEffect = "restoreCommitted" | "restoreStaged" | "remove" | "unstage";
+
+export interface DiscardPlanEntry {
+  path: GitPath;
+  previousPath: GitPath | null;
+  kind: FileChangeKind;
+  effect: DiscardEffect;
+}
+
+export type KeptChangeReason = "submodule" | "nestedRepository";
+
+/** A change a discard leaves alone because its content cannot be saved in a recovery point. */
+export interface KeptChange {
+  path: GitPath;
+  reason: KeptChangeReason;
+}
+
+export interface DiscardPlan {
+  target: DiscardTarget;
+  entries: DiscardPlanEntry[];
+  kept: KeptChange[];
+  /** Working-tree bytes the recovery point adds to the repository's object store. */
+  backupBytes: number;
+  fingerprint: string;
+}
+
+export interface DiscardResult {
+  snapshot: WorkingCopySnapshot;
+  recoveryPoint: RecoveryPoint;
+}
+
+export type RecoveryPointKind = "discardFile" | "discardAll" | "restore";
+
+/** Content Repola saved under `refs/repola/discarded/` before discarding or overwriting it. */
+export interface RecoveryPoint {
+  /** The full reference name. */
+  id: string;
+  /** The tree the reference points at. */
+  oid: string;
+  kind: RecoveryPointKind;
+  summary: string;
+  /** RFC 3339 UTC timestamp. */
+  createdAt: string;
+  worktreePath: string;
+  head: string | null;
+  pathCount: number;
+  /** The first saved paths, for display; `pathCount` is authoritative. */
+  paths: GitPath[];
+  storedBytes: number;
+}
+
+export interface RecoveryPointReference {
+  id: string;
+  oid: string;
+}
+
+export type RestoreEffect = "unchanged" | "create" | "replace" | "remove";
+
+export interface RecoveryRestoreEntry {
+  path: GitPath;
+  worktree: RestoreEffect;
+  indexChanges: boolean;
+}
+
+export interface RecoveryRestorePlan {
+  point: RecoveryPoint;
+  entries: RecoveryRestoreEntry[];
+  fingerprint: string;
+}
+
+export interface RecoveryRestoreResult {
+  snapshot: WorkingCopySnapshot;
+  /** The recovery point holding what the restore replaced, when there was anything. */
+  replaced: RecoveryPoint | null;
+}
+
+/** The change restoring one saved path would make to the working tree. */
+export interface RecoveryFileDiff {
+  patch: string;
+  binary: boolean;
+  truncated: boolean;
+}
+
 export interface WorkingCopySnapshot {
   repositoryPath: string;
   worktreePath: string;

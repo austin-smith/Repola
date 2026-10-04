@@ -299,8 +299,13 @@ fn validate_handshake(
         | AgentRequest::SetFileStaging { .. }
         | AgentRequest::ResolveConflict { .. }
         | AgentRequest::ConflictFile { .. }
-        | AgentRequest::DiscardFile { .. }
-        | AgentRequest::DiscardAll { .. }
+        | AgentRequest::PlanDiscard { .. }
+        | AgentRequest::Discard { .. }
+        | AgentRequest::RecoveryPoints { .. }
+        | AgentRequest::PlanRecoveryRestore { .. }
+        | AgentRequest::RestoreRecoveryPoint { .. }
+        | AgentRequest::RecoveryFileDiff { .. }
+        | AgentRequest::DeleteRecoveryPoints { .. }
         | AgentRequest::ApplyPatchHunk { .. }
         | AgentRequest::MutateRepositoryOperation { .. }
         | AgentRequest::Commit { .. }
@@ -368,8 +373,13 @@ fn operation_timeout(request: &AgentRequest) -> Duration {
         | AgentRequest::SetFileStaging { .. }
         | AgentRequest::ResolveConflict { .. }
         | AgentRequest::ConflictFile { .. }
-        | AgentRequest::DiscardFile { .. }
-        | AgentRequest::DiscardAll { .. }
+        | AgentRequest::PlanDiscard { .. }
+        | AgentRequest::Discard { .. }
+        | AgentRequest::RecoveryPoints { .. }
+        | AgentRequest::PlanRecoveryRestore { .. }
+        | AgentRequest::RestoreRecoveryPoint { .. }
+        | AgentRequest::RecoveryFileDiff { .. }
+        | AgentRequest::DeleteRecoveryPoints { .. }
         | AgentRequest::ApplyPatchHunk { .. }
         | AgentRequest::MutateRepositoryOperation { .. }
         | AgentRequest::Commit { .. }
