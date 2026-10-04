@@ -435,6 +435,9 @@ pub(super) fn observe_paths(
         folder_permissions: Option<u32>,
         chain: ParentChain,
     }
+    // Two Git paths that are one entry on disk, as case or Unicode
+    // normalization can make them, would be saved as two copies of one file.
+    let mut entries_on_disk: HashMap<(u64, u64), &GitPath> = HashMap::new();
     let mut observed = Vec::with_capacity(paths.len());
     for (path, valid) in paths.iter().zip(&validated) {
         let chain = parent_chain(worktree, valid)?;
@@ -461,6 +464,14 @@ pub(super) fn observe_paths(
             }
             Err(error) => return Err(format!("{} could not be inspected: {error}", path.display)),
         };
+        if let Some(identity) = single_entry_identity(&metadata) {
+            if let Some(other) = entries_on_disk.insert(identity, path) {
+                return Err(format!(
+                    "{} and {} are spelled differently but are one file on this file system, so Repola cannot save them separately. Undo this change with Git instead.",
+                    other.display, path.display
+                ));
+            }
+        }
         let file_type = metadata.file_type();
         if file_type.is_dir() {
             item.directory = true;
@@ -629,6 +640,22 @@ struct ParentChain {
     /// The first one that does not is a file or a link rather than missing.
     blocked: bool,
     permissions: Vec<u32>,
+}
+
+/// The device and inode of an entry no other name links to: a folder, or a
+/// file with one link. Two paths with the same identity are one entry under
+/// two spellings; hard links are separate entries by design.
+#[cfg(unix)]
+fn single_entry_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.is_dir() || metadata.nlink() == 1).then(|| (metadata.dev(), metadata.ino()))
+}
+
+/// Windows compares names exactly apart from case, which `core.ignorecase`
+/// already covers.
+#[cfg(windows)]
+fn single_entry_identity(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 #[cfg(unix)]
@@ -3320,6 +3347,37 @@ mod tests {
         let mut second = vec!["bbb".to_string(), "c".to_string()];
         assert_eq!(keep_within(&mut second, &mut budget).expect("second"), 1);
         assert_eq!(second, ["bbb"]);
+    }
+
+    #[test]
+    fn two_spellings_of_one_file_on_disk_are_refused() {
+        let (_directory, path) = repository();
+        // Even where Git is told names are case-sensitive, the file system
+        // decides which spellings are one file.
+        git(&path, &["config", "core.ignorecase", "false"]);
+        fs::write(path.join("caf\u{e9}.txt"), b"one file\n").expect("write");
+        for (stored, other) in [
+            ("caf\u{e9}.txt", "CAF\u{c9}.TXT"),
+            ("caf\u{e9}.txt", "cafe\u{301}.txt"),
+        ] {
+            if !path.join(other).exists() {
+                // This file system tells the spellings apart.
+                continue;
+            }
+            let paths = [git_path(stored.as_bytes()), git_path(other.as_bytes())];
+            let error = observe_paths(&path, None, &paths, false).expect_err("one file");
+            assert!(error.contains("spelled differently"), "{error}");
+        }
+        // Hard links are separate names on purpose and stay allowed.
+        #[cfg(unix)]
+        {
+            fs::hard_link(path.join("caf\u{e9}.txt"), path.join("linked.txt")).expect("link");
+            let paths = [
+                git_path("caf\u{e9}.txt".as_bytes()),
+                git_path(b"linked.txt"),
+            ];
+            observe_paths(&path, None, &paths, false).expect("hard links");
+        }
     }
 
     #[test]
