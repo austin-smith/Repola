@@ -1209,7 +1209,19 @@ mod tests {
         let nested = path.join("nested");
         std::fs::create_dir(&nested).expect("nested directory");
         git(&nested, &["init", "--quiet"]);
-        git(&nested, &["commit", "--allow-empty", "-m", "nested"]);
+        git(
+            &nested,
+            &[
+                "-c",
+                "user.name=Repola Test",
+                "-c",
+                "user.email=repola@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "nested",
+            ],
+        );
         git(&path, &["add", "nested"]);
         write(&path, "base.txt", b"changed\n");
 
