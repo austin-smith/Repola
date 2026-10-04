@@ -153,22 +153,26 @@ struct Manifest {
 }
 
 /// Digest of everything a destructive action depends on: HEAD, any
-/// in-progress operation, and the exact state of every path it touches.
-pub(super) fn fingerprint(
+/// in-progress operation, the exact state of every path it touches, and the
+/// reviewed plan when that state alone does not determine it.
+pub(super) fn fingerprint<P: Serialize + ?Sized>(
     head: Option<&str>,
     operation: Option<RepositoryOperation>,
     states: &[PathState],
+    plan: &P,
 ) -> Result<String, String> {
     #[derive(Serialize)]
-    struct Fingerprinted<'a> {
+    struct Fingerprinted<'a, P: ?Sized> {
         head: Option<&'a str>,
         operation: Option<RepositoryOperation>,
         paths: &'a [PathState],
+        plan: &'a P,
     }
     let bytes = serde_json::to_vec(&Fingerprinted {
         head,
         operation,
         paths: states,
+        plan,
     })
     .map_err(|error| format!("Could not fingerprint the working copy: {error}"))?;
     Ok(hex(Sha256::digest(&bytes).as_slice()))
@@ -1023,7 +1027,7 @@ pub fn plan_recovery_restore(request: RecoveryPointRequest) -> Result<RecoveryRe
     Ok(RecoveryRestorePlan {
         point,
         entries,
-        fingerprint: fingerprint(snapshot.head.as_deref(), snapshot.operation, &current)?,
+        fingerprint: fingerprint(snapshot.head.as_deref(), snapshot.operation, &current, &())?,
     })
 }
 
@@ -1072,7 +1076,9 @@ pub fn restore_recovery_point(
     let (point, saved) = load_point(&worktree, &request.point)?;
     let paths: Vec<GitPath> = saved.iter().map(|state| state.path.clone()).collect();
     let current = observe_paths(&worktree, snapshot.head.as_deref(), &paths, true)?;
-    if fingerprint(snapshot.head.as_deref(), snapshot.operation, &current)? != request.fingerprint {
+    if fingerprint(snapshot.head.as_deref(), snapshot.operation, &current, &())?
+        != request.fingerprint
+    {
         return Err(
             "The working copy changed after this restore was reviewed. Review it again.".into(),
         );

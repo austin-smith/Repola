@@ -236,13 +236,30 @@ pub fn plan_discard(request: DiscardPlanRequest) -> Result<DiscardPlan, String> 
         &selection,
         false,
     )?;
+    let fingerprint = plan_fingerprint(&snapshot, &selection, &states)?;
     Ok(DiscardPlan {
         target: request.target,
         entries: selection.entries,
         kept: selection.kept,
         backup_bytes: stored_bytes(&states),
-        fingerprint: fingerprint(snapshot.head.as_deref(), snapshot.operation, &states)?,
+        fingerprint,
     })
+}
+
+/// Covers the reviewed effects as well as the observed paths: if the index
+/// changes while a plan is made, the paths it observed can select a different
+/// effect when the discard runs.
+fn plan_fingerprint(
+    snapshot: &WorkingCopySnapshot,
+    selection: &Selection,
+    states: &[PathState],
+) -> Result<String, String> {
+    fingerprint(
+        snapshot.head.as_deref(),
+        snapshot.operation,
+        states,
+        &selection.entries,
+    )
 }
 
 /// Executes a reviewed discard. The content it removes is saved as a
@@ -257,7 +274,7 @@ pub fn discard_changes(request: DiscardRequest) -> Result<DiscardResult, String>
     // Hashing with `store` writes the very bytes being fingerprinted, so the
     // recovery point holds exactly the reviewed content.
     let states = observe(worktree, snapshot.head.as_deref(), &selection, true)?;
-    if fingerprint(snapshot.head.as_deref(), snapshot.operation, &states)? != request.fingerprint {
+    if plan_fingerprint(&snapshot, &selection, &states)? != request.fingerprint {
         return Err(STALE_PLAN.into());
     }
     let recovery_point = store_recovery_point(
@@ -1023,6 +1040,40 @@ mod tests {
         );
         assert!(!path.join("deep/a/b").exists());
         assert!(path.join("deep/a/other.txt").is_file());
+    }
+
+    #[test]
+    fn a_plan_whose_index_changed_mid_review_never_runs_a_different_effect() {
+        let directory = repository();
+        let path = root(&directory);
+        base_commit(&path);
+        write(&path, "modified.txt", b"edited\n");
+        let target = DiscardTarget::File {
+            path: path_of(&path, "modified.txt"),
+            scope: DiscardScope::Unstaged,
+        };
+        // Planning as `plan_discard` does, with the file leaving the index
+        // between the snapshot and the observation: the plan shows restoring
+        // the staged version, but its paths now select removing the file.
+        let snapshot = working_copy_snapshot(request(&path)).expect("snapshot");
+        let selection = select(&snapshot, &target).expect("select");
+        assert_eq!(selection.entries[0].effect, DiscardEffect::RestoreStaged);
+        git(&path, &["rm", "--cached", "--quiet", "modified.txt"]);
+        let worktree = Path::new(&snapshot.worktree_path);
+        let states =
+            observe(worktree, snapshot.head.as_deref(), &selection, false).expect("observe");
+        let error = discard_changes(DiscardRequest {
+            repository_path: request(&path).repository_path,
+            worktree_path: request(&path).worktree_path,
+            target,
+            fingerprint: plan_fingerprint(&snapshot, &selection, &states).expect("fingerprint"),
+        })
+        .expect_err("changed review");
+        assert_eq!(error, STALE_PLAN);
+        assert_eq!(
+            std::fs::read(path.join("modified.txt")).expect("read"),
+            b"edited\n"
+        );
     }
 
     fn effect_of(plan: &DiscardPlan, display: &str) -> DiscardEffect {
