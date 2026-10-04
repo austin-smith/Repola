@@ -104,14 +104,16 @@ describe("recovery points", () => {
       { path: { display: "c", token: "63" }, worktree: "create", indexChanges: false },
       { path: { display: "d", token: "64" }, worktree: "replace", indexChanges: true },
       { path: { display: "e", token: "65" }, worktree: "createFolder", indexChanges: false },
+      { path: { display: "f", token: "66" }, worktree: "folderPermissions", indexChanges: false },
     ];
-    expect(restoreChanges(entries).map((entry) => entry.path.display)).toEqual(["b", "c", "d", "e"]);
+    expect(restoreChanges(entries).map((entry) => entry.path.display)).toEqual(["b", "c", "d", "e", "f"]);
     expect(entries.map(restoreEffectLabel)).toEqual([
       "Already matches",
       "Restore the saved staged state",
       "Recreate the saved file",
       "Replace the current content and the saved staged state",
       "Recreate the saved folder",
+      "Restore the saved folder's permissions",
     ]);
   });
 

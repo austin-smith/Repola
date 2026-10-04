@@ -87,6 +87,8 @@ export function restoreEffectLabel(entry: RecoveryRestoreEntry): string {
       return entry.indexChanges ? "Remove the current file and restore the saved staged state" : "Remove the current file";
     case "createFolder":
       return `Recreate the saved folder${staged}`;
+    case "folderPermissions":
+      return `Restore the saved folder's permissions${staged}`;
     case "unchanged":
       return entry.indexChanges ? "Restore the saved staged state" : "Already matches";
   }

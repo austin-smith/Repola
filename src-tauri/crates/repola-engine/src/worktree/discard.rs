@@ -1783,6 +1783,13 @@ mod tests {
         std::fs::remove_dir(path.join("f")).expect("remove folder");
         restore(&path, &discarded.recovery_point);
         assert!(path.join("f").is_dir());
+
+        // So are its permissions, when the folder is still there.
+        std::fs::set_permissions(path.join("f"), std::fs::Permissions::from_mode(0o755))
+            .expect("widen");
+        restore(&path, &discarded.recovery_point);
+        let folder = std::fs::metadata(path.join("f")).expect("folder");
+        assert_eq!(folder.permissions().mode() & 0o777, 0o700);
     }
 
     fn effect_of(plan: &DiscardPlan, display: &str) -> DiscardEffect {

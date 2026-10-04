@@ -870,6 +870,8 @@ pub enum RestoreEffect {
     /// A folder stood at the path when it was saved; whatever is there now is
     /// removed and the folder comes back.
     CreateFolder,
+    /// The saved folder is there, and only its permissions change back.
+    FolderPermissions,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

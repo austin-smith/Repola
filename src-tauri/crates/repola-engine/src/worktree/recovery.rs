@@ -119,12 +119,18 @@ impl PathState {
     }
 
     /// Whether restoring `saved` over this state changes anything: its index
-    /// entries, its file, or the folder that stood at the path. A folder there
-    /// now is never removed by a restore.
+    /// entries, its file, or the folder that stood at the path and its
+    /// permissions. A folder there now is never removed by a restore.
     fn differs_from(&self, saved: &PathState) -> bool {
         self.index != saved.index
             || self.worktree != saved.worktree
             || saved.directory && !self.directory
+            || self.folder_permissions_differ(saved)
+    }
+
+    /// The saved folder is still there, with other permissions.
+    fn folder_permissions_differ(&self, saved: &PathState) -> bool {
+        saved.directory && self.directory && saved.folder_permissions != self.folder_permissions
     }
 }
 
@@ -1750,6 +1756,9 @@ fn restore_effect(saved: &PathState, current: &PathState) -> RestoreEffect {
     if saved.directory && !current.directory {
         return RestoreEffect::CreateFolder;
     }
+    if current.folder_permissions_differ(saved) {
+        return RestoreEffect::FolderPermissions;
+    }
     match (saved.worktree.as_ref(), current.worktree.as_ref()) {
         (saved, current) if saved == current => RestoreEffect::Unchanged,
         (Some(_), None) => RestoreEffect::Create,
@@ -1861,6 +1870,11 @@ fn apply_restore(
     for (saved, current) in changed {
         if saved.directory && !current.directory {
             restore_folder(worktree, saved, &mut folders)?;
+        } else if current.folder_permissions_differ(saved) {
+            let location = inspect_path(worktree, &WorktreePath::new(&saved.path)?)?;
+            if let (Some(location), Some(mode)) = (location, saved.folder_permissions) {
+                folders.push((location, mode));
+            }
         }
     }
     for (saved, current) in changed {
