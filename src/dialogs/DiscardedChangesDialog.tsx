@@ -209,6 +209,8 @@ export default function DiscardedChangesDialog({
           <DeleteReview points={view.points} busy={busy} onBack={() => setView({ kind: "list" })} onConfirm={() => void remove(view.points)} />
         ) : view.kind === "restore" ? (
           <RestoreReview
+            // A fresh review starts without the previous review's previews.
+            key={view.review}
             machineId={machineId}
             repositoryPath={repositoryPath}
             worktreePath={worktreePath}

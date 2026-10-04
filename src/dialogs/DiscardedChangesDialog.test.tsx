@@ -106,14 +106,17 @@ describe("DiscardedChangesDialog", () => {
     expect(await screen.findByText("Replaced while restoring")).toBeInTheDocument();
   });
 
-  it("reviews the restore again after a refusal", async () => {
+  it("reviews the restore again after a refusal, without the earlier preview", async () => {
     ipc.restoreRecoveryPoint.mockRejectedValue(new Error("The working copy changed after this restore was reviewed."));
     renderDialog();
     fireEvent.click(await screen.findByRole("button", { name: "Review Restore…" }));
-    const restore = await screen.findByRole("button", { name: "Restore 1 Path" });
-    await act(async () => fireEvent.click(restore));
+    expect(await screen.findByTestId("patch-diff")).toHaveTextContent("+saved");
+    ipc.loadRecoveryFileDiff.mockImplementation(() => new Promise(() => undefined));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Restore 1 Path" })));
     expect(await screen.findByText(/changed after this restore was reviewed/)).toBeInTheDocument();
     await waitFor(() => expect(ipc.planRecoveryRestore).toHaveBeenCalledTimes(2));
+    await screen.findByRole("button", { name: "Restore 1 Path" });
+    expect(screen.queryByTestId("patch-diff")).not.toBeInTheDocument();
   });
 
   it("restores only what the latest review planned and cancels the review it left", async () => {
