@@ -2,6 +2,8 @@ import { isTauri } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { useSyncExternalStore } from "react";
+import { acceptsReleaseVersion } from "@/domain/release-channel";
+import { releaseChannel } from "./release";
 
 export type UpdaterState =
   | { status: "idle" }
@@ -49,6 +51,10 @@ export function checkForUpdates(reportErrors = true): Promise<void> {
         activeUpdate = null;
       }
       const update = await check({ timeout: 20_000 });
+      if (update && !acceptsReleaseVersion(releaseChannel, update.version)) {
+        await update.close();
+        throw new Error(`The update feed offered ${update.version}, which does not belong to the installed ${releaseChannel} channel.`);
+      }
       activeUpdate = update;
       if (update) {
         publish({ status: "available", version: update.version, notes: update.body ?? null });

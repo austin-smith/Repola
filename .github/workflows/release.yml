@@ -2,63 +2,132 @@ name: Release
 
 on:
   push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+    tags: ["v*"]
+  schedule:
+    - cron: "17 9 * * *"
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Operation to run for the selected branch
+        required: true
+        type: choice
+        default: Build installers
+        options: [Build installers, Publish nightly]
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
+  actions: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-build-${{ github.ref }}-${{ inputs.operation == 'Build installers' && 'installers' || 'release' }}
   cancel-in-progress: false
 
 jobs:
-  package:
-    name: ${{ matrix.label }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      # tauri-action merges every platform into one latest.json asset. Publishing
-      # these concurrently races the release asset's replace operation.
-      max-parallel: 1
-      matrix:
-        include:
-          - label: macOS Apple Silicon
-            os: macos-latest
-            target: aarch64-apple-darwin
-            tauri_args: --target aarch64-apple-darwin
-            executable_suffix: ""
-          - label: macOS Intel
-            os: macos-latest
-            target: x86_64-apple-darwin
-            tauri_args: --target x86_64-apple-darwin
-            executable_suffix: ""
-          - label: Linux x64
-            os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            tauri_args: ""
-            executable_suffix: ""
-          - label: Windows x64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            tauri_args: ""
-            executable_suffix: .exe
+  build-installers:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'Build installers'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build-installers.yml
+    secrets: inherit
 
+  plan:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation == 'Publish nightly'
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.metadata.outputs.skip }}
+      sha: ${{ steps.metadata.outputs.sha }}
+      version: ${{ steps.metadata.outputs.version }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      channel: ${{ steps.metadata.outputs.channel }}
     steps:
+      - name: Require main
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          REPOLA_SOURCE_REF: ${{ github.ref }}
+        run: test "$REPOLA_SOURCE_REF" = refs/heads/main
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Linux system dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils
-
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-          cache: pnpm
+      - name: Plan release
+        id: metadata
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/release/release-metadata.mjs resolve "$RUNNER_TEMP/repola-release/metadata/release.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.metadata.outputs.skip != 'true'
+        with:
+          name: release-metadata
+          path: ${{ runner.temp }}/repola-release/metadata/release.json
+          if-no-files-found: error
+
+  package:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      REPOLA_RELEASE_SHA: ${{ needs.plan.outputs.sha }}
+      REPOLA_SIGNING_PUBLIC_KEY: ${{ vars.REPOLA_SIGNING_PUBLIC_KEY }}
+      VITE_REPOLA_RELEASE_CHANNEL: ${{ needs.plan.outputs.channel }}
+      VITE_REPOLA_VERSION: ${{ needs.plan.outputs.version }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ vars.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+      AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+      AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            desktop: true
+          - label: Linux x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            desktop: true
+          - label: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            desktop: true
+          - label: Linux arm64 agent
+            os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            desktop: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-metadata
+          path: ${{ runner.temp }}/repola-release/metadata
+      - name: Verify checkout
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$REPOLA_RELEASE_SHA"
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux' && matrix.desktop
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Install pnpm
+        shell: bash
+        run: npm install --global --ignore-scripts "$(node --print 'require("./package.json").packageManager')"
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: stable
@@ -68,167 +137,148 @@ jobs:
           workspaces: src-tauri
           key: release-${{ matrix.target }}
       - run: pnpm install --frozen-lockfile
-
-      - name: Prepare App Store Connect private key
+      - name: Stamp release version
+        shell: bash
+        run: node scripts/release/release-metadata.mjs stamp "$RUNNER_TEMP/repola-release/metadata/release.json"
+      - name: Azure login for Windows signing
+        if: runner.os == 'Windows'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Install Windows signing runtime
+        if: runner.os == 'Windows'
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 8.0.x
+      - name: Prepare Windows signing
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/release/windows-signing.ps1 -Operation prepare
+      - name: Prepare macOS signing
         if: runner.os == 'macOS'
         shell: bash
         env:
-          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
-        run: |
-          if [[ -n "$APPLE_API_PRIVATE_KEY" ]]; then
-            umask 077
-            key_path="$RUNNER_TEMP/repola-notarization-key.p8"
-            printf '%s' "$APPLE_API_PRIVATE_KEY" > "$key_path"
-            echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
-          fi
-
-      - name: Validate release trust and generate signed-build configuration
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY_BASE64 }}
+        run: node scripts/release/macos-signing.mjs prepare
+      - name: Configure release bundles
+        shell: bash
         env:
-          REPOLA_SIGNING_PUBLIC_KEY: ${{ vars.REPOLA_SIGNING_PUBLIC_KEY }}
-          REPOLA_WINDOWS_SIGN_COMMAND: ${{ vars.REPOLA_WINDOWS_SIGN_COMMAND }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-        run: node scripts/prepare-release.mjs
-
-      - name: Build matching remote agent
+        run: node scripts/release/prepare-release.mjs "$RUNNER_TEMP/repola-release/metadata/release.json"
+      - name: Build agent
         working-directory: src-tauri
         run: cargo build --locked --release --package repola-engine --bin repola-agent --target ${{ matrix.target }}
-
-      - name: Stage agent artifact and checksum
-        shell: bash
+      - name: Sign Windows agent
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          REPOLA_TARGET: ${{ matrix.target }}
+        run: ./scripts/release/windows-signing.ps1 -Operation sign -FilePath "src-tauri/target/$env:REPOLA_TARGET/release/repola-agent.exe"
+      - name: Build desktop bundle
+        if: matrix.desktop
+        env:
+          TAURI_BUNDLER_DMG_IGNORE_CI: ${{ runner.os == 'macOS' && 'true' || 'false' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
+      - name: Verify Windows release signatures
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          REPOLA_TARGET: ${{ matrix.target }}
         run: |
-          mkdir -p release-agent
-          cp "src-tauri/target/${{ matrix.target }}/release/repola-agent${{ matrix.executable_suffix }}" "release-agent/repola-agent-${{ matrix.target }}${{ matrix.executable_suffix }}"
-          cd release-agent
-          if command -v shasum >/dev/null 2>&1; then
-            shasum -a 256 "repola-agent-${{ matrix.target }}${{ matrix.executable_suffix }}" > "repola-agent-${{ matrix.target }}${{ matrix.executable_suffix }}.sha256"
-          else
-            sha256sum "repola-agent-${{ matrix.target }}${{ matrix.executable_suffix }}" > "repola-agent-${{ matrix.target }}${{ matrix.executable_suffix }}.sha256"
-          fi
-
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: Sign agent artifact with GitHub OIDC identity
-        shell: bash
-        run: cosign sign-blob --yes --bundle "release-agent/repola-agent-${{ matrix.target }}${{ matrix.executable_suffix }}.sigstore.json" "release-agent/repola-agent-${{ matrix.target }}${{ matrix.executable_suffix }}"
-
-      - name: Sign agent artifact with the pinned Repola updater key
+          $release = "src-tauri/target/$env:REPOLA_TARGET/release"
+          $installers = @(Get-ChildItem -LiteralPath "$release/bundle/nsis" -Filter '*-setup.exe' -File)
+          if ($installers.Count -ne 1) { throw "Expected one Windows installer; found $($installers.Count)." }
+          ./scripts/release/windows-signing.ps1 -Operation verify -FilePath "$release/repola-agent.exe"
+          ./scripts/release/windows-signing.ps1 -Operation verify-installer -FilePath $installers[0].FullName
+      - name: Notarize and verify macOS bundles
+        if: runner.os == 'macOS'
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        shell: bash
-        run: pnpm tauri signer sign "release-agent/repola-agent-${{ matrix.target }}${{ matrix.executable_suffix }}"
-
-      - name: Build and upload native desktop bundle
-        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          REPOLA_SIGNING_PUBLIC_KEY: ${{ vars.REPOLA_SIGNING_PUBLIC_KEY }}
-        with:
-          tagName: v__VERSION__
-          releaseName: Repola v__VERSION__
-          generateReleaseNotes: true
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.tauri_args }} --config src-tauri/tauri.release.conf.json
-          uploadUpdaterJson: true
-
-      - name: Upload matching agent assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: gh release upload "v$(node -p "require('./package.json').version")" release-agent/* --clobber
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: agent-${{ matrix.target }}
-          path: release-agent/
-          if-no-files-found: error
-
-      - name: Remove App Store Connect private key
+          REPOLA_TARGET: ${{ matrix.target }}
+        run: node scripts/release/macos-signing.mjs verify
+      - name: Clean up macOS signing
         if: always() && runner.os == 'macOS'
         shell: bash
-        run: rm -f "$RUNNER_TEMP/repola-notarization-key.p8"
+        run: node scripts/release/macos-signing.mjs cleanup
+      - name: Stage and sign artifacts
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: node scripts/release/stage-release.mjs ${{ matrix.target }} "$RUNNER_TEMP/repola-release/metadata/release.json" "$RUNNER_TEMP/repola-release/assets"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign agent provenance
+        shell: bash
+        env:
+          REPOLA_TARGET: ${{ matrix.target }}
+          REPOLA_AGENT_SUFFIX: ${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: |
+          agent="$RUNNER_TEMP/repola-release/assets/repola-agent-$REPOLA_TARGET$REPOLA_AGENT_SUFFIX"
+          cosign sign-blob --yes --bundle "$agent.sigstore.json" "$agent"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ runner.temp }}/repola-release/assets
+          if-no-files-found: error
 
-  agent-linux-arm64:
-    name: Linux ARM64 remote agent
-    needs: package
-    runs-on: ubuntu-24.04-arm
+  draft:
+    needs: [plan, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install native build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
-
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-          cache: pnpm
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: stable
-          targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
-          key: release-aarch64-unknown-linux-gnu
-      - run: pnpm install --frozen-lockfile
-
-      - name: Validate release trust
+          key: release-verifier
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-metadata
+          path: ${{ runner.temp }}/repola-release/metadata
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: release-*-*
+          path: ${{ runner.temp }}/repola-release/assets
+          merge-multiple: true
+      - name: Assemble and verify release
+        shell: bash
         env:
           REPOLA_SIGNING_PUBLIC_KEY: ${{ vars.REPOLA_SIGNING_PUBLIC_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: node scripts/prepare-release.mjs
-
-      - name: Build matching remote agent
-        working-directory: src-tauri
-        run: cargo build --locked --release --package repola-engine --bin repola-agent --target aarch64-unknown-linux-gnu
-
-      - name: Stage agent artifact and checksum
+        run: node scripts/release/release-artifacts.mjs "$RUNNER_TEMP/repola-release/assets" "$RUNNER_TEMP/repola-release/metadata/release.json"
+      - name: Create release draft
         shell: bash
-        run: |
-          mkdir -p release-agent
-          cp src-tauri/target/aarch64-unknown-linux-gnu/release/repola-agent release-agent/repola-agent-aarch64-unknown-linux-gnu
-          cd release-agent
-          sha256sum repola-agent-aarch64-unknown-linux-gnu > repola-agent-aarch64-unknown-linux-gnu.sha256
-
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: Sign agent artifact with GitHub OIDC identity
-        shell: bash
-        run: cosign sign-blob --yes --bundle release-agent/repola-agent-aarch64-unknown-linux-gnu.sigstore.json release-agent/repola-agent-aarch64-unknown-linux-gnu
-
-      - name: Sign agent artifact with the pinned Repola updater key
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: pnpm tauri signer sign release-agent/repola-agent-aarch64-unknown-linux-gnu
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/release/publish-release.mjs draft "$RUNNER_TEMP/repola-release/assets"
 
-      - name: Upload matching agent assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "v$(node -p "require('./package.json').version")" release-agent/* --clobber
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: agent-aarch64-unknown-linux-gnu
-          path: release-agent/
-          if-no-files-found: error
+  publish-nightly:
+    needs: [plan, draft]
+    if: needs.plan.outputs.channel == 'nightly'
+    permissions:
+      contents: write
+      actions: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/publish-release.yml
+    with:
+      tag: ${{ needs.plan.outputs.tag }}
+      channel: nightly
