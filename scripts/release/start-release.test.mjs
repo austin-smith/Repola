@@ -5,7 +5,7 @@ import { ghClient, stableVersion, startRelease } from "./start-release.mjs";
 const sha = "a".repeat(40);
 const tagSha = "c".repeat(40);
 const annotation = ["/git/tags", { fields: { tag: "v0.1.0", message: "release 0.1.0", object: sha, type: "commit" } }];
-const reference = ["/git/refs", { fields: { ref: "refs/tags/v0.1.0", sha: tagSha } }];
+const reference = ["graphql", { fields: { query: expect.any(String), repositoryId: "R_test", sourceOid: sha, tagOid: tagSha, tagRef: "refs/tags/v0.1.0" } }];
 const files = {
   "package.json": '{"version":"0.1.0"}',
   "src-tauri/tauri.conf.json": '{"version":"0.1.0"}',
@@ -14,11 +14,13 @@ const files = {
 };
 const success = { id: 1, head_sha: sha, head_branch: "main", event: "push", status: "completed", conclusion: "success" };
 
-function fixture({ contents = files, existingTag = false, advance = false, ci = [[success]] } = {}) {
+function fixture({ contents = files, existingTag = false, advance = false, race = false, tagRace = false, ci = [[success]] } = {}) {
   let reads = 0;
   let polls = 0;
   let time = 0;
+  let createdRef = null;
   const api = vi.fn(async (endpoint, options) => {
+    if (endpoint === "") return { node_id: "R_test" };
     if (endpoint === "/commits/main") return { sha: advance && reads++ > 0 ? "b".repeat(40) : sha };
     if (endpoint.startsWith("/contents/")) {
       const [name, ref] = endpoint.slice("/contents/".length).split("?ref=");
@@ -32,14 +34,19 @@ function fixture({ contents = files, existingTag = false, advance = false, ci = 
       return [{ workflow_runs: ci[Math.min(polls++, ci.length - 1)] }];
     }
     if (endpoint === "/git/tags") return { sha: tagSha, tag: options.fields.tag, object: { sha: options.fields.object, type: options.fields.type } };
-    if (endpoint === "/git/refs") return { ref: options.fields.ref, object: { sha: options.fields.sha } };
+    if (endpoint === "graphql") {
+      if (race) throw new Error("Main changed before the atomic ref update");
+      if (tagRace) throw new Error("Tag already exists at atomic ref update");
+      createdRef = { ref: options.fields.tagRef, object: { sha: options.fields.tagOid } };
+      return { data: { updateRefs: { clientMutationId: null } } };
+    }
     throw new Error(`Unexpected request: ${endpoint}`);
   });
   const sleep = vi.fn(async (ms) => { time += ms; });
   const log = vi.fn();
   const options = { api, sleep, now: () => time, interval: 10, timeout: 20, log };
   const mutations = () => api.mock.calls.filter(([, options]) => options?.fields);
-  return { api, sleep, log, options, mutations };
+  return { api, sleep, log, options, mutations, createdRef: () => createdRef };
 }
 
 describe("stable release command", () => {
@@ -48,6 +55,10 @@ describe("stable release command", () => {
     await expect(startRelease(f.options)).resolves.toEqual({ tag: "v0.1.0", sha, state: "success" });
     expect(f.mutations()).toEqual([annotation, reference]);
     expect(f.sleep).not.toHaveBeenCalled();
+    expect(f.createdRef()).toEqual({ ref: "refs/tags/v0.1.0", object: { sha: tagSha } });
+    const query = f.api.mock.calls.find(([endpoint]) => endpoint === "graphql")[1].fields.query;
+    expect(query).toContain('{ name: "refs/heads/main", beforeOid: $sourceOid, afterOid: $sourceOid, force: false }');
+    expect(query).toContain('{ name: $tagRef, beforeOid: "0000000000000000000000000000000000000000", afterOid: $tagOid, force: false }');
   });
 
   it("waits for CI to start and pass before creating the tag", async () => {
@@ -114,15 +125,24 @@ describe("stable release command", () => {
     expect(f.mutations()).toEqual([annotation]);
   });
 
-  it("propagates tag creation failure without attempting an overwrite", async () => {
+  it.each([
+    [{ race: true }, /Main changed/],
+    [{ tagRace: true }, /Tag already exists/],
+  ])("rejects a race during atomic creation without creating or overwriting a reference: %j", async (race, error) => {
+    const f = fixture(race);
+    await expect(startRelease(f.options)).rejects.toThrow(error);
+    expect(f.mutations()).toEqual([annotation, reference]);
+    expect(f.createdRef()).toBeNull();
+  });
+
+  it("rejects an unconfirmed mutation instead of reporting release success", async () => {
     const f = fixture();
     const request = f.api.getMockImplementation();
-    f.api.mockImplementation((endpoint, options) => {
-      if (endpoint === "/git/refs") throw new Error("HTTP 422: tag created concurrently");
-      return request(endpoint, options);
-    });
-    await expect(startRelease(f.options)).rejects.toThrow(/422/);
+    f.api.mockImplementation((endpoint, options) => endpoint === "graphql" ? { data: { updateRefs: null } } : request(endpoint, options));
+    await expect(startRelease(f.options)).rejects.toThrow(/did not confirm/);
     expect(f.mutations()).toEqual([annotation, reference]);
+    expect(f.createdRef()).toBeNull();
+    expect(f.log.mock.calls.some(([text]) => text.startsWith("Created"))).toBe(false);
   });
 });
 
@@ -142,6 +162,12 @@ describe("source version checks", () => {
 });
 
 describe("GitHub CLI adapter", () => {
+  it("uses the GraphQL endpoint and propagates GraphQL errors", async () => {
+    const run = vi.fn().mockResolvedValue({ stdout: '{"data":{"updateRefs":null},"errors":[{"message":"Reference changed"}]}' });
+    await expect(ghClient(run)("graphql", { fields: { query: "mutation { updateRefs }" } })).rejects.toThrow(/Reference changed/);
+    expect(run).toHaveBeenCalledWith("gh", ["api", "graphql", "--hostname", "github.com", "--method", "POST", "--raw-field", "query=mutation { updateRefs }"], expect.not.objectContaining({ shell: true }));
+  });
+
   it("passes tag fields as arguments without invoking a shell", async () => {
     const run = vi.fn().mockResolvedValue({ stdout: '{"ref":"refs/tags/v0.1.0"}' });
     await ghClient(run)("/git/refs", { fields: { ref: "refs/tags/v0.1.0", sha } });

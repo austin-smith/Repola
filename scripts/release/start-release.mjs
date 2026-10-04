@@ -4,15 +4,23 @@ import { promisify } from "node:util";
 import { isMain, parseVersion, repository, root } from "./release-utils.mjs";
 
 const execute = promisify(execFile);
+const createTag = `mutation($repositoryId: ID!, $sourceOid: GitObjectID!, $tagOid: GitObjectID!, $tagRef: GitRefname!) {
+  updateRefs(input: { repositoryId: $repositoryId, refUpdates: [
+    { name: "refs/heads/main", beforeOid: $sourceOid, afterOid: $sourceOid, force: false },
+    { name: $tagRef, beforeOid: "0000000000000000000000000000000000000000", afterOid: $tagOid, force: false }
+  ] }) { clientMutationId }
+}`;
 
 export function ghClient(run = execute) {
   return async (endpoint, { fields, missing = false, paginate = false } = {}) => {
-    const args = ["api", `repos/${repository}${endpoint}`, "--hostname", "github.com", "--method", fields ? "POST" : "GET"];
+    const args = ["api", endpoint === "graphql" ? endpoint : `repos/${repository}${endpoint}`, "--hostname", "github.com", "--method", fields ? "POST" : "GET"];
     if (paginate) args.push("--paginate", "--slurp");
     for (const [key, value] of Object.entries(fields ?? {})) args.push("--raw-field", `${key}=${value}`);
     try {
       const { stdout } = await run("gh", args, { cwd: root, timeout: 120_000, maxBuffer: 8 * 1024 * 1024 });
-      return JSON.parse(stdout);
+      const response = JSON.parse(stdout);
+      if (endpoint === "graphql" && response.errors?.length) throw new Error(response.errors.map((error) => error.message).join("; "));
+      return response;
     } catch (error) {
       if (missing && /\bHTTP 404\b/.test(error.stderr ?? "")) return null;
       throw error;
@@ -75,8 +83,10 @@ export async function startRelease({ api = ghClient(), dryRun = false, sleep = d
   if (!/^[a-f0-9]{40}$/.test(annotated.sha) || annotated.tag !== tag || annotated.object?.type !== "commit" || annotated.object.sha !== sha) {
     throw new Error("GitHub returned an invalid annotated release tag. No tag reference was created.");
   }
+  const { node_id: repositoryId } = await api("");
   if ((await api("/commits/main")).sha !== sha) throw new Error("Main advanced while preparing the release. No tag was created; rerun pnpm release for the current main commit.");
-  await api("/git/refs", { fields: { ref: `refs/tags/${tag}`, sha: annotated.sha } });
+  const result = await api("graphql", { fields: { query: createTag, repositoryId, sourceOid: sha, tagOid: annotated.sha, tagRef: `refs/tags/${tag}` } });
+  if (!result.data?.updateRefs) throw new Error("GitHub did not confirm release tag creation. Check the tag before retrying.");
   log(`Created ${tag}. Follow the signed installer build at https://github.com/${repository}/actions/workflows/release.yml`);
   log("When the draft is ready, review it and run Publish release from main with channel stable.");
   return { tag, sha, state };
