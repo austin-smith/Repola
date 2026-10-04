@@ -8,6 +8,8 @@ import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
+import { deletionNotice } from "../domain/branch-deletion";
+import type { BranchDeletionResult } from "../ipc/types";
 
 export interface BulkItem {
   key: string;
@@ -20,6 +22,8 @@ export interface BulkItem {
   error: string | null;
   /** The action was interrupted after it started, so it may have completed anyway. */
   unconfirmed?: boolean;
+  /** A finished branch deletion, reported as the single-deletion dialog reports it. */
+  deletion?: BranchDeletionResult;
   done: boolean;
 }
 
@@ -38,6 +42,9 @@ interface BulkActionDialogProps {
 }
 
 function itemBadge(item: BulkItem, stage: BulkStage) {
+  if (item.done && item.deletion && deletionNotice(item.deletion).type === "warning") {
+    return <Badge variant="warning">Done with warnings</Badge>;
+  }
   if (item.done) return <Badge variant="success">Done</Badge>;
   if (item.unconfirmed) return <Badge variant="warning">Unconfirmed</Badge>;
   if (item.error) return <Badge variant="destructive">{stage === "review" ? "Blocked" : "Failed"}</Badge>;
@@ -98,6 +105,7 @@ export function BulkActionDialog({
                 </div>
                 <code className="font-mono text-xs break-all text-muted-foreground">{item.subtitle}</code>
                 {item.error && <p className="text-xs wrap-anywhere text-destructive">{item.error}</p>}
+                {item.done && item.deletion ? <DeletionOutcome deletion={item.deletion} /> : null}
                 {!item.error && item.command !== null && (
                   <code className="border-l-2 border-foreground bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap break-all">
                     {item.command}
@@ -147,4 +155,11 @@ export function BulkActionDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+/** What a finished branch deletion left to do and how to restore it, as the single deletion reports it. */
+function DeletionOutcome({ deletion }: { deletion: BranchDeletionResult }) {
+  const { type, description } = deletionNotice(deletion);
+  if (!description) return null;
+  return <p className={`text-xs wrap-anywhere ${type === "warning" ? "text-warning" : "text-muted-foreground"}`}>{description}</p>;
 }

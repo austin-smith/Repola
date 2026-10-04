@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BulkActionDialog, type BulkItem, type BulkStage } from "./BulkActionDialog";
+import type { BranchDeletionResult, BranchDeletionStep } from "../ipc/types";
 
 // BulkActionDialog is presentational: preflight (one review per item) and
 // sequential execution live in App.tsx's reviewBulkRemoval,
@@ -154,5 +155,40 @@ describe("BulkActionDialog", () => {
     expect(within(rows[1]).getByText("Unconfirmed")).toBeInTheDocument();
     expect(within(rows[1]).queryByText("Failed")).not.toBeInTheDocument();
     expect(within(rows[1]).getByText(/may have completed anyway/)).toBeInTheDocument();
+  });
+
+  it("reports what each finished branch deletion left to do and how to restore it", () => {
+    const step = (warning: string | null, finishCommands: string[]): BranchDeletionStep => ({
+      target: "feature",
+      deletedOid: "a".repeat(40),
+      succeeded: true,
+      output: "",
+      warning,
+      finishCommands,
+      recoveryCommands: ["git branch -- feature aaaa"],
+    });
+    const deletion = (local: BranchDeletionStep): BranchDeletionResult => ({
+      message: "Deleted local branch feature.",
+      local,
+      remote: null,
+      auditPath: null,
+      auditWarning: null,
+    });
+    const items = [
+      { ...ready("alpha"), done: true, deletion: deletion(step(null, [])) },
+      {
+        ...ready("beta"),
+        done: true,
+        deletion: deletion(step("feature was deleted, but its configuration was not removed.", ["git config --local --remove-section branch.feature"])),
+      },
+    ];
+    renderDialog("done", items);
+
+    const rows = screen.getAllByRole("listitem");
+    expect(within(rows[0]).getByText("Done")).toBeInTheDocument();
+    expect(within(rows[0]).getByText("To restore: git branch -- feature aaaa")).toBeInTheDocument();
+    expect(within(rows[1]).getByText("Done with warnings")).toBeInTheDocument();
+    expect(within(rows[1]).getByText(/To finish: git config --local --remove-section branch\.feature/)).toBeInTheDocument();
+    expect(within(rows[1]).getByText(/To restore: git branch -- feature aaaa/)).toBeInTheDocument();
   });
 });

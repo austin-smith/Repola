@@ -656,15 +656,16 @@ function App() {
       const item = items[index];
       if (!item.plan || item.error || item.done) continue;
       try {
+        let deletion: BranchDeletionResult | undefined;
         if (item.plan.kind === "remove") {
           const result = await executeWorktreeAction(selectedMachineId, item.plan.plan);
           if (result.auditPath) setAuditPath(result.auditPath);
           removals.push({ repositoryPath: item.plan.plan.repositoryPath, followUp: result.followUp });
         } else {
-          const result = await executeBranchDeletion(selectedMachineId, item.plan.plan, null);
-          if (result.auditPath) setAuditPath(result.auditPath);
+          deletion = await executeBranchDeletion(selectedMachineId, item.plan.plan, null);
+          if (deletion.auditPath) setAuditPath(deletion.auditPath);
         }
-        items[index] = { ...item, done: true };
+        items[index] = { ...item, done: true, deletion };
       } catch (cause) {
         items[index] = { ...item, error: toMessage(cause), unconfirmed: item.plan.kind === "deleteBranch" && deletionOutcomeUnknown(cause) };
       }
