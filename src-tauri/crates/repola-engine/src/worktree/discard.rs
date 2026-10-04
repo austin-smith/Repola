@@ -3,6 +3,7 @@
 //! fingerprint, and saves everything it will change as a recovery point
 //! before Git touches anything.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -28,6 +29,9 @@ struct Selection {
     kept: Vec<KeptChange>,
     /// Every path whose index entries or working-tree content may change.
     touched: Vec<GitPath>,
+    /// Tokens of the paths already selected, so a path Git reports twice is
+    /// discarded and saved once.
+    selected: HashSet<String>,
     /// Tracked paths whose index entries and working tree return to HEAD.
     reset: Vec<GitPath>,
     /// New files already gone from disk: only their index entries change, so
@@ -48,6 +52,7 @@ impl Selection {
             entries: Vec::new(),
             kept: Vec::new(),
             touched: Vec::new(),
+            selected: HashSet::new(),
             reset: Vec::new(),
             unstage: Vec::new(),
             restore_from_index: Vec::new(),
@@ -57,7 +62,13 @@ impl Selection {
         }
     }
 
+    /// Adds one status record. Callers add tracked records first: a path
+    /// removed from the index but still on disk is also reported as
+    /// untracked, and returning it to HEAD already replaces that file.
     fn add(&mut self, change: &FileChange, scope: DiscardScope, unborn: bool) {
+        if !self.selected.insert(change.path.token.clone()) {
+            return;
+        }
         // Rename and copy records report HEAD's mode for the original path, so
         // only ordinary records can name a path HEAD lacks.
         let gone_addition = change.worktree_status == "D"
@@ -99,8 +110,10 @@ impl Selection {
             // when the new name has since been deleted from disk.
             if change.index_status == "R" {
                 if let Some(previous) = &change.previous_path {
-                    self.reset.push(previous.clone());
-                    self.touched.push(previous.clone());
+                    if self.selected.insert(previous.token.clone()) {
+                        self.reset.push(previous.clone());
+                        self.touched.push(previous.clone());
+                    }
                 }
             }
         }
@@ -126,10 +139,18 @@ fn select(snapshot: &WorkingCopySnapshot, target: &DiscardTarget) -> Result<Sele
     let unborn = snapshot.head.is_none();
     match target {
         DiscardTarget::File { path, scope } => {
-            let change = snapshot
-                .changes
-                .iter()
-                .find(|change| change.path.token == path.token)
+            // A path removed from the index but still on disk has a tracked
+            // and an untracked record. Its unstaged change is the file on
+            // disk; discarding everything returns the path to HEAD.
+            let records = || {
+                snapshot
+                    .changes
+                    .iter()
+                    .filter(|change| change.path.token == path.token)
+            };
+            let change = records()
+                .find(|change| change.untracked == (*scope == DiscardScope::Unstaged))
+                .or_else(|| records().next())
                 .ok_or_else(|| {
                     "The selected change no longer exists. Refresh and try again.".to_string()
                 })?;
@@ -165,7 +186,12 @@ fn select(snapshot: &WorkingCopySnapshot, target: &DiscardTarget) -> Result<Sele
                 );
             }
             let mut selection = Selection::new(RecoveryPointKind::DiscardAll, String::new());
-            for change in snapshot.changes.iter().filter(|change| !change.ignored) {
+            let (tracked, untracked): (Vec<&FileChange>, Vec<&FileChange>) = snapshot
+                .changes
+                .iter()
+                .filter(|change| !change.ignored)
+                .partition(|change| !change.untracked);
+            for change in tracked.into_iter().chain(untracked) {
                 if is_submodule(change) {
                     selection.kept.push(KeptChange {
                         path: change.path.clone(),
@@ -1233,6 +1259,63 @@ mod tests {
         discard(&path, DiscardTarget::All);
         assert!(nested.join(".git").exists());
         assert_eq!(git(&path, &["diff", "--cached", "--name-only"]), "nested\n");
+    }
+
+    #[test]
+    fn a_path_git_reports_twice_is_discarded_and_saved_once() {
+        let directory = repository();
+        let path = root(&directory);
+        write(&path, "unindexed.txt", b"committed\n");
+        write(&path, "moved.txt", b"original\n");
+        git(&path, &["add", "."]);
+        git(&path, &["commit", "-m", "base"]);
+        // Each path below is reported by a tracked record and an untracked one.
+        git(&path, &["rm", "--quiet", "--cached", "unindexed.txt"]);
+        write(&path, "unindexed.txt", b"edited on disk\n");
+        git(&path, &["mv", "moved.txt", "renamed.txt"]);
+        write(&path, "moved.txt", b"recreated\n");
+        let before = exact_state(&path);
+
+        let plan = plan(&path, DiscardTarget::All);
+        let mut planned: Vec<&str> = plan
+            .entries
+            .iter()
+            .map(|entry| entry.path.display.as_str())
+            .collect();
+        planned.sort_unstable();
+        assert_eq!(planned, ["renamed.txt", "unindexed.txt"]);
+        let all = discard(&path, DiscardTarget::All);
+        assert!(all.snapshot.changes.is_empty());
+        assert_eq!(
+            std::fs::read(path.join("unindexed.txt")).expect("read"),
+            b"committed\n"
+        );
+        assert_eq!(
+            std::fs::read(path.join("moved.txt")).expect("read"),
+            b"original\n"
+        );
+        restore(&path, &all.recovery_point);
+        assert_eq!(exact_state(&path), before);
+
+        // Its unstaged change is the file on disk; all of it returns to HEAD.
+        let unstaged = discard(
+            &path,
+            DiscardTarget::File {
+                path: path_of(&path, "unindexed.txt"),
+                scope: DiscardScope::Unstaged,
+            },
+        );
+        assert!(!path.join("unindexed.txt").exists());
+        assert_eq!(git(&path, &["ls-files", "--", "unindexed.txt"]), "");
+        let committed = discard(&path, file(&path, "unindexed.txt"));
+        assert_eq!(
+            std::fs::read(path.join("unindexed.txt")).expect("read"),
+            b"committed\n"
+        );
+        for point in [&committed.recovery_point, &unstaged.recovery_point] {
+            restore(&path, point);
+        }
+        assert_eq!(exact_state(&path), before);
     }
 
     #[test]
