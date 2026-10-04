@@ -688,26 +688,29 @@ pub(super) fn store_recovery_point(
         stored_bytes: stored_bytes(states),
     };
     // Sample only as many paths as keep the summary readable by `list`.
+    let serialize =
+        |record: &Summary| serde_json::to_vec(record).map_err(|error| error.to_string());
+    let mut summary_json = serialize(&record)?;
     for state in states.iter().take(SUMMARY_SAMPLE_PATHS) {
         record.paths.push(state.path.clone());
-        if serde_json::to_vec(&record)
-            .map_err(|error| error.to_string())?
-            .len()
-            > MAX_SUMMARY_BYTES
-        {
+        let sampled = serialize(&record)?;
+        if sampled.len() > MAX_SUMMARY_BYTES {
             record.paths.pop();
             break;
         }
+        summary_json = sampled;
+    }
+    if summary_json.len() > MAX_SUMMARY_BYTES {
+        return Err(
+            "The description of this change is too long to save as a recovery point, so nothing was changed."
+                .into(),
+        );
     }
     let manifest = Manifest {
         version: MANIFEST_VERSION,
         paths: states.to_vec(),
     };
-    let summary_oid = hash_bytes(
-        worktree,
-        &serde_json::to_vec(&record).map_err(|error| error.to_string())?,
-        true,
-    )?;
+    let summary_oid = hash_bytes(worktree, &summary_json, true)?;
     let manifest_oid = hash_bytes(
         worktree,
         &serde_json::to_vec(&manifest).map_err(|error| error.to_string())?,
@@ -2258,6 +2261,20 @@ mod tests {
         let listed = list_recovery_points(request(&path)).expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].path_count, SUMMARY_SAMPLE_PATHS as u64);
+    }
+
+    #[test]
+    fn a_summary_too_large_to_list_is_never_stored() {
+        let (_directory, path) = repository();
+        store_recovery_point(
+            &path,
+            RecoveryPointKind::DiscardFile,
+            "x".repeat(MAX_SUMMARY_BYTES),
+            None,
+            &[saved_file(&path, "a.txt", WorktreeEntryKind::File, b"a\n")],
+        )
+        .expect_err("oversized summary");
+        assert!(git(&path, &["for-each-ref", RECOVERY_REF_NAMESPACE]).is_empty());
     }
 
     #[test]
