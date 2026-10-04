@@ -9,7 +9,10 @@ const ipc = vi.hoisted(() => ({
 }));
 vi.mock("../ipc/worktrees", () => ipc);
 vi.mock("../ipc/app-preferences", () => ({
-  loadAppPreferences: async () => ({ defaultSignCommits: false, editorId: null }),
+  loadAppPreferences: async () => ({
+    defaultSignCommits: false, editorId: null,
+    diff: { hideWhitespaceInChanges: false, hideWhitespaceInHistory: false },
+  }),
   loadExternalTools: async () => ({ editors: [], terminals: [] }),
 }));
 vi.mock("../app/environment", () => ({ usePathSeparator: () => "/" }));

@@ -112,9 +112,11 @@ where
         } => worktree::worktree_changes(&repository_path, &worktree_path)
             .map(|changes| AgentResult::WorktreeChanges { changes })
             .map_err(AgentError::operation),
-        AgentRequest::FileDiff { request } => worktree::file_diff(request)
-            .map(|diff| AgentResult::FileDiff { diff })
-            .map_err(AgentError::operation),
+        AgentRequest::FileDiff { request, options } => {
+            worktree::file_diff_for_display(request, options)
+                .map(|diff| AgentResult::FileDiff { diff })
+                .map_err(AgentError::operation)
+        }
         AgentRequest::WorkingCopySnapshot { request } => worktree::working_copy_snapshot(request)
             .map(|snapshot| AgentResult::WorkingCopySnapshot { snapshot })
             .map_err(AgentError::operation),
@@ -146,9 +148,11 @@ where
         AgentRequest::CommitFiles { request } => worktree::commit_files(request)
             .map(|files| AgentResult::CommitFiles { files })
             .map_err(AgentError::operation),
-        AgentRequest::CommitFileDiff { request } => worktree::commit_file_diff(request)
-            .map(|diff| AgentResult::CommitFileDiff { diff })
-            .map_err(AgentError::operation),
+        AgentRequest::CommitFileDiff { request, options } => {
+            worktree::commit_file_diff(request, options)
+                .map(|diff| AgentResult::CommitFileDiff { diff })
+                .map_err(AgentError::operation)
+        }
         AgentRequest::MutateHistory { request } => worktree::mutate_history(request)
             .map(|result| AgentResult::HistoryMutation { result })
             .map_err(AgentError::operation),

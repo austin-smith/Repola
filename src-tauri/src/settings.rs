@@ -740,6 +740,33 @@ mod tests {
     }
 
     #[test]
+    fn stored_preferences_keep_their_choices_across_diff_preference_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_app, store) = mock_store(&temp.path().join("settings.json"));
+        let stored = serde_json::json!({
+            "version": APP_PREFERENCES_VERSION,
+            "terminalId": "warp",
+            "defaultSignCommits": true,
+        });
+
+        store.set(APP_PREFERENCES_KEY, stored.clone());
+        let older = read_app_preferences(&store);
+        assert_eq!(older.diff, Default::default());
+        assert_eq!(older.terminal_id.as_deref(), Some("warp"));
+        assert!(older.default_sign_commits);
+
+        let mut newer = stored;
+        newer["diff"] = serde_json::json!({ "hideWhitespaceInHistory": true, "unknown": 1 });
+        newer["unknownFuturePreference"] = serde_json::json!([1, 2, 3]);
+        store.set(APP_PREFERENCES_KEY, newer);
+        let newer = read_app_preferences(&store);
+        assert!(newer.diff.hide_whitespace_in_history);
+        assert!(!newer.diff.hide_whitespace_in_changes);
+        assert_eq!(newer.terminal_id.as_deref(), Some("warp"));
+        assert!(newer.default_sign_commits);
+    }
+
+    #[test]
     fn registered_repositories_round_trip_through_the_store_file() {
         let temp = tempfile::tempdir().expect("temp dir");
         let location = temp.path().join("code");

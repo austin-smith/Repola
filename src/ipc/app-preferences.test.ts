@@ -15,7 +15,10 @@ function deferred<T>() {
 describe("preference updates", () => {
   let stored: AppPreferences;
   beforeEach(() => {
-    stored = { version: 5, editorId: null, terminalId: null, defaultSignCommits: false, textGenerationSelections: {} };
+    stored = {
+      version: 5, editorId: null, terminalId: null, defaultSignCommits: false, textGenerationSelections: {},
+      diff: { hideWhitespaceInChanges: false, hideWhitespaceInHistory: false },
+    };
     mocks.invoke.mockReset().mockImplementation(async (command, args) => {
       if (command === "save_app_preferences") stored = args.preferences;
       return structuredClone(stored);
