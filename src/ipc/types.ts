@@ -401,6 +401,12 @@ export interface RecoveryPoint {
   storedBytes: number;
 }
 
+/** The newest recovery points that fit in one response, and how many older ones were left out. */
+export interface RecoveryPointList {
+  points: RecoveryPoint[];
+  omitted: number;
+}
+
 export interface RecoveryPointReference {
   id: string;
   oid: string;

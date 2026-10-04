@@ -28,9 +28,9 @@ use sha2::{Digest, Sha256};
 use super::command;
 use super::models::{
     DeleteRecoveryPointsRequest, GitPath, RecoveryFileDiff, RecoveryFileDiffRequest, RecoveryPoint,
-    RecoveryPointKind, RecoveryPointReference, RecoveryPointRequest, RecoveryRestoreEntry,
-    RecoveryRestorePlan, RecoveryRestoreRequest, RecoveryRestoreResult, RepositoryOperation,
-    RestoreEffect, WorkingCopyRequest,
+    RecoveryPointKind, RecoveryPointList, RecoveryPointReference, RecoveryPointRequest,
+    RecoveryRestoreEntry, RecoveryRestorePlan, RecoveryRestoreRequest, RecoveryRestoreResult,
+    RepositoryOperation, RestoreEffect, WorkingCopyRequest,
 };
 use super::working_copy::{
     decode_path_token_bytes, hex, literal_pathspec, null_device, os_string_from_path_bytes,
@@ -44,6 +44,8 @@ const SUMMARY_SAMPLE_PATHS: usize = 20;
 const MAX_SUMMARY_BYTES: usize = 64 * 1024;
 /// Summaries read per Git invocation: at most 16 MiB, half the capture limit.
 const SUMMARIES_PER_READ: usize = 256;
+/// Listed points per response: half of what one SSH protocol frame carries.
+const MAX_LISTED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RECOVERY_ID_BYTES: usize = 128;
 /// Paths per Git invocation stay well inside the Windows command-line limit.
 const ARGUMENT_BUDGET_BYTES: usize = 16 * 1024;
@@ -809,11 +811,26 @@ fn point_from_summary(id: String, oid: String, summary: Summary) -> RecoveryPoin
     }
 }
 
-/// Lists every recovery point in the repository, newest first. Points saved
-/// from every worktree of the repository share one list.
-pub fn list_recovery_points(request: WorkingCopyRequest) -> Result<Vec<RecoveryPoint>, String> {
+/// Lists the repository's recovery points, newest first, as many as fit in
+/// one response; the rest are counted. Points saved from every worktree of the
+/// repository share one list.
+pub fn list_recovery_points(request: WorkingCopyRequest) -> Result<RecoveryPointList, String> {
     let snapshot = working_copy_snapshot(request)?;
-    list(Path::new(&snapshot.worktree_path))
+    let mut points = list(Path::new(&snapshot.worktree_path))?;
+    let mut budget = MAX_LISTED_BYTES;
+    let mut fits = 0;
+    for point in &points {
+        let size = serde_json::to_vec(point)
+            .map_err(|error| error.to_string())?
+            .len();
+        if size > budget {
+            break;
+        }
+        budget -= size;
+        fits += 1;
+    }
+    let omitted = points.split_off(fits).len() as u64;
+    Ok(RecoveryPointList { points, omitted })
 }
 
 fn list(worktree: &Path) -> Result<Vec<RecoveryPoint>, String> {
@@ -1710,9 +1727,7 @@ fn patch_label(prefix: &str, display: &str) -> String {
 
 /// Deletes the reviewed recovery points in one transaction; if any reference
 /// moved or vanished, none is deleted.
-pub fn delete_recovery_points(
-    request: DeleteRecoveryPointsRequest,
-) -> Result<Vec<RecoveryPoint>, String> {
+pub fn delete_recovery_points(request: DeleteRecoveryPointsRequest) -> Result<(), String> {
     let snapshot = working_copy_snapshot(WorkingCopyRequest {
         repository_path: request.repository_path,
         worktree_path: request.worktree_path,
@@ -1738,7 +1753,7 @@ pub fn delete_recovery_points(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    list(worktree)
+    Ok(())
 }
 
 fn split_once(bytes: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
@@ -2235,10 +2250,19 @@ mod tests {
         };
         let error = delete(vec![reference(&first), stale]).expect_err("stale selection");
         assert!(error.starts_with("Nothing was deleted"), "{error}");
-        assert_eq!(list_recovery_points(request(&path)).expect("list").len(), 2);
+        assert_eq!(
+            list_recovery_points(request(&path))
+                .expect("list")
+                .points
+                .len(),
+            2
+        );
         assert!(delete(vec![reference(&first), reference(&first)]).is_err());
-        let remaining = delete(vec![reference(&first), reference(&second)]).expect("delete");
-        assert!(remaining.is_empty());
+        delete(vec![reference(&first), reference(&second)]).expect("delete");
+        assert!(list_recovery_points(request(&path))
+            .expect("list")
+            .points
+            .is_empty());
     }
 
     #[test]
@@ -2288,7 +2312,7 @@ mod tests {
         let point = store(&path, &states);
         assert!(!point.paths.is_empty());
         assert!(point.paths.len() < SUMMARY_SAMPLE_PATHS);
-        let listed = list_recovery_points(request(&path)).expect("list");
+        let listed = list_recovery_points(request(&path)).expect("list").points;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].path_count, SUMMARY_SAMPLE_PATHS as u64);
     }
@@ -2329,7 +2353,7 @@ mod tests {
                 head.trim(),
             ],
         );
-        let points = list_recovery_points(request(&path)).expect("list");
+        let points = list_recovery_points(request(&path)).expect("list").points;
         assert_eq!(
             points
                 .iter()
@@ -2380,6 +2404,7 @@ mod tests {
         assert!(output.status.success());
         let mut listed: Vec<String> = list_recovery_points(request(&path))
             .expect("list")
+            .points
             .into_iter()
             .map(|point| point.id)
             .collect();
@@ -2387,6 +2412,53 @@ mod tests {
         copies.push(first.id);
         copies.sort();
         assert_eq!(listed, copies);
+    }
+
+    #[test]
+    fn listing_sends_the_newest_points_one_response_carries_and_counts_the_rest() {
+        let (_directory, path) = repository();
+        // Summaries near their limit, so a few hundred points fill a response.
+        let large = store_recovery_point(
+            &path,
+            RecoveryPointKind::DiscardFile,
+            "x".repeat(MAX_SUMMARY_BYTES - 1024),
+            None,
+            &[saved_file(&path, "a.txt", WorktreeEntryKind::File, b"a\n")],
+        )
+        .expect("store");
+        let copies = 2 * MAX_LISTED_BYTES / MAX_SUMMARY_BYTES;
+        let updates: String = (0..copies)
+            .map(|index| {
+                format!(
+                    "create {RECOVERY_REF_NAMESPACE}/point-{index:04} {}\n",
+                    large.oid
+                )
+            })
+            .collect();
+        let output =
+            command::git_at_with_input(&path, ["update-ref", "--stdin"], updates.as_bytes())
+                .expect("update-ref");
+        assert!(output.status.success());
+
+        let list = list_recovery_points(request(&path)).expect("list");
+        assert!(list.omitted > 0);
+        assert_eq!(list.points.len() as u64 + list.omitted, copies as u64 + 1);
+        let sent: usize = list
+            .points
+            .iter()
+            .map(|point| serde_json::to_vec(point).expect("serialize").len())
+            .sum();
+        assert!(sent <= MAX_LISTED_BYTES);
+        // Every copy has the same creation time, so newest first falls back to
+        // the reference name, descending.
+        let mut newest: Vec<String> = (0..copies)
+            .map(|index| format!("{RECOVERY_REF_NAMESPACE}/point-{index:04}"))
+            .chain([large.id])
+            .collect();
+        newest.sort_by(|left, right| right.cmp(left));
+        newest.truncate(list.points.len());
+        let listed: Vec<String> = list.points.into_iter().map(|point| point.id).collect();
+        assert_eq!(listed, newest);
     }
 
     #[test]

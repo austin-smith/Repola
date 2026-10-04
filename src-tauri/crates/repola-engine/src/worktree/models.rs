@@ -820,6 +820,15 @@ pub struct RecoveryPoint {
     pub stored_bytes: u64,
 }
 
+/// The newest recovery points that fit in one response, and how many older
+/// ones were left out.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryPointList {
+    pub points: Vec<RecoveryPoint>,
+    pub omitted: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryPointReference {

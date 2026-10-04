@@ -29,7 +29,7 @@ use worktree::{
     GenerateCommitMessageRequest, GeneratedCommitMessage, HistoryMutationRequest,
     HistoryMutationResult, HistoryPage, HistoryRequest, PullRequestEvidence,
     PullRequestMutationRequest, PullRequestMutationResult, RecoveryFileDiff,
-    RecoveryFileDiffRequest, RecoveryPoint, RecoveryPointRequest, RecoveryRestorePlan,
+    RecoveryFileDiffRequest, RecoveryPointList, RecoveryPointRequest, RecoveryRestorePlan,
     RecoveryRestoreRequest, RecoveryRestoreResult, ReflogEntry, ReflogRequest,
     RepositoryOperationMutationResult, RepositoryOperationRequest, RepositoryOperationResult,
     ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry,
@@ -622,7 +622,7 @@ async fn load_recovery_points(
     machine_id: String,
     operation_id: String,
     request: WorkingCopyRequest,
-) -> Result<Vec<RecoveryPoint>, String> {
+) -> Result<RecoveryPointList, String> {
     let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
     let token = operations.begin(&operation_id)?;
     let request_id = operation_id.clone();
@@ -633,7 +633,7 @@ async fn load_recovery_points(
             AgentRequest::RecoveryPoints { request },
             token,
         )? {
-            AgentResult::RecoveryPoints { points } => Ok(points),
+            AgentResult::RecoveryPoints { list } => Ok(list),
             _ => Err("The Repola agent returned an unexpected response.".to_string()),
         }
     })
@@ -730,7 +730,7 @@ async fn delete_recovery_points(
     machine_id: String,
     operation_id: String,
     request: DeleteRecoveryPointsRequest,
-) -> Result<Vec<RecoveryPoint>, String> {
+) -> Result<(), String> {
     let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
     let token = operations.begin(&operation_id)?;
     let request_id = operation_id.clone();
@@ -741,7 +741,7 @@ async fn delete_recovery_points(
             AgentRequest::DeleteRecoveryPoints { request },
             token,
         )? {
-            AgentResult::RecoveryPoints { points } => Ok(points),
+            AgentResult::RecoveryPointsDeleted => Ok(()),
             _ => Err("The Repola agent returned an unexpected response.".to_string()),
         }
     })

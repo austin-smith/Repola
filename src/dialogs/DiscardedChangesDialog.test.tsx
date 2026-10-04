@@ -67,7 +67,7 @@ describe("DiscardedChangesDialog", () => {
   afterEach(cleanup);
   beforeEach(() => {
     vi.clearAllMocks();
-    ipc.loadRecoveryPoints.mockResolvedValue([newest, sibling, older]);
+    ipc.loadRecoveryPoints.mockResolvedValue({ points: [newest, sibling, older], omitted: 0 });
     ipc.planRecoveryRestore.mockResolvedValue(restorePlan);
     ipc.loadRecoveryFileDiff.mockResolvedValue({ patch: "diff --git a/a.txt b/a.txt\n-now\n+saved\n", binary: false, truncated: false });
   });
@@ -140,11 +140,11 @@ describe("DiscardedChangesDialog", () => {
   });
 
   it("deletes only the reviewed selection", async () => {
-    ipc.deleteRecoveryPoints.mockResolvedValue([sibling]);
+    ipc.deleteRecoveryPoints.mockResolvedValue(undefined);
     renderDialog();
-    const remove = await screen.findByRole("button", { name: "Delete…" });
-    expect(remove).toBeDisabled();
-    fireEvent.click(screen.getByRole("checkbox", { name: "Select “Discarded changes to a.txt” for deletion" }));
+    const first = await screen.findByRole("checkbox", { name: "Select “Discarded changes to a.txt” for deletion" });
+    expect(screen.getByRole("button", { name: "Delete…" })).toBeDisabled();
+    fireEvent.click(first);
     fireEvent.click(screen.getByRole("checkbox", { name: "Select “Discarded all changes (30 files)” for deletion" }));
     fireEvent.click(screen.getByRole("button", { name: "Delete 2…" }));
     const review = screen.getByRole("region", { name: "Recovery points to delete" });
@@ -159,5 +159,23 @@ describe("DiscardedChangesDialog", () => {
     ]);
     const list = screen.getByRole("region", { name: "Recovery points" });
     expect(within(list).getAllByRole("button")).toHaveLength(1);
+    expect(ipc.loadRecoveryPoints).toHaveBeenCalledTimes(1);
+  });
+
+  it("says how many older points were left out and lists them once a deletion makes room", async () => {
+    ipc.loadRecoveryPoints
+      .mockResolvedValueOnce({ points: [newest], omitted: 1 })
+      .mockResolvedValueOnce({ points: [older], omitted: 0 });
+    ipc.deleteRecoveryPoints.mockResolvedValue(undefined);
+    renderDialog();
+    expect(await screen.findByText("1 older recovery point not shown. Delete recovery points you no longer need to see it.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select “Discarded changes to a.txt” for deletion" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete 1…" }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Delete Recovery Point" })));
+    const list = screen.getByRole("region", { name: "Recovery points" });
+    expect(await within(list).findByText("Discarded all changes (30 files)")).toBeInTheDocument();
+    expect(within(list).queryByText("Discarded changes to a.txt")).not.toBeInTheDocument();
+    expect(screen.queryByText(/not shown/)).not.toBeInTheDocument();
   });
 });

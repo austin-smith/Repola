@@ -40,7 +40,7 @@ import type {
   PullRequestMutationResult,
   PullRequestSummary,
   RecoveryFileDiff,
-  RecoveryPoint,
+  RecoveryPointList,
   RecoveryPointReference,
   RecoveryRestorePlan,
   RecoveryRestoreResult,
@@ -268,8 +268,8 @@ export function loadRecoveryPoints(
   repositoryPath: string,
   worktreePath: string,
   signal?: AbortSignal,
-): Promise<RecoveryPoint[]> {
-  return invokeOperation<RecoveryPoint[]>("load_recovery_points", {
+): Promise<RecoveryPointList> {
+  return invokeOperation<RecoveryPointList>("load_recovery_points", {
     machineId,
     request: { repositoryPath, worktreePath },
   }, { signal });
@@ -320,14 +320,14 @@ export function loadRecoveryFileDiff(
   }, { signal });
 }
 
-/** Delete the reviewed recovery points in one transaction; returns the remaining list. */
+/** Delete the reviewed recovery points in one transaction. */
 export function deleteRecoveryPoints(
   machineId: string,
   repositoryPath: string,
   worktreePath: string,
   points: RecoveryPointReference[],
-): Promise<RecoveryPoint[]> {
-  return invokeOperation<RecoveryPoint[]>("delete_recovery_points", {
+): Promise<void> {
+  return invokeOperation<void>("delete_recovery_points", {
     machineId,
     request: { repositoryPath, worktreePath, points },
   });

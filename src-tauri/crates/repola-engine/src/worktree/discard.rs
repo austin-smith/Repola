@@ -662,7 +662,13 @@ mod tests {
         assert_eq!(exact_state(&path), before);
         // Three discards, plus the committed content two of the restores
         // replaced; restoring the removed untracked file replaced nothing.
-        assert_eq!(list_recovery_points(request(&path)).expect("list").len(), 5);
+        assert_eq!(
+            list_recovery_points(request(&path))
+                .expect("list")
+                .points
+                .len(),
+            5
+        );
     }
 
     #[test]
@@ -704,6 +710,7 @@ mod tests {
         assert!(path.join("later.txt").is_file());
         assert!(list_recovery_points(request(&path))
             .expect("list")
+            .points
             .is_empty());
     }
 
@@ -1238,6 +1245,7 @@ mod tests {
         );
         assert!(list_recovery_points(request(&path))
             .expect("list")
+            .points
             .is_empty());
 
         // A restore does not replace a directory with the saved file either.

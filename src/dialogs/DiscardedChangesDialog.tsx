@@ -71,6 +71,9 @@ export default function DiscardedChangesDialog({
   onClose,
 }: DiscardedChangesDialogProps) {
   const [points, setPoints] = useState<RecoveryPoint[] | null>(null);
+  // Older points left out because the list would not fit in one response.
+  const [omitted, setOmitted] = useState(0);
+  const [listing, setListing] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [activeId, setActiveId] = useState<string | null>(initialPointId);
   const [checked, setChecked] = useState<ReadonlySet<string>>(() => new Set());
@@ -85,12 +88,13 @@ export default function DiscardedChangesDialog({
     const controller = new AbortController();
     void loadRecoveryPoints(machineId, repositoryPath, worktreePath, controller.signal)
       .then((next) => {
-        setPoints(next);
-        setActiveId((current) => (current && next.some((point) => point.id === current) ? current : next[0]?.id ?? null));
+        setPoints(next.points);
+        setOmitted(next.omitted);
+        setActiveId((current) => (current && next.points.some((point) => point.id === current) ? current : next.points[0]?.id ?? null));
       })
       .catch((cause: unknown) => { if (!controller.signal.aborted) setError(toMessage(cause)); });
     return () => controller.abort();
-  }, [machineId, repositoryPath, worktreePath]);
+  }, [listing, machineId, repositoryPath, worktreePath]);
 
   const { here, elsewhere } = useMemo(() => partitionRecoveryPoints(points ?? [], worktreePath), [points, worktreePath]);
   const active = points?.find((point) => point.id === activeId) ?? null;
@@ -149,16 +153,20 @@ export default function DiscardedChangesDialog({
     setBusy(true);
     setError(null);
     try {
-      const remaining = await deleteRecoveryPoints(
+      await deleteRecoveryPoints(
         machineId,
         repositoryPath,
         worktreePath,
         selected.map((point) => ({ id: point.id, oid: point.oid })),
       );
+      const deleted = new Set(selected.map((point) => point.id));
+      const remaining = (points ?? []).filter((point) => !deleted.has(point.id));
       setPoints(remaining);
       setChecked(new Set());
       setActiveId((current) => (current && remaining.some((point) => point.id === current) ? current : remaining[0]?.id ?? null));
       setView({ kind: "list" });
+      // Older points the list left out may fit now.
+      if (omitted > 0) setListing((current) => current + 1);
     } catch (cause) {
       setError(toMessage(cause));
     } finally {
@@ -232,6 +240,11 @@ export default function DiscardedChangesDialog({
                     <h3 className="border-b bg-muted/40 px-3 py-1.5 text-xs font-medium text-muted-foreground">From other worktrees</h3>
                     {elsewhere.map(renderPoint)}
                   </>
+                ) : null}
+                {omitted > 0 ? (
+                  <p className="px-3 py-2 text-xs text-muted-foreground">
+                    {omitted} older recovery point{omitted === 1 ? "" : "s"} not shown. Delete recovery points you no longer need to see {omitted === 1 ? "it" : "them"}.
+                  </p>
                 ) : null}
               </section>
               <section aria-label="Recovery point details" className="min-h-0 overflow-y-auto p-4">

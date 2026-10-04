@@ -9,7 +9,7 @@ use crate::worktree::{
     DiscardRequest, DiscardResult, FileDiff, FileDiffRequest, GenerateCommitMessageRequest,
     GeneratedCommitMessage, HistoryMutationRequest, HistoryMutationResult, HistoryPage,
     HistoryRequest, PullRequestEvidence, PullRequestMutationRequest, PullRequestMutationResult,
-    RecoveryFileDiff, RecoveryFileDiffRequest, RecoveryPoint, RecoveryPointRequest,
+    RecoveryFileDiff, RecoveryFileDiffRequest, RecoveryPointList, RecoveryPointRequest,
     RecoveryRestorePlan, RecoveryRestoreRequest, RecoveryRestoreResult, ReflogEntry, ReflogRequest,
     RepositoryOperationMutationResult, RepositoryOperationRequest, RepositoryOperationResult,
     ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry,
@@ -308,8 +308,9 @@ pub enum AgentResult {
         result: Box<DiscardResult>,
     },
     RecoveryPoints {
-        points: Vec<RecoveryPoint>,
+        list: RecoveryPointList,
     },
+    RecoveryPointsDeleted,
     RecoveryRestorePlan {
         plan: RecoveryRestorePlan,
     },

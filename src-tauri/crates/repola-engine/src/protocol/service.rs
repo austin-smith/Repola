@@ -197,7 +197,7 @@ where
             })
             .map_err(AgentError::operation),
         AgentRequest::RecoveryPoints { request } => worktree::list_recovery_points(request)
-            .map(|points| AgentResult::RecoveryPoints { points })
+            .map(|list| AgentResult::RecoveryPoints { list })
             .map_err(AgentError::operation),
         AgentRequest::PlanRecoveryRestore { request } => worktree::plan_recovery_restore(request)
             .map(|plan| AgentResult::RecoveryRestorePlan { plan })
@@ -211,7 +211,7 @@ where
             .map(|diff| AgentResult::RecoveryFileDiff { diff })
             .map_err(AgentError::operation),
         AgentRequest::DeleteRecoveryPoints { request } => worktree::delete_recovery_points(request)
-            .map(|points| AgentResult::RecoveryPoints { points })
+            .map(|()| AgentResult::RecoveryPointsDeleted)
             .map_err(AgentError::operation),
         AgentRequest::ApplyPatchHunk { request } => worktree::apply_patch_hunk(request)
             .map(|snapshot| AgentResult::WorkingCopyUpdated { snapshot })
