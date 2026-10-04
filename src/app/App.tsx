@@ -34,7 +34,7 @@ import { cn } from "@/lib/utils";
 import { toMessage } from "@/lib/errors";
 import { ActionDialog } from "../dialogs/ActionDialog";
 import { CommandPalette, type CommandPaletteItem } from "../dialogs/CommandPalette";
-import { BulkActionDialog, type BulkItem, type BulkStage } from "../dialogs/BulkActionDialog";
+import type { BulkItem, BulkStage } from "../dialogs/BulkActionDialog";
 import { SettingsDialog } from "../dialogs/SettingsDialog";
 import { RepositoryDialog } from "../dialogs/RepositoryDialog";
 import { CreateWorktreeDialog } from "../dialogs/CreateWorktreeDialog";
@@ -43,7 +43,7 @@ import { useShortPath } from "./environment";
 import { formatAge, formatBytes, formatMeasuredBytes } from "../domain/format";
 import { performFocusedSelectAll } from "../domain/select-all";
 import { actionForWorktree, computeTotals, filterAndSortWorktrees, isRemovable } from "../domain/inventory";
-import { batchDeletionRefusal, settleFollowUps, type Removal } from "../domain/branch-deletion-outcomes";
+import { batchDeletionRefusal, deletionOutcomeUnknown, settleFollowUps, type Removal } from "../domain/branch-deletion-outcomes";
 import type { AgeFilter, StateFilter } from "../domain/inventory";
 import type {
   ActionKind,
@@ -91,7 +91,7 @@ import { HistoryWorkbench } from "../workspace/HistoryWorkbench";
 import { WorktreeDetails, type PullState } from "../workspace/WorktreeDetails";
 import { PaneResizeHandle } from "../workspace/PaneResizeHandle";
 import { LazyDialog } from "../workspace/LazyDialog";
-import { DeleteBranchDialog, DiffDialog } from "../workspace/lazy";
+import { BulkActionDialog, DeleteBranchDialog, DiffDialog } from "../workspace/lazy";
 import { RepositoryDropZone } from "../components/RepositoryDropZone";
 import { useRepositoryDrop } from "./use-repository-drop";
 
@@ -666,7 +666,7 @@ function App() {
         }
         items[index] = { ...item, done: true };
       } catch (cause) {
-        items[index] = { ...item, error: toMessage(cause) };
+        items[index] = { ...item, error: toMessage(cause), unconfirmed: item.plan.kind === "deleteBranch" && deletionOutcomeUnknown(cause) };
       }
       setBulk({ kind, stage: "running", items: items.map((entry) => ({ ...entry })), followUps: [] });
     }
@@ -1308,19 +1308,21 @@ function App() {
 
       {actionPlan && <ActionDialog plan={actionPlan} busy={actionBusy} error={actionError} onCancel={() => { setActionPlan(null); setActionError(null); }} onConfirm={() => void executeAction()} />}
       {bulk && (
-        <BulkActionDialog
-          title={bulk.kind === "remove" ? `Remove ${bulk.items.length} clean worktree${bulk.items.length === 1 ? "" : "s"}?` : `Delete ${bulk.items.length} retained branch${bulk.items.length === 1 ? "" : "es"}?`}
-          summary={bulk.kind === "remove"
-            ? "Each worktree passed its own preflight moments ago and is revalidated again at execution. Branches are always retained."
-            : "Each branch is reviewed again and deleted only if it is unchanged and still merged. Remote branches are untouched."}
-          confirmationText={bulk.kind === "remove" ? "REMOVE" : "DELETE"}
-          stage={bulk.stage}
-          items={bulk.items}
-          followUpLabel={bulkFollowUpLabel}
-          onCancel={() => setBulk(null)}
-          onConfirm={() => void executeBulk()}
-          onFollowUp={() => void reviewBulkBranchDeletion(bulk.followUps)}
-        />
+        <LazyDialog onClose={() => setBulk(null)}>
+          <BulkActionDialog
+            title={bulk.kind === "remove" ? `Remove ${bulk.items.length} clean worktree${bulk.items.length === 1 ? "" : "s"}?` : `Delete ${bulk.items.length} retained branch${bulk.items.length === 1 ? "" : "es"}?`}
+            summary={bulk.kind === "remove"
+              ? "Each worktree passed its own preflight moments ago and is revalidated again at execution. Branches are always retained."
+              : "Each branch is reviewed again and deleted only if it is unchanged and still merged. Remote branches are untouched."}
+            confirmationText={bulk.kind === "remove" ? "REMOVE" : "DELETE"}
+            stage={bulk.stage}
+            items={bulk.items}
+            followUpLabel={bulkFollowUpLabel}
+            onCancel={() => setBulk(null)}
+            onConfirm={() => void executeBulk()}
+            onFollowUp={() => void reviewBulkBranchDeletion(bulk.followUps)}
+          />
+        </LazyDialog>
       )}
       {branchReview ? (
         <LazyDialog onClose={() => setBranchReview(null)}>

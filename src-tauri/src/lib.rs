@@ -1281,6 +1281,54 @@ async fn prepare_branch_deletion(
     result.map_err(|error| format!("Branch deletion review failed: {error}"))?
 }
 
+/// Why a branch deletion returned no result. The engine deletes nothing before
+/// it refuses, so a refusal, or a failure before the request reached the
+/// engine, leaves the outcome known. Anything that interrupts the request after
+/// that leaves it unknown: the deletion may have run.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BranchDeletionFailure {
+    message: String,
+    outcome_known: bool,
+}
+
+impl BranchDeletionFailure {
+    fn known(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            outcome_known: true,
+        }
+    }
+
+    fn unknown(cause: impl std::fmt::Display) -> Self {
+        Self {
+            message: format!(
+                "{cause} The deletion may have completed anyway. Review the branch before trying again."
+            ),
+            outcome_known: false,
+        }
+    }
+
+    /// Known when no agent received the request, or when the engine itself
+    /// answered; anything else interrupted a request an agent may have run.
+    fn from_host(error: host::HostError) -> Self {
+        use host::HostError;
+        match error {
+            HostError::NotDelivered(_)
+            | HostError::Disabled(_)
+            | HostError::InvalidProfile(_)
+            | HostError::Launch(_)
+            | HostError::Remote(_) => Self::known(error.to_string()),
+            HostError::AgentUnavailable { .. }
+            | HostError::AgentVersionMismatch { .. }
+            | HostError::Timeout { .. }
+            | HostError::Cancelled(_)
+            | HostError::Transport(_)
+            | HostError::Protocol(_) => Self::unknown(error),
+        }
+    }
+}
+
 #[tauri::command]
 async fn execute_branch_deletion(
     app: tauri::AppHandle,
@@ -1288,41 +1336,39 @@ async fn execute_branch_deletion(
     machine_id: String,
     operation_id: String,
     request: BranchDeletionExecutionRequest,
-) -> Result<BranchDeletionResult, String> {
-    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+) -> Result<BranchDeletionResult, BranchDeletionFailure> {
+    let machine = settings::machine(&app, &machine_id)
+        .map_err(|error| BranchDeletionFailure::known(error.to_string()))?;
     let audit_request = request.clone();
-    let token = operations.begin(&operation_id)?;
+    let token = operations
+        .begin(&operation_id)
+        .map_err(BranchDeletionFailure::known)?;
     let request_id = operation_id.clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        match execute_on_machine(
+        match host::execute(
             &machine,
-            request_id,
-            AgentRequest::ExecuteBranchDeletion { request },
+            RequestEnvelope::current(request_id, AgentRequest::ExecuteBranchDeletion { request }),
+            |_| {},
             token,
-        )? {
+        )
+        .map_err(BranchDeletionFailure::from_host)?
+        {
             AgentResult::BranchDeletion { result } => Ok(*result),
-            _ => Err("The Repola agent returned an unexpected response.".to_string()),
+            _ => Err(BranchDeletionFailure::unknown(
+                "The Repola agent returned an unexpected response.",
+            )),
         }
     })
     .await;
     operations.finish(&operation_id);
-    let outcome = outcome.map_err(|error| format!("Branch deletion failed: {error}"))?;
-    let (succeeded, message) = match &outcome {
-        Ok(result) => {
-            let steps = [&result.local, &result.remote].into_iter().flatten();
-            (
-                steps.clone().all(|step| step.succeeded),
-                std::iter::once(result.message.as_str())
-                    .chain(steps.filter_map(|step| step.warning.as_deref()))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            )
-        }
-        Err(error) => (false, error.clone()),
-    };
+    let outcome = outcome.unwrap_or_else(|error| {
+        Err(BranchDeletionFailure::unknown(format!(
+            "Branch deletion failed: {error}."
+        )))
+    });
     let audit = append_audit_entry(
         &app,
-        &AuditEntry::branch_deletion(&machine_id, &audit_request, succeeded, message),
+        &AuditEntry::branch_deletion_outcome(&machine_id, &audit_request, &outcome),
     );
     let mut result = outcome?;
     match audit {
@@ -1453,6 +1499,9 @@ struct BranchDeletionAudit {
     remote: Option<String>,
     remote_ref: Option<String>,
     remote_oid: Option<String>,
+    /// The deletion was interrupted after it started, so whether it happened is unknown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    outcome_unknown: bool,
 }
 
 impl AuditEntry {
@@ -1477,10 +1526,60 @@ impl AuditEntry {
         }
     }
 
+    /// Records how a deletion ended: what it did, what it left undone, and how
+    /// to finish and restore it. The result keeps its commands whole so they
+    /// restore exactly what was deleted; the log on disk does not keep
+    /// credentials they may contain.
+    fn branch_deletion_outcome(
+        machine_id: &str,
+        execution: &BranchDeletionExecutionRequest,
+        outcome: &Result<BranchDeletionResult, BranchDeletionFailure>,
+    ) -> Self {
+        let (succeeded, outcome_known, message) = match outcome {
+            Ok(result) => {
+                let steps: Vec<_> = [&result.local, &result.remote]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                let finish = steps
+                    .iter()
+                    .flat_map(|step| &step.finish_commands)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let restore = steps
+                    .iter()
+                    .flat_map(|step| &step.recovery_commands)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                (
+                    steps.iter().all(|step| step.succeeded),
+                    true,
+                    std::iter::once(result.message.clone())
+                        .chain(steps.iter().filter_map(|step| step.warning.clone()))
+                        .chain((!finish.is_empty()).then(|| format!("To finish: {finish}")))
+                        .chain((!restore.is_empty()).then(|| format!("To restore: {restore}")))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            }
+            Err(failure) => (false, failure.outcome_known, failure.message.clone()),
+        };
+        Self::branch_deletion(
+            machine_id,
+            execution,
+            succeeded,
+            outcome_known,
+            repola_engine::diagnostics::redact(&message),
+        )
+    }
+
     fn branch_deletion(
         machine_id: &str,
         execution: &BranchDeletionExecutionRequest,
         succeeded: bool,
+        outcome_known: bool,
         outcome: String,
     ) -> Self {
         let request = &execution.request;
@@ -1515,6 +1614,7 @@ impl AuditEntry {
                 remote: expected.remote.clone(),
                 remote_ref: expected.remote_ref.clone(),
                 remote_oid: expected.remote_oid.clone(),
+                outcome_unknown: !outcome_known,
             }),
         }
     }
@@ -1677,6 +1777,45 @@ mod audit_tests {
     }
 
     #[test]
+    fn a_branch_deletion_is_unknown_only_once_an_agent_may_have_run_it() {
+        use host::HostError;
+        let machine = || "build box".to_string();
+        for known in [
+            HostError::NotDelivered(Box::new(HostError::Transport("connection refused".into()))),
+            HostError::NotDelivered(Box::new(HostError::AgentVersionMismatch {
+                machine: machine(),
+                expected: "1".into(),
+                actual: "2".into(),
+            })),
+            HostError::Disabled(machine()),
+            HostError::InvalidProfile(machine()),
+            HostError::Launch("ssh not found".into()),
+            HostError::Remote("The branch deletion is blocked.".into()),
+        ] {
+            let failure = BranchDeletionFailure::from_host(known);
+            assert!(failure.outcome_known, "{}", failure.message);
+        }
+        // Without `NotDelivered`, these followed a request an agent received.
+        for unknown in [
+            HostError::AgentUnavailable {
+                machine: machine(),
+                detail: "repola-agent: not found".into(),
+            },
+            HostError::Timeout {
+                machine: machine(),
+                seconds: 120,
+            },
+            HostError::Cancelled(machine()),
+            HostError::Transport("connection reset".into()),
+            HostError::Protocol("stream closed".into()),
+        ] {
+            let failure = BranchDeletionFailure::from_host(unknown);
+            assert!(!failure.outcome_known, "{}", failure.message);
+            assert!(failure.message.contains("may have completed"));
+        }
+    }
+
+    #[test]
     fn branch_deletions_written_as_worktree_actions_still_decode() {
         let line = r#"{"timestampMs":1700000000000,"action":"deleteBranch","machineId":"local","repositoryPath":"/work/repository","worktreePath":"","expectedHead":"0123456789abcdef0123456789abcdef01234567","expectedBranch":"feature","affectedPaths":["refs/heads/feature"],"succeeded":true,"outcome":"Branch feature deleted with git branch -d."}"#;
         let entry: AuditEntry = serde_json::from_str(line).expect("legacy branch deletion entry");
@@ -1702,14 +1841,17 @@ mod audit_tests {
                 remote: Some("origin".into()),
                 remote_ref: Some("refs/heads/feature".into()),
                 remote_oid: Some("c".repeat(40)),
-                push_url: Some("https://example.com/repository.git".into()),
-                local_exclusive_commits: None,
-                remote_exclusive_commits: None,
+                pull_requests: None,
+                push_destination: Some("e".repeat(64)),
+                local_reachability: None,
+                remote_reachability: None,
+                commands: Vec::new(),
+                warnings: Vec::new(),
                 confirmation: BranchDeletionConfirmation::TypeBranchName,
             },
             typed_confirmation: Some("feature".into()),
         };
-        let entry = AuditEntry::branch_deletion("local", &execution, false, "partial".into());
+        let entry = AuditEntry::branch_deletion("local", &execution, false, true, "partial".into());
         assert_eq!(entry.action, AuditAction::DeleteBranch);
         assert_eq!(
             entry.affected_paths,
@@ -1723,8 +1865,104 @@ mod audit_tests {
             .as_ref()
             .expect("branch deletion details");
         assert!(details.force);
+        assert!(!details.outcome_unknown);
         let line = serde_json::to_string(&entry).expect("serialize");
+        assert!(!line.contains("outcomeUnknown"), "{line}");
         let decoded: AuditEntry = serde_json::from_str(&line).expect("decode");
         assert_eq!(decoded, entry);
+
+        let interrupted =
+            AuditEntry::branch_deletion("local", &execution, false, false, "timed out".into());
+        let line = serde_json::to_string(&interrupted).expect("serialize");
+        assert!(line.contains("\"outcomeUnknown\":true"), "{line}");
+        let decoded: AuditEntry = serde_json::from_str(&line).expect("decode");
+        assert_eq!(decoded, interrupted);
+    }
+
+    #[test]
+    fn branch_deletion_audits_keep_the_commands_but_not_their_credentials() {
+        let execution = BranchDeletionExecutionRequest {
+            request: BranchDeletionRequest {
+                repository_path: "/work/repository".into(),
+                worktree_path: "/work/repository".into(),
+                branch_ref: "refs/heads/feature".into(),
+                delete_local: true,
+                delete_remote: false,
+            },
+            force: false,
+            expected: BranchDeletionFingerprint {
+                local_tip: Some("a".repeat(40)),
+                merge_reference_oid: Some("b".repeat(40)),
+                requires_force: false,
+                remote: None,
+                remote_ref: None,
+                remote_oid: None,
+                pull_requests: None,
+                push_destination: None,
+                local_reachability: None,
+                remote_reachability: None,
+                commands: Vec::new(),
+                warnings: Vec::new(),
+                confirmation: BranchDeletionConfirmation::Confirm,
+            },
+            typed_confirmation: None,
+        };
+        let result = BranchDeletionResult {
+            message: "Deleted local branch feature.".into(),
+            local: Some(worktree::BranchDeletionStep {
+                target: "feature".into(),
+                deleted_oid: "a".repeat(40),
+                succeeded: true,
+                output: String::new(),
+                warning: Some("feature was deleted, but its configuration was not removed.".into()),
+                finish_commands: vec![
+                    "git -C /work/repository config --local --remove-section branch.feature".into(),
+                ],
+                recovery_commands: vec![
+                    "git -C /work/repository branch -- feature aaaa".into(),
+                    "git -C /work/repository config --local --add branch.feature.remote https://alice:hunter2@example.com/repo.git".into(),
+                ],
+            }),
+            remote: None,
+            audit_path: None,
+            audit_warning: None,
+        };
+
+        let entry = AuditEntry::branch_deletion_outcome("local", &execution, &Ok(result));
+        assert!(entry.succeeded);
+        assert!(
+            entry.outcome.contains(
+                "To finish: git -C /work/repository config --local --remove-section branch.feature"
+            ),
+            "{}",
+            entry.outcome
+        );
+        assert!(
+            entry
+                .outcome
+                .contains("To restore: git -C /work/repository branch -- feature aaaa"),
+            "{}",
+            entry.outcome
+        );
+        assert!(
+            entry.outcome.contains("example.com/repo.git"),
+            "{}",
+            entry.outcome
+        );
+        assert!(!entry.outcome.contains("hunter2"), "{}", entry.outcome);
+
+        let interrupted = AuditEntry::branch_deletion_outcome(
+            "local",
+            &execution,
+            &Err(BranchDeletionFailure::unknown("The SSH connection closed.")),
+        );
+        assert!(!interrupted.succeeded);
+        assert!(
+            interrupted
+                .branch_deletion
+                .as_ref()
+                .expect("branch deletion details")
+                .outcome_unknown
+        );
     }
 }

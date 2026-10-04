@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { BranchDeletionPlan, FollowUpAction, LocalBranchDeletion } from "../ipc/types";
-import { batchDeletionRefusal, settleFollowUps } from "./branch-deletion-outcomes";
+import { batchDeletionRefusal, deletionOutcomeUnknown, settleFollowUps } from "./branch-deletion-outcomes";
 
 function plan(overrides: Partial<BranchDeletionPlan>): BranchDeletionPlan {
   return {
@@ -25,9 +25,12 @@ function plan(overrides: Partial<BranchDeletionPlan>): BranchDeletionPlan {
       remote: null,
       remoteRef: null,
       remoteOid: null,
-      pushUrl: null,
-      localExclusiveCommits: null,
-      remoteExclusiveCommits: null,
+      pullRequests: null,
+      pushDestination: null,
+      localReachability: null,
+      remoteReachability: null,
+      commands: [],
+      warnings: [],
       confirmation: "confirm",
     },
     ...overrides,
@@ -99,5 +102,14 @@ describe("settleFollowUps", () => {
     ]);
 
     expect(settled.map(({ branch }) => branch)).toEqual(["solo"]);
+  });
+});
+
+describe("deletionOutcomeUnknown", () => {
+  it("trusts only the engine's word that a deletion did not happen", () => {
+    expect(deletionOutcomeUnknown({ message: "The branch deletion is blocked.", outcomeKnown: true })).toBe(false);
+    expect(deletionOutcomeUnknown({ message: "The SSH connection closed.", outcomeKnown: false })).toBe(true);
+    expect(deletionOutcomeUnknown(new Error("IPC bridge unavailable"))).toBe(true);
+    expect(deletionOutcomeUnknown("lost")).toBe(true);
   });
 });

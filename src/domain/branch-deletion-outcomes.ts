@@ -31,3 +31,8 @@ export function settleFollowUps(removals: Removal[]): FollowUpAction[] {
     return followUp && worktreePath ? [{ ...followUp, worktreePath }] : [];
   });
 }
+
+/** Whether a rejected `executeBranchDeletion` may have deleted anyway: only the engine's own answer says it did not. */
+export function deletionOutcomeUnknown(cause: unknown): boolean {
+  return !(typeof cause === "object" && cause !== null && "outcomeKnown" in cause && cause.outcomeKnown === true);
+}

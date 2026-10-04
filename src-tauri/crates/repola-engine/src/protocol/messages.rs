@@ -433,15 +433,12 @@ mod tests {
                     remote: Some("origin".into()),
                     remote_ref: Some("refs/heads/feature".into()),
                     remote_oid: Some("a".repeat(40)),
-                    push_url: Some("https://example.com/repository.git".into()),
-                    local_exclusive_commits: Some(crate::worktree::CommitCount {
-                        count: 0,
-                        capped: false,
-                    }),
-                    remote_exclusive_commits: Some(crate::worktree::CommitCount {
-                        count: 2,
-                        capped: false,
-                    }),
+                    pull_requests: Some(vec!["octo/app#42".into()]),
+                    push_destination: Some("e".repeat(64)),
+                    local_reachability: Some("c".repeat(64)),
+                    remote_reachability: Some("d".repeat(64)),
+                    commands: vec!["git -C /work/repository update-ref --no-deref -d refs/heads/feature aaaa".into()],
+                    warnings: vec!["2 commits on origin/feature are on no ref, stash entry, or worktree HEAD that remains in this repository.".into()],
                     confirmation: crate::worktree::BranchDeletionConfirmation::TypeBranchName,
                 },
                 typed_confirmation: Some("feature".into()),
@@ -460,8 +457,8 @@ mod tests {
         );
         assert_eq!(value["request"]["typedConfirmation"], "feature");
         assert_eq!(
-            value["request"]["expected"]["remoteExclusiveCommits"]["count"],
-            2
+            value["request"]["expected"]["remoteReachability"],
+            "d".repeat(64)
         );
         let decoded: AgentRequest = serde_json::from_value(value).expect("decode request");
         let AgentRequest::ExecuteBranchDeletion { request: decoded } = decoded else {
@@ -469,12 +466,11 @@ mod tests {
         };
         assert_eq!(decoded.expected.remote.as_deref(), Some("origin"));
         assert_eq!(
-            decoded.expected.remote_exclusive_commits,
-            Some(crate::worktree::CommitCount {
-                count: 2,
-                capped: false,
-            })
+            decoded.expected.remote_reachability.as_deref(),
+            Some("d".repeat(64).as_str())
         );
+        assert_eq!(decoded.expected.commands.len(), 1);
+        assert_eq!(decoded.expected.warnings.len(), 1);
         assert!(decoded.request.delete_local);
     }
 

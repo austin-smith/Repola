@@ -39,6 +39,11 @@ pub(crate) fn quote_argument(value: &str) -> String {
 /// typographic single quotes as quote characters too, so each one is doubled
 /// like `'`. A bare `--` is quoted because Windows PowerShell drops it before
 /// running a native command.
+///
+/// Windows PowerShell 5.1 also drops an empty argument and passes an embedded
+/// `"` to the command unescaped; PowerShell 7.3 and later pass both as
+/// written. No quoting reads the same in both, so a command with either one
+/// runs as displayed only in PowerShell 7.3 or later.
 #[cfg(windows)]
 pub(crate) fn quote_argument(value: &str) -> String {
     let plain = value != "--"

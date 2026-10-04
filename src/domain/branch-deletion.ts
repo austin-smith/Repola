@@ -1,4 +1,13 @@
-import type { BranchDeletionPlan, BranchDeletionResult, BranchInfo } from "../ipc/types";
+import { toMessage } from "../lib/errors";
+import { deletionOutcomeUnknown } from "./branch-deletion-outcomes";
+import type {
+  BranchDeletionFailure,
+  BranchDeletionPlan,
+  BranchDeletionResult,
+  BranchInfo,
+  OpenPullRequest,
+  RemoteProvider,
+} from "../ipc/types";
 
 export interface DeletionScope {
   deleteLocal: boolean;
@@ -92,17 +101,61 @@ export interface DeletionNotice {
 }
 
 /**
- * Reports a finished deletion: why a step failed or left something undone, how to restore what
- * was deleted, and whether the audit log missed it.
+ * Reports a finished deletion: why a step failed or left something undone, how to finish it, how
+ * to restore what was deleted, and whether the audit log missed it.
  */
 export function deletionNotice(result: BranchDeletionResult): DeletionNotice {
   const steps = [result.local, result.remote].flatMap((step) => (step ? [step] : []));
   const problems = steps.flatMap((step) => [step.succeeded ? "" : step.output, step.warning ?? ""]).filter(Boolean);
-  const recovery = steps.flatMap((step) => (step.recoveryCommand ? [step.recoveryCommand] : [])).join("; ");
+  const finish = steps.flatMap((step) => step.finishCommands).join("; ");
+  const recovery = steps.flatMap((step) => step.recoveryCommands).join("; ");
   const description = [
     ...problems,
+    finish && `To finish: ${finish}`,
     recovery && `To restore: ${recovery}`,
     result.auditWarning && `Audit warning: ${result.auditWarning}`,
   ].filter(Boolean).join(" ");
   return { type: problems.length > 0 ? "warning" : "success", title: result.message, description: description || undefined };
+}
+
+/** Why `executeBranchDeletion` rejected, and whether the deletion may have happened anyway. */
+export function deletionFailure(cause: unknown): BranchDeletionFailure {
+  return { message: toMessage(cause), outcomeKnown: !deletionOutcomeUnknown(cause) };
+}
+
+/** The open pull requests that use the remote branch this plan deletes as their source or target. */
+export function openPullRequests(plan: BranchDeletionPlan): OpenPullRequest[] {
+  const check = plan.deleteRemote ? plan.remote?.pullRequests : null;
+  return check?.status === "checked" ? check.pulls : [];
+}
+
+/** What deleting their source branch does to open pull requests on this provider. */
+export function pullRequestConsequence(provider: RemoteProvider, count: number): string {
+  const them = count === 1 ? "it" : "them";
+  switch (provider) {
+    case "gitHub":
+      return `Deleting the branch closes ${them} on GitHub. Restoring the branch lets ${them} be reopened.`;
+    case "azureDevOps":
+      return `Deleting the branch leaves ${them} unable to complete on Azure DevOps until the branch is restored.`;
+    default:
+      return `Deleting the branch removes the source of ${them}.`;
+  }
+}
+
+/** Why the review asks for the typed branch name before deleting. */
+export function confirmationReasons(plan: BranchDeletionPlan): string[] {
+  const reasons: string[] = [];
+  if (plan.requiresForce) reasons.push("This forced deletion discards commits that no other ref contains.");
+  const remote = plan.deleteRemote ? plan.remote : null;
+  if (remote && remote.exclusiveCommitCount > 0) reasons.push("Commits on the remote branch exist in no ref that remains after this deletion.");
+  const pulls = openPullRequests(plan).length;
+  if (pulls === 1) reasons.push("An open pull request uses the remote branch.");
+  if (pulls > 1) reasons.push(`${pulls} open pull requests use the remote branch.`);
+  return reasons;
+}
+
+/** Says that the provider has more open pull requests than the review lists. */
+export function pullRequestOverflow(provider: RemoteProvider): string {
+  const where = provider === "azureDevOps" ? "Azure DevOps" : provider === "gitHub" ? "GitHub" : "The provider";
+  return `${where} has more open pull requests that use this branch than Repola lists here.`;
 }

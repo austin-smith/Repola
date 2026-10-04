@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangleIcon, BanIcon, Trash2Icon } from "lucide-react";
+import { AlertTriangleIcon, BanIcon, GitPullRequestIcon, Trash2Icon } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -13,18 +13,22 @@ import { toMessage } from "@/lib/errors";
 import { ActionableGitError } from "../components/ActionableGitError";
 import {
   canExecuteDeletion,
+  confirmationReasons,
   deletionButtonLabel,
+  deletionFailure,
   deletionNotice,
   describeObservedAt,
   hasScope,
   initialDeletionBranch,
   initialScope,
+  pullRequestConsequence,
+  pullRequestOverflow,
   scopeOptions,
   type DeletionScope,
 } from "../domain/branch-deletion";
 import { shortSha } from "../domain/format";
-import { executeBranchDeletion, prepareBranchDeletionReview } from "../ipc/worktrees";
-import type { BranchDeletionPlan, BranchDeletionResult, BranchInfo } from "../ipc/types";
+import { executeBranchDeletion, openExternalUrl, prepareBranchDeletionReview } from "../ipc/worktrees";
+import type { BranchDeletionFailure, BranchDeletionPlan, BranchDeletionResult, BranchInfo, BranchPullRequests } from "../ipc/types";
 
 interface DeleteBranchDialogProps {
   machineId: string;
@@ -66,7 +70,7 @@ export default function DeleteBranchDialog({
   const [review, setReview] = useState<Review | null>(null);
   const [typed, setTyped] = useState("");
   const [busy, setBusy] = useState(false);
-  const [executeError, setExecuteError] = useState<string | null>(null);
+  const [executeError, setExecuteError] = useState<BranchDeletionFailure | null>(null);
   const options = selected ? scopeOptions(selected, worktreePath) : null;
   const items = useMemo(() => Object.fromEntries(branches.map((branch) => [branch.fullName, branch.name])), [branches]);
   const { deleteLocal, deleteRemote } = scope;
@@ -114,8 +118,8 @@ export default function DeleteBranchDialog({
     try {
       result = await executeBranchDeletion(machineId, plan, plan.confirmation === "typeBranchName" ? typed : null);
     } catch (cause) {
-      // Whatever made execution refuse is reviewed again before another attempt.
-      setExecuteError(toMessage(cause));
+      // Whatever made execution refuse, or interrupted it, is reviewed again before another attempt.
+      setExecuteError(deletionFailure(cause));
       setTyped("");
       setRevision((value) => value + 1);
       setBusy(false);
@@ -207,17 +211,15 @@ export default function DeleteBranchDialog({
               spellCheck={false}
               onChange={(event) => setTyped(event.currentTarget.value)}
             />
-            <FieldDescription>
-              {plan.requiresForce ? "This forced deletion discards commits that no other ref contains." : "Commits on the remote branch exist in no ref that remains after this deletion."}
-            </FieldDescription>
+            <FieldDescription>{confirmationReasons(plan).join(" ")}</FieldDescription>
           </Field>
         ) : null}
 
         {executeError ? (
           <Alert variant="destructive" role="alert">
             <AlertTriangleIcon aria-hidden="true" />
-            <AlertTitle>The branch was not deleted</AlertTitle>
-            <AlertDescription className="whitespace-pre-wrap break-words">{executeError}</AlertDescription>
+            <AlertTitle>{executeError.outcomeKnown ? "The branch was not deleted" : "Repola could not confirm whether the branch was deleted"}</AlertTitle>
+            <AlertDescription className="whitespace-pre-wrap break-words">{executeError.message}</AlertDescription>
           </Alert>
         ) : null}
 
@@ -277,9 +279,10 @@ function PlanReview({ plan }: { plan: BranchDeletionPlan }) {
       </dl>
       {remote ? (
         <p className="text-xs text-muted-foreground">
-          Repola does not fetch during review. Git deletes {remote.displayName} from <span className="break-all">{remote.pushUrl}</span> only if it still has it at {shortSha(remote.expectedOid)}; if it moved or is already gone, the push is rejected and nothing on the remote changes.
+          Repola does not fetch during review. Git deletes {remote.displayName} from <span className="break-all">{remote.pushUrl}</span> only if it still has it at {shortSha(remote.expectedOid)}. If it moved, the push is rejected and nothing on the remote changes; if it is already gone, Repola says so and removes the stale remote-tracking branch.
         </p>
       ) : null}
+      {remote?.pullRequests ? <PullRequestCheck name={remote.displayName} check={remote.pullRequests} /> : null}
       {plan.blockers.map((blocker) => (
         <Alert key={blocker} variant="destructive">
           <BanIcon aria-hidden="true" />
@@ -300,6 +303,45 @@ function PlanReview({ plan }: { plan: BranchDeletionPlan }) {
         </div>
       ) : null}
     </div>
+  );
+}
+
+function PullRequestCheck({ name, check }: { name: string; check: BranchPullRequests }) {
+  if (check.status === "unsupported") {
+    return <p className="text-xs text-muted-foreground">Repola checks for open pull requests only on GitHub and Azure DevOps remotes.</p>;
+  }
+  if (check.status === "unavailable") {
+    return (
+      <Alert variant="warning">
+        <AlertTriangleIcon aria-hidden="true" />
+        <AlertTitle>Could not check for open pull requests</AlertTitle>
+        <AlertDescription className="break-words">{check.reason}</AlertDescription>
+      </Alert>
+    );
+  }
+  if (check.pulls.length === 0) {
+    return <p className="text-xs text-muted-foreground">No open pull requests merge from or into {name}.</p>;
+  }
+  const count = check.pulls.length;
+  return (
+    <Alert variant="warning">
+      <GitPullRequestIcon aria-hidden="true" />
+      <AlertTitle>{count === 1 ? "An open pull request uses" : `${count} open pull requests use`} {name}</AlertTitle>
+      <AlertDescription className="flex flex-col gap-1.5">
+        <span>{pullRequestConsequence(check.provider, count)}</span>
+        <ul className="flex flex-col gap-1">
+          {check.pulls.map(({ repository, number, title, url, from, into }) => (
+            <li key={`${repository}#${number}`} className="min-w-0 break-words">
+              {url ? (
+                <Button variant="link" size="xs" className="h-auto p-0" onClick={() => void openExternalUrl(url)}>#{number}</Button>
+              ) : `#${number}`}
+              {" "}{title} <span className="text-muted-foreground">from {from} into {into}</span>
+            </li>
+          ))}
+        </ul>
+        {check.moreThanListed ? <span>{pullRequestOverflow(check.provider)}</span> : null}
+      </AlertDescription>
+    </Alert>
   );
 }
 

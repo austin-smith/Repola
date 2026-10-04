@@ -30,6 +30,8 @@ pub(crate) fn redact_agent_result(mut result: AgentResult) -> AgentResult {
                 .into_iter()
                 .flatten()
             {
+                // The finishing and recovery commands are left whole: redacted,
+                // they would remove or restore something else.
                 step.output = redact(&step.output);
                 step.warning = step.warning.as_deref().map(redact);
             }
@@ -45,7 +47,7 @@ pub(crate) fn redact_agent_error(mut error: AgentError) -> AgentError {
     error
 }
 
-pub(crate) fn redact(input: &str) -> String {
+pub fn redact(input: &str) -> String {
     let mut output = redact_url_credentials(input);
     output = redact_assignments(&output);
     redact_known_tokens(&output)

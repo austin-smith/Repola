@@ -18,6 +18,8 @@ export interface BulkItem {
   command: string | null;
   warnings: string[];
   error: string | null;
+  /** The action was interrupted after it started, so it may have completed anyway. */
+  unconfirmed?: boolean;
   done: boolean;
 }
 
@@ -37,6 +39,7 @@ interface BulkActionDialogProps {
 
 function itemBadge(item: BulkItem, stage: BulkStage) {
   if (item.done) return <Badge variant="success">Done</Badge>;
+  if (item.unconfirmed) return <Badge variant="warning">Unconfirmed</Badge>;
   if (item.error) return <Badge variant="destructive">{stage === "review" ? "Blocked" : "Failed"}</Badge>;
   if (stage === "review") return <Badge variant="secondary">Ready</Badge>;
   return <Badge variant="ghost">Pending…</Badge>;
@@ -60,6 +63,7 @@ export function BulkActionDialog({
   const readyCount = items.filter((item) => item.command !== null && !item.error && !item.done).length;
   const doneCount = items.filter((item) => item.done).length;
   const failedCount = items.filter((item) => item.error).length;
+  const unconfirmedCount = items.filter((item) => item.unconfirmed).length;
   const warnings = Array.from(new Set(items.flatMap((item) => item.warnings)));
   const confirmed = confirmation === confirmationText;
 
@@ -73,7 +77,9 @@ export function BulkActionDialog({
             </div>
             <div className="flex min-w-0 flex-col gap-1 wrap-anywhere">
               <span className="text-xs font-medium tracking-widest text-muted-foreground uppercase">
-                {stage === "done" ? `${doneCount} completed · ${failedCount} not completed` : "Batch preflight complete"}
+                {stage === "done"
+                  ? [`${doneCount} completed`, `${failedCount - unconfirmedCount} not completed`, unconfirmedCount > 0 && `${unconfirmedCount} unconfirmed`].filter(Boolean).join(" · ")
+                  : "Batch preflight complete"}
               </span>
               <DialogTitle>{title}</DialogTitle>
             </div>

@@ -141,4 +141,18 @@ describe("BulkActionDialog", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "Close" }).find((button) => button.textContent === "Close")!);
     expect(onCancel).toHaveBeenCalledOnce();
   });
+
+  it("marks an interrupted item as unconfirmed rather than failed", () => {
+    const items = [
+      { ...ready("alpha"), done: true },
+      { ...ready("beta"), error: "The SSH connection closed. The deletion may have completed anyway.", unconfirmed: true },
+    ];
+    renderDialog("done", items);
+
+    expect(screen.getByText("1 completed · 0 not completed · 1 unconfirmed")).toBeInTheDocument();
+    const rows = screen.getAllByRole("listitem");
+    expect(within(rows[1]).getByText("Unconfirmed")).toBeInTheDocument();
+    expect(within(rows[1]).queryByText("Failed")).not.toBeInTheDocument();
+    expect(within(rows[1]).getByText(/may have completed anyway/)).toBeInTheDocument();
+  });
 });

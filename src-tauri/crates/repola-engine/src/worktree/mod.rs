@@ -1,6 +1,7 @@
 mod actions;
 mod agents;
 mod branch_deletion;
+mod branch_pull_requests;
 mod branches;
 mod claude;
 mod codex;
@@ -43,22 +44,23 @@ pub use models::{
     ActionExecutionRequest, ActionKind, ActionPlan, ActionRequest, ActionResult,
     ApplyPatchHunkRequest, BranchDeletionConfirmation, BranchDeletionExecutionRequest,
     BranchDeletionFingerprint, BranchDeletionPlan, BranchDeletionRequest, BranchDeletionResult,
-    BranchDeletionStep, BranchInfo, BranchMutationRequest, BranchMutationResult, BranchRequest,
-    CloneRepositoryRequest, CommitChangedFile, CommitCount, CommitFileDiffRequest,
-    CommitFilesRequest, CommitRequest, CommitResult, ConflictFile, ConflictFileRequest,
-    CreateRepositoryRequest, CreateWorktreeRequest, CreateWorktreeResult, DiscardAllRequest,
-    DiscardFileRequest, DiscardScope, FileDiff, FileDiffRequest, GenerateCommitMessageRequest,
-    GeneratedCommitMessage, HistoryMutationKind, HistoryMutationRequest, HistoryMutationResult,
-    HistoryPage, HistoryRequest, LocalBranchDeletion, MergeReferenceKind, PatchHunk,
-    PatchHunkAction, PullRequestEvidence, PullRequestMutationKind, PullRequestMutationRequest,
-    PullRequestMutationResult, ReasoningEffort, ReflogEntry, ReflogRequest, RemoteBranchDeletion,
-    RepositoryOperationAction, RepositoryOperationMutationResult, RepositoryOperationRequest,
-    RepositoryOperationResult, ResolveConflictRequest, ReviewedFileChange, ScanEvent, ScanRequest,
-    ScanResult, SetFileStagingRequest, StashEntry, StashMutationRequest, StashMutationResult,
-    StashRequest, SyncRequest, SyncResult, TagInfo, TagMutationKind, TagMutationRequest,
-    TagMutationResult, TagRequest, TextGenerationModel, TextGenerationStatus,
-    TextGenerationStatusKind, UndoCommitRequest, UndoCommitResult, WorkingCopyRequest,
-    WorkingCopySnapshot, WorktreeChanges,
+    BranchDeletionStep, BranchInfo, BranchMutationRequest, BranchMutationResult,
+    BranchPullRequests, BranchRequest, CloneRepositoryRequest, CommitChangedFile,
+    CommitFileDiffRequest, CommitFilesRequest, CommitRequest, CommitResult, ConflictFile,
+    ConflictFileRequest, CreateRepositoryRequest, CreateWorktreeRequest, CreateWorktreeResult,
+    DiscardAllRequest, DiscardFileRequest, DiscardScope, FileDiff, FileDiffRequest,
+    GenerateCommitMessageRequest, GeneratedCommitMessage, HistoryMutationKind,
+    HistoryMutationRequest, HistoryMutationResult, HistoryPage, HistoryRequest,
+    LocalBranchDeletion, MergeReferenceKind, OpenPullRequest, PatchHunk, PatchHunkAction,
+    PullRequestEvidence, PullRequestMutationKind, PullRequestMutationRequest,
+    PullRequestMutationResult, PullRequestRelation, ReasoningEffort, ReflogEntry, ReflogRequest,
+    RemoteBranchDeletion, RepositoryOperationAction, RepositoryOperationMutationResult,
+    RepositoryOperationRequest, RepositoryOperationResult, ResolveConflictRequest,
+    ReviewedFileChange, ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry,
+    StashMutationRequest, StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo,
+    TagMutationKind, TagMutationRequest, TagMutationResult, TagRequest, TextGenerationModel,
+    TextGenerationStatus, TextGenerationStatusKind, UndoCommitRequest, UndoCommitResult,
+    WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges,
 };
 pub use operations::mutate_operation;
 pub use providers::{fetch_pull_requests, mutate_pull_request};

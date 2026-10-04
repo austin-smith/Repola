@@ -490,7 +490,10 @@ export function prepareBranchDeletionReview(
   return invokeOperation<BranchDeletionPlan>("prepare_branch_deletion", { machineId, request }, { signal });
 }
 
-/** Runs a reviewed deletion; the engine plans again and refuses if anything changed. */
+/**
+ * Runs a reviewed deletion; the engine plans again and refuses if anything changed. Rejects with
+ * a `BranchDeletionFailure`.
+ */
 export function executeBranchDeletion(
   machineId: string,
   plan: BranchDeletionPlan,

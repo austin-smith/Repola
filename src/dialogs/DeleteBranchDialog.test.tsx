@@ -7,11 +7,13 @@ import type {
   BranchDeletionRequest,
   BranchDeletionResult,
   BranchInfo,
+  BranchPullRequests,
 } from "../ipc/types";
 
 const ipc = vi.hoisted(() => ({
   prepareBranchDeletionReview: vi.fn(),
   executeBranchDeletion: vi.fn(),
+  openExternalUrl: vi.fn(),
 }));
 
 vi.mock("../ipc/worktrees", () => ipc);
@@ -70,6 +72,7 @@ function planFor(request: BranchDeletionRequest, overrides: Partial<BranchDeleti
       displayName: "origin/feature",
       expectedOid: "a".repeat(40),
       pushUrl: "https://example.com/repola.git",
+      pullRequests: null,
       trackingRefUpdatedAt: null,
       lastFetchedAt: null,
       isRemoteDefaultBranch: false,
@@ -81,7 +84,7 @@ function planFor(request: BranchDeletionRequest, overrides: Partial<BranchDeleti
     requiresForce: false,
     confirmation: request.deleteLocal && request.deleteRemote ? "typeBranchName" : "confirm",
     commands: [
-      ...(request.deleteLocal ? ["git -C /repos/repola update-ref -d refs/heads/feature aaaa"] : []),
+      ...(request.deleteLocal ? ["git -C /repos/repola update-ref --no-deref -d refs/heads/feature aaaa"] : []),
       ...(request.deleteRemote ? ["git -C /repos/repola push --porcelain '--force-with-lease=refs/heads/feature:aaaa' -- origin :refs/heads/feature"] : []),
     ],
     warnings: [],
@@ -93,9 +96,12 @@ function planFor(request: BranchDeletionRequest, overrides: Partial<BranchDeleti
       remote: request.deleteRemote ? "origin" : null,
       remoteRef: request.deleteRemote ? "refs/heads/feature" : null,
       remoteOid: request.deleteRemote ? "a".repeat(40) : null,
-      pushUrl: request.deleteRemote ? "https://example.com/repola.git" : null,
-      localExclusiveCommits: null,
-      remoteExclusiveCommits: null,
+      pullRequests: null,
+      pushDestination: request.deleteRemote ? "f".repeat(64) : null,
+      localReachability: null,
+      remoteReachability: null,
+      commands: [],
+      warnings: [],
       confirmation: "confirm",
     },
     ...overrides,
@@ -104,7 +110,7 @@ function planFor(request: BranchDeletionRequest, overrides: Partial<BranchDeleti
 
 const result: BranchDeletionResult = {
   message: "Deleted local branch feature.",
-  local: { target: "feature", deletedOid: "a".repeat(40), succeeded: true, output: "", warning: null, recoveryCommand: "git -C /repos/repola branch -- feature aaaa" },
+  local: { target: "feature", deletedOid: "a".repeat(40), succeeded: true, output: "", warning: null, finishCommands: [], recoveryCommands: ["git -C /repos/repola branch -- feature aaaa"] },
   remote: null,
   auditPath: null,
   auditWarning: null,
@@ -142,7 +148,7 @@ describe("DeleteBranchDialog", () => {
     const remote = screen.getByRole("checkbox", { name: "Remote branch origin/feature" });
     expect(remote).not.toBeChecked();
     expect(screen.getByRole("checkbox", { name: "Local branch feature" })).toBeChecked();
-    await screen.findByText(/update-ref -d refs\/heads\/feature/);
+    await screen.findByText(/update-ref --no-deref -d refs\/heads\/feature/);
     expect(ipc.prepareBranchDeletionReview).toHaveBeenLastCalledWith("local", {
       repositoryPath: "/repos/repola",
       worktreePath: "/repos/repola",
@@ -171,7 +177,7 @@ describe("DeleteBranchDialog", () => {
 
   it("requires the exact branch name before deleting both copies", async () => {
     renderDialog();
-    await screen.findByText(/update-ref -d refs\/heads\/feature/);
+    await screen.findByText(/update-ref --no-deref -d refs\/heads\/feature/);
     fireEvent.click(screen.getByRole("checkbox", { name: "Remote branch origin/feature" }));
 
     await screen.findByText(/push --porcelain/);
@@ -205,7 +211,7 @@ describe("DeleteBranchDialog", () => {
 
   it("explains why a branch checked out here can only be deleted on the remote", async () => {
     renderDialog();
-    await screen.findByText(/update-ref -d refs\/heads\/feature/);
+    await screen.findByText(/update-ref --no-deref -d refs\/heads\/feature/);
     fireEvent.click(screen.getByRole("combobox", { name: "Branch to delete" }));
     const option = await screen.findByRole("option", { name: /^main.*checked out/ });
     fireEvent.pointerDown(option, { button: 0 });
@@ -224,7 +230,7 @@ describe("DeleteBranchDialog", () => {
     const notify = vi.spyOn(toast, "add");
     const onDeleted = vi.fn(() => new Promise<void>(() => undefined));
     const { onClose } = renderDialog(onDeleted);
-    await screen.findByText(/update-ref -d refs\/heads\/feature/);
+    await screen.findByText(/update-ref --no-deref -d refs\/heads\/feature/);
 
     fireEvent.click(screen.getByRole("button", { name: "Delete Branch" }));
 
@@ -235,9 +241,9 @@ describe("DeleteBranchDialog", () => {
   });
 
   it("shows a refused execution and reviews the branch again", async () => {
-    ipc.executeBranchDeletion.mockRejectedValue(new Error("The branch changed after this deletion was reviewed."));
+    ipc.executeBranchDeletion.mockRejectedValue({ message: "The branch changed after this deletion was reviewed.", outcomeKnown: true });
     const { onDeleted } = renderDialog();
-    await screen.findByText(/update-ref -d refs\/heads\/feature/);
+    await screen.findByText(/update-ref --no-deref -d refs\/heads\/feature/);
     expect(ipc.prepareBranchDeletionReview).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole("button", { name: "Delete Branch" }));
@@ -245,5 +251,68 @@ describe("DeleteBranchDialog", () => {
     expect(await screen.findByText("The branch was not deleted")).toBeInTheDocument();
     await waitFor(() => expect(ipc.prepareBranchDeletionReview).toHaveBeenCalledTimes(2));
     expect(onDeleted).not.toHaveBeenCalled();
+  });
+
+  it("does not claim a deletion it lost track of was refused", async () => {
+    ipc.executeBranchDeletion.mockRejectedValue({
+      message: "The operation on \"build box\" exceeded its 120-second deadline. The deletion may have completed anyway. Review the branch before trying again.",
+      outcomeKnown: false,
+    });
+    const { onDeleted } = renderDialog();
+    await screen.findByText(/update-ref --no-deref -d refs\/heads\/feature/);
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete Branch" }));
+
+    expect(await screen.findByText("Repola could not confirm whether the branch was deleted")).toBeInTheDocument();
+    expect(screen.queryByText("The branch was not deleted")).not.toBeInTheDocument();
+    await waitFor(() => expect(ipc.prepareBranchDeletionReview).toHaveBeenCalledTimes(2));
+    expect(onDeleted).not.toHaveBeenCalled();
+  });
+
+  /** Reviews the remote branch as the provider answered about pull requests. */
+  function reviewRemoteWith(check: BranchPullRequests) {
+    ipc.prepareBranchDeletionReview.mockImplementation((_machine: string, request: BranchDeletionRequest) => {
+      const plan = planFor(request);
+      return Promise.resolve({
+        ...plan,
+        remote: plan.remote && { ...plan.remote, pullRequests: request.deleteRemote ? check : null },
+        confirmation: request.deleteRemote ? "typeBranchName" : plan.confirmation,
+      });
+    });
+  }
+
+  it("lists the open pull requests a remote deletion affects and why the name must be typed", async () => {
+    reviewRemoteWith({
+      status: "checked",
+      provider: "gitHub",
+      pulls: [
+        { repository: "octo/app", number: 42, title: "Ship it", url: "https://github.com/octo/app/pull/42", relation: "source", from: "octo/app:feature", into: "octo/app:main" },
+        { repository: "octo/app", number: 43, title: "Stacked", url: null, relation: "target", from: "octo/app:next", into: "octo/app:feature" },
+      ],
+      moreThanListed: true,
+    });
+    renderDialog();
+    await screen.findByText(/update-ref --no-deref -d refs\/heads\/feature/);
+    expect(screen.queryByText(/open pull request/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Remote branch origin/feature" }));
+
+    expect(await screen.findByText("2 open pull requests use origin/feature")).toBeInTheDocument();
+    expect(screen.getByText(/closes them on GitHub/)).toBeInTheDocument();
+    expect(screen.getByText("from octo/app:feature into octo/app:main")).toBeInTheDocument();
+    expect(screen.getByText("from octo/app:next into octo/app:feature")).toBeInTheDocument();
+    expect(screen.getByText(/2 open pull requests use the remote branch\./)).toBeInTheDocument();
+    expect(screen.getByText("GitHub has more open pull requests that use this branch than Repola lists here.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "#42" }));
+    expect(ipc.openExternalUrl).toHaveBeenCalledWith("https://github.com/octo/app/pull/42");
+  });
+
+  it("says when it could not check for open pull requests", async () => {
+    reviewRemoteWith({ status: "unavailable", reason: "The gh CLI is not installed on this machine." });
+    renderDialog();
+    await screen.findByText(/update-ref --no-deref -d refs\/heads\/feature/);
+    fireEvent.click(screen.getByRole("checkbox", { name: "Remote branch origin/feature" }));
+
+    expect(await screen.findByText("Could not check for open pull requests")).toBeInTheDocument();
+    expect(screen.getByText("The gh CLI is not installed on this machine.")).toBeInTheDocument();
   });
 });

@@ -1104,6 +1104,9 @@ pub struct RemoteBranchDeletion {
     pub expected_oid: String,
     /// Where the deletion pushes, with any credentials redacted.
     pub push_url: String,
+    /// The open pull requests that use this branch as their source or target,
+    /// asked of the provider only when the remote branch is selected for deletion.
+    pub pull_requests: Option<BranchPullRequests>,
     /// When the remote-tracking ref last changed (a fetch or push that moved it), in Unix seconds.
     pub tracking_ref_updated_at: Option<u64>,
     /// The most recent fetch from any worktree of this repository, in Unix seconds.
@@ -1124,21 +1127,78 @@ pub struct BranchDeletionFingerprint {
     pub remote: Option<String>,
     pub remote_ref: Option<String>,
     pub remote_oid: Option<String>,
-    /// Where the remote deletion pushes, as reviewed, with any credentials redacted.
-    pub push_url: Option<String>,
-    /// The commits the local deletion would leave unreachable, as reviewed.
-    pub local_exclusive_commits: Option<CommitCount>,
-    /// The commits the remote deletion would leave unreachable, as reviewed.
-    pub remote_exclusive_commits: Option<CommitCount>,
+    /// The open pull requests the review listed for the remote branch, by
+    /// [`OpenPullRequest::key`], or `None` when the provider could not be asked.
+    pub pull_requests: Option<Vec<String>>,
+    /// A digest of the exact URL the remote deletion pushes to, as reviewed.
+    /// The plan displays it with credentials redacted, which can make two
+    /// different URLs look alike.
+    pub push_destination: Option<String>,
+    /// A digest of exactly which commits the local deletion would leave
+    /// unreachable, as reviewed.
+    pub local_reachability: Option<String>,
+    /// A digest of exactly which commits the remote deletion would leave
+    /// unreachable, as reviewed.
+    pub remote_reachability: Option<String>,
+    /// The commands the review displayed, which execution runs.
+    pub commands: Vec<String>,
+    /// The warnings the review displayed.
+    pub warnings: Vec<String>,
     pub confirmation: BranchDeletionConfirmation,
 }
 
-/// A commit count that stops at a limit, recording whether it got there.
+/// What the provider hosting a remote branch said about the open pull requests
+/// that use it as their source or target branch.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum BranchPullRequests {
+    /// The provider answered; these are all the open ones.
+    Checked {
+        provider: RemoteProvider,
+        pulls: Vec<OpenPullRequest>,
+        /// The provider has more than Repola lists.
+        more_than_listed: bool,
+    },
+    /// The remote is not hosted where Repola can ask.
+    Unsupported,
+    /// The provider could not be asked.
+    Unavailable { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenPullRequest {
+    /// The repository the pull request belongs to, which numbers it.
+    pub repository: String,
+    pub number: u64,
+    pub title: String,
+    pub url: Option<String>,
+    pub relation: PullRequestRelation,
+    /// The repository and branch it merges from.
+    pub from: String,
+    /// The repository and branch it merges into.
+    pub into: String,
+}
+
+impl OpenPullRequest {
+    /// Identifies the pull request across repositories, whose numbers overlap.
+    pub fn key(&self) -> String {
+        format!("{}#{}", self.repository, self.number)
+    }
+}
+
+/// How a pull request uses the branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CommitCount {
-    pub count: u64,
-    pub capped: bool,
+pub enum PullRequestRelation {
+    /// It merges from the branch.
+    Source,
+    /// It merges into the branch.
+    Target,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1181,7 +1241,10 @@ pub struct BranchDeletionStep {
     pub output: String,
     /// Something left undone by a step that still succeeded.
     pub warning: Option<String>,
-    pub recovery_command: Option<String>,
+    /// The commands that finish what the warning says was left undone.
+    pub finish_commands: Vec<String>,
+    /// The commands that restore what a successful step deleted, in order.
+    pub recovery_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1294,6 +1357,7 @@ pub enum ScanEvent {
 #[derive(Debug, Clone)]
 pub(crate) struct WorktreeSeed {
     pub path: String,
+    pub bare: bool,
     pub head: Option<String>,
     pub branch: Option<String>,
     pub detached: bool,

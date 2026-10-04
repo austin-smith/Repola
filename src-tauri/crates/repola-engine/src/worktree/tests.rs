@@ -91,6 +91,17 @@ fn parses_nul_terminated_worktree_porcelain() {
 }
 
 #[test]
+fn parses_a_bare_main_worktree() {
+    let records = parse_worktree_porcelain(
+        b"worktree /repo.git\0bare\0\0worktree /tmp/feature\0HEAD def456\0branch refs/heads/feature\0\0",
+    );
+
+    assert_eq!(records.len(), 2);
+    assert!(records[0].bare);
+    assert!(!records[1].bare);
+}
+
+#[test]
 fn worktree_paths_from_git_use_native_separators() {
     let records = parse_worktree_porcelain(b"worktree C:/code/repo\0HEAD abc123\0\0");
     let expected = if cfg!(windows) {
@@ -123,6 +134,7 @@ fn parses_status_without_counting_rename_path_payloads() {
 fn locked_registration_takes_precedence_over_prunable_metadata() {
     let seed = WorktreeSeed {
         path: "/tmp/missing".to_string(),
+        bare: false,
         head: None,
         branch: Some("old-work".to_string()),
         detached: false,
