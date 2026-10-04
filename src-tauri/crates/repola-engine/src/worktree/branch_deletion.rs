@@ -504,11 +504,20 @@ pub fn execute_branch_deletion(
     let remote = match selected_remote.filter(|_| !local_unconfirmed) {
         Some(remote) => {
             let deletion = delete_remote(worktree, remote, push_url.as_deref());
+            // Recreates the branch only while the remote has none, so it can
+            // never move a branch someone made since.
+            let lease = format!("--force-with-lease={}:", remote.remote_ref);
             let refspec = format!("{}:{}", remote.expected_oid, remote.remote_ref);
             let push_back = || {
                 vec![git_command_line(
                     worktree,
-                    ["push", "--", remote.remote.as_str(), &refspec],
+                    [
+                        "push",
+                        lease.as_str(),
+                        "--",
+                        remote.remote.as_str(),
+                        &refspec,
+                    ],
                 )]
             };
             let unconfirmed = matches!(deletion.outcome, RemoteOutcome::Unconfirmed);
@@ -516,7 +525,23 @@ pub fn execute_branch_deletion(
                 RemoteOutcome::Deleted => (true, None, push_back()),
                 // Restoring a branch that still exists is refused, so it is safe to offer.
                 RemoteOutcome::Unconfirmed => (false, None, push_back()),
-                RemoteOutcome::AlreadyGone { tracking_kept } => {
+                RemoteOutcome::Gone {
+                    already: false,
+                    tracking_kept,
+                } => (
+                    true,
+                    tracking_kept.as_ref().map(|reason| {
+                        format!(
+                            "{} kept its remote-tracking ref, which no longer matches the review ({reason}). Fetch to update it.",
+                            remote.display_name
+                        )
+                    }),
+                    push_back(),
+                ),
+                RemoteOutcome::Gone {
+                    already: true,
+                    tracking_kept,
+                } => {
                     already_gone = true;
                     match tracking_kept {
                         None => (
@@ -646,10 +671,12 @@ enum RemoteOutcome {
     /// The push was interrupted after it started, so the remote may have
     /// deleted the branch.
     Unconfirmed,
-    /// The remote no longer had the branch. Its remote-tracking ref was
-    /// removed as a deleting push removes it, unless it had changed, in which
-    /// case this says why it was kept.
-    AlreadyGone {
+    /// The remote no longer has the branch, but Git did not report deleting
+    /// it: it was `already` gone, or the push lost the server's report. Its
+    /// remote-tracking ref was removed as a deleting push removes it, unless it
+    /// had changed, in which case this says why it was kept.
+    Gone {
+        already: bool,
         tracking_kept: Option<String>,
     },
     Failed,
@@ -701,40 +728,59 @@ fn delete_remote(
         Err(error) => return failed(error.to_string()),
     };
     let diagnostic = combined_output(&output.stdout, &output.stderr);
-    if output.status.success() {
-        return RemoteDeletion {
-            outcome: RemoteOutcome::Deleted,
-            output: diagnostic,
-        };
-    }
-    if !String::from_utf8_lossy(&output.stdout).contains("(stale info)") {
-        return failed(diagnostic);
-    }
-    match remote_has(worktree, &remote.remote, &remote.remote_ref) {
-        Ok(false) => {
-            let tracking = command::git_at(
-                worktree,
-                [
-                    "update-ref",
-                    "--no-deref",
-                    "-d",
-                    remote.tracking_ref.as_str(),
-                    remote.expected_oid.as_str(),
-                ],
-            );
-            let tracking_kept = match tracking {
-                Ok(output) if output.status.success() => None,
-                Ok(output) => Some(combined_output(&output.stdout, &output.stderr)),
-                Err(error) => Some(error.to_string()),
-            };
-            RemoteDeletion {
-                outcome: RemoteOutcome::AlreadyGone { tracking_kept },
-                output: format!(
-                    "{} no longer has {}; someone deleted it after your last fetch.",
-                    remote.remote, remote.remote_ref
-                ),
+    let report = String::from_utf8_lossy(&output.stdout);
+    match reported_deletion(&report, &remote.remote_ref) {
+        Some(true) => {
+            return RemoteDeletion {
+                outcome: RemoteOutcome::Deleted,
+                output: diagnostic,
             }
         }
+        // The lease rejects a branch that moved and one that is gone alike.
+        Some(false) if report.contains("(stale info)") => {}
+        Some(false) => return failed(diagnostic),
+        // No status for the branch: the push may have failed before sending
+        // anything, or lost the server's report after it deleted the branch.
+        None if output.status.success() => {
+            return RemoteDeletion {
+                outcome: RemoteOutcome::Deleted,
+                output: diagnostic,
+            }
+        }
+        None => {
+            return match remote_has(worktree, &remote.remote, &remote.remote_ref) {
+                Ok(true) => failed(diagnostic),
+                Ok(false) => RemoteDeletion {
+                    outcome: RemoteOutcome::Gone {
+                        already: false,
+                        tracking_kept: remove_tracking_ref(worktree, remote),
+                    },
+                    output: format!(
+                        "{diagnostic}\nGit did not report the deletion, but {} no longer has {}.",
+                        remote.remote, remote.remote_ref
+                    ),
+                },
+                Err(reason) => RemoteDeletion {
+                    outcome: RemoteOutcome::Unconfirmed,
+                    output: format!(
+                        "{diagnostic}\nGit did not report whether {} deleted {}, and asking it failed ({reason}).",
+                        remote.remote, remote.remote_ref
+                    ),
+                },
+            };
+        }
+    }
+    match remote_has(worktree, &remote.remote, &remote.remote_ref) {
+        Ok(false) => RemoteDeletion {
+            outcome: RemoteOutcome::Gone {
+                already: true,
+                tracking_kept: remove_tracking_ref(worktree, remote),
+            },
+            output: format!(
+                "{} no longer has {}; someone deleted it after your last fetch.",
+                remote.remote, remote.remote_ref
+            ),
+        },
         Ok(true) => failed(match remote_tip(worktree, url, &remote.remote_ref) {
             Ok(Some(tip)) => format!(
                 "{diagnostic}\n{} on {} is now at {tip}, not the reviewed {}. Fetch, then review again.",
@@ -749,6 +795,45 @@ fn delete_remote(
             "{diagnostic}\n{} on {} no longer matches the reviewed commit {}, or it no longer exists, and asking the remote failed ({reason}). Fetch, then review again.",
             remote.remote_ref, remote.remote, remote.expected_oid
         )),
+    }
+}
+
+/// What `git push --porcelain` reported for deleting `reference`: deleted,
+/// rejected, or `None` when its report has no status for the branch.
+fn reported_deletion(report: &str, reference: &str) -> Option<bool> {
+    let deletion = format!(":{reference}");
+    report.lines().find_map(|line| {
+        let mut fields = line.split('\t');
+        let (flag, refspec) = (fields.next()?, fields.next()?);
+        if !refspec.ends_with(&deletion) {
+            return None;
+        }
+        match flag {
+            "-" => Some(true),
+            "!" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+/// Removes the remote-tracking ref a deleted remote branch leaves behind, as a
+/// deleting push does, only while it is still at the reviewed commit. Returns
+/// why it was kept, if it was.
+fn remove_tracking_ref(worktree: &Path, remote: &RemoteBranchDeletion) -> Option<String> {
+    let tracking = command::git_at(
+        worktree,
+        [
+            "update-ref",
+            "--no-deref",
+            "-d",
+            remote.tracking_ref.as_str(),
+            remote.expected_oid.as_str(),
+        ],
+    );
+    match tracking {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => Some(combined_output(&output.stdout, &output.stderr)),
+        Err(error) => Some(error.to_string()),
     }
 }
 
@@ -3238,16 +3323,112 @@ mod tests {
         assert!(!fixture.remote_has_branch("published"));
 
         let refspec = format!("{}:refs/heads/published", remote.expected_oid);
-        let recovery = ["push", "--", "origin", refspec.as_str()];
+        let recovery = [
+            "push",
+            "--force-with-lease=refs/heads/published:",
+            "--",
+            "origin",
+            refspec.as_str(),
+        ];
         assert_eq!(
             remote_step.recovery_commands,
             vec![git_command_line(Path::new(&plan.worktree_path), recovery)]
         );
+
+        // Someone recreates the branch at an older commit: restoring must not
+        // move it.
+        let peer = fixture.peer();
+        git(&peer, &["push", "origin", "main:refs/heads/published"]);
+        let refused = command::git_at(&fixture.repository, recovery).expect("run recovery");
+        assert!(
+            !refused.status.success(),
+            "the restore leaves a recreated branch alone"
+        );
+        git(&peer, &["push", "origin", "--delete", "published"]);
+
         git(&fixture.repository, &recovery);
         assert!(
             fixture.remote_has_branch("published"),
             "the recovery command republishes the branch"
         );
+    }
+
+    #[test]
+    fn reads_the_push_report_for_the_deleted_branch() {
+        let deleted = "To origin\n-\t:refs/heads/topic\t[deleted]\nDone\n";
+        assert_eq!(reported_deletion(deleted, "refs/heads/topic"), Some(true));
+        let rejected = "To origin\n!\t(delete):refs/heads/topic\t[rejected] (stale info)\nDone\n";
+        assert_eq!(reported_deletion(rejected, "refs/heads/topic"), Some(false));
+        let declined =
+            "To origin\n!\t:refs/heads/topic\t[remote rejected] (pre-receive hook declined)\nDone\n";
+        assert_eq!(reported_deletion(declined, "refs/heads/topic"), Some(false));
+        assert_eq!(reported_deletion(deleted, "refs/heads/other"), None);
+        assert_eq!(reported_deletion("", "refs/heads/topic"), None);
+    }
+
+    /// Installs a pre-push hook running `body`, which then fails the push before
+    /// Git sends anything or reports a status for the branch.
+    fn failing_pre_push(repository: &Path, body: &str) {
+        let hooks = repository.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).expect("hooks directory");
+        let script = hooks.join("pre-push");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\n{body}\nexit 1\n"),
+        )
+        .expect("write hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("make the hook executable");
+        }
+    }
+
+    #[test]
+    fn a_push_without_a_report_is_settled_by_asking_the_remote() {
+        let remote_path = |fixture: &Fixture| fixture.remote.to_string_lossy().replace('\\', "/");
+
+        // Still there: the push did not delete it.
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "kept"]);
+        git(&fixture.repository, &["push", "origin", "kept"]);
+        let plan = fixture.plan("refs/remotes/origin/kept", false, true);
+        failing_pre_push(&fixture.repository, ":");
+        execute(&plan, None).expect_err("the remote still has the branch");
+        assert!(fixture.remote_has_branch("kept"));
+
+        // Gone: the report was lost, but the branch was deleted.
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "lost"]);
+        git(&fixture.repository, &["push", "origin", "lost"]);
+        let plan = fixture.plan("refs/remotes/origin/lost", false, true);
+        failing_pre_push(
+            &fixture.repository,
+            &format!(
+                "git -C '{}' update-ref -d refs/heads/lost",
+                remote_path(&fixture)
+            ),
+        );
+        let result = execute(&plan, None).expect("the branch is gone");
+        assert_eq!(result.message, "Deleted remote branch origin/lost.");
+        assert!(!fixture.has_ref("refs/remotes/origin/lost"));
+
+        // Unreachable: whether it was deleted is unknown.
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "unknown"]);
+        git(&fixture.repository, &["push", "origin", "unknown"]);
+        let plan = fixture.plan("refs/remotes/origin/unknown", false, true);
+        failing_pre_push(
+            &fixture.repository,
+            &format!("mv '{0}' '{0}.moved'", remote_path(&fixture)),
+        );
+        let result = execute(&plan, None).expect("an unknown outcome is not a refusal");
+        assert_eq!(
+            result.message,
+            "Repola could not confirm whether remote branch origin/unknown was deleted."
+        );
+        assert!(result.remote.as_ref().expect("remote step").unconfirmed);
     }
 
     #[test]
