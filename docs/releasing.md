@@ -33,7 +33,9 @@ Generate the updater key with `pnpm tauri signer generate -w <private-key-path>`
 
 Feeds are `https://austin-smith.github.io/Repola/updates/stable.json` and `https://austin-smith.github.io/Repola/updates/nightly.json`.
 
-Both channels share application identity and settings. Switch by installing the desired channel. Back up settings before installing an older version.
+Stable installs as **Repola**, nightly as **Repola (Nightly)**, and local or manual installer builds as **Repola (Dev)**. Each has a separate application identity and settings profile, so they can be installed side by side. Development builds have no update feed.
+
+Stable retains existing data and imports legacy Git In Here settings. Existing nightly installs shared Stable's profile; the next nightly update starts a separate, empty profile. Add repositories explicitly in each new profile.
 
 ## Recovery
 

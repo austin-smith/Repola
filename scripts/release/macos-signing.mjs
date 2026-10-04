@@ -140,7 +140,10 @@ export async function verifyMacosRelease({ environment = process.env, platform =
   const target = required(environment, "REPOLA_TARGET");
   if (target !== "aarch64-apple-darwin") throw new Error("Unsupported macOS release target.");
   const bundle = bundleDirectory ?? join(root, "src-tauri", "target", target, "release", "bundle");
-  const app = join(bundle, "macos", "Repola.app");
+  const apps = (await readdir(join(bundle, "macos"), { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory() && entry.name.endsWith(".app"));
+  if (apps.length !== 1) throw new Error("Expected exactly one macOS application bundle.");
+  const app = join(bundle, "macos", apps[0].name);
   await run("codesign", ["--verify", "--deep", "--strict", app]);
   await run("xcrun", ["stapler", "validate", app]);
   await run("spctl", ["--assess", "--type", "execute", app]);

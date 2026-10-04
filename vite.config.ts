@@ -1,9 +1,10 @@
 import path from "node:path";
-import { defineConfig, type Plugin } from "vite";
+import { readFileSync } from "node:fs";
+import { loadEnv, type Plugin } from "vite";
+import { defineConfig, type ViteUserConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
-
-/// <reference types="vitest/config" />
+import { buildIdentities, resolveBuildChannel } from "./src/domain/build-identity.ts";
 
 const host = process.env.TAURI_DEV_HOST;
 const STARTUP_JAVASCRIPT_BUDGET_BYTES = 768 * 1024;
@@ -31,7 +32,7 @@ function startupBudget(): Plugin {
         .filter((output) => output.type === "asset" && output.fileName.endsWith(".css"))
         .reduce(
           (size, output) =>
-            size + (typeof output.source === "string" ? Buffer.byteLength(output.source) : output.source.byteLength),
+            size + (output.type === "asset" ? (typeof output.source === "string" ? Buffer.byteLength(output.source) : output.source.byteLength) : 0),
           0,
         );
 
@@ -48,59 +49,75 @@ function startupBudget(): Plugin {
 }
 
 // https://vite.dev/config/
-export default defineConfig(async () => ({
-  plugins: [react(), tailwindcss(), startupBudget()],
-  resolve: {
-    alias: {
-      "@": path.resolve(import.meta.dirname, "./src"),
+export default defineConfig(async ({ mode }) => {
+  const environment = loadEnv(mode, process.cwd(), "VITE_REPOLA_");
+  const baseConfig = JSON.parse(readFileSync(new URL("./src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+  const nativeConfig = process.env.TAURI_CONFIG ? JSON.parse(process.env.TAURI_CONFIG) : null;
+  const identifier = process.env.TAURI_ENV_PLATFORM ? nativeConfig?.identifier ?? baseConfig.identifier : undefined;
+  const channel = resolveBuildChannel(identifier, environment.VITE_REPOLA_RELEASE_CHANNEL);
+  const identity = buildIdentities[channel];
+  return {
+    plugins: [react(), tailwindcss(), {
+      name: "repola-build-identity",
+      transformIndexHtml(html) {
+        return html.replace(/%REPOLA_BUILD_CHANNEL%/g, channel).replace(/%REPOLA_APPLICATION_NAME%/g, identity.name);
+      },
+    }, startupBudget()],
+    define: {
+      "import.meta.env.VITE_REPOLA_RELEASE_CHANNEL": JSON.stringify(channel),
     },
-  },
-  test: {
-    environment: "jsdom",
-    setupFiles: "./src/test-setup.ts",
-  },
-  build: {
-    // Shiki grammars are emitted as independently loaded chunks. The largest
-    // bundled grammar is just under 800 KiB; startup assets are protected by
-    // the stricter transitive budget above.
-    chunkSizeWarningLimit: 820,
-    rollupOptions: {
-      output: {
-        manualChunks(id) {
-          if (!id.includes("node_modules")) return undefined;
-          const dependency = id.slice(id.lastIndexOf("/node_modules/") + "/node_modules/".length);
-          if (/^(react|react-dom|scheduler)(\/|$)/.test(dependency)) {
-            return "react-runtime";
-          }
-          // Keep image-only slider code in the lazily loaded diff rather than startup UI.
-          if (dependency.startsWith("@base-ui/react/slider/")) return undefined;
-          if (dependency.startsWith("@base-ui/")) return "ui-primitives";
-          if (dependency.startsWith("@tauri-apps/")) return "tauri-runtime";
-          return undefined;
+    resolve: {
+      alias: {
+        "@": path.resolve(import.meta.dirname, "./src"),
+      },
+    },
+    test: {
+      environment: "jsdom",
+      setupFiles: "./src/test-setup.ts",
+    },
+    build: {
+      // Shiki grammars are emitted as independently loaded chunks. The largest
+      // bundled grammar is just under 800 KiB; startup assets are protected by
+      // the stricter transitive budget above.
+      chunkSizeWarningLimit: 820,
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            if (!id.includes("node_modules")) return undefined;
+            const dependency = id.slice(id.lastIndexOf("/node_modules/") + "/node_modules/".length);
+            if (/^(react|react-dom|scheduler)(\/|$)/.test(dependency)) {
+              return "react-runtime";
+            }
+            // Keep image-only slider code in the lazily loaded diff rather than startup UI.
+            if (dependency.startsWith("@base-ui/react/slider/")) return undefined;
+            if (dependency.startsWith("@base-ui/")) return "ui-primitives";
+            if (dependency.startsWith("@tauri-apps/")) return "tauri-runtime";
+            return undefined;
+          },
         },
       },
     },
-  },
 
-  // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
-  //
-  // 1. prevent Vite from obscuring rust errors
-  clearScreen: false,
-  // 2. tauri expects a fixed port, fail if that port is not available
-  server: {
-    port: 1420,
-    strictPort: true,
-    host: host || false,
-    hmr: host
-      ? {
-          protocol: "ws",
-          host,
-          port: 1421,
-        }
-      : undefined,
-    watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+    // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
+    //
+    // 1. prevent Vite from obscuring rust errors
+    clearScreen: false,
+    // 2. tauri expects a fixed port, fail if that port is not available
+    server: {
+      port: 1420,
+      strictPort: true,
+      host: host || false,
+      hmr: host
+        ? {
+            protocol: "ws",
+            host,
+            port: 1421,
+          }
+        : undefined,
+      watch: {
+        // 3. tell Vite to ignore watching `src-tauri`
+        ignored: ["**/src-tauri/**"],
+      },
     },
-  },
-}));
+  } satisfies ViteUserConfig;
+});

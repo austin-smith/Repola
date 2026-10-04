@@ -1,0 +1,23 @@
+{
+  "stable": {
+    "name": "Repola",
+    "channelLabel": null,
+    "binaryName": "repola",
+    "identifier": "net.crapshack.repola",
+    "iconDirectory": "assets/icons"
+  },
+  "nightly": {
+    "name": "Repola (Nightly)",
+    "channelLabel": "Nightly",
+    "binaryName": "repola-nightly",
+    "identifier": "net.crapshack.repola.nightly",
+    "iconDirectory": "assets/icons/nightly"
+  },
+  "development": {
+    "name": "Repola (Dev)",
+    "channelLabel": "Dev",
+    "binaryName": "repola-dev",
+    "identifier": "net.crapshack.repola.dev",
+    "iconDirectory": "assets/icons/development"
+  }
+}
