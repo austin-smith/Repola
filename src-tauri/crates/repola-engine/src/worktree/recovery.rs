@@ -115,7 +115,7 @@ fn is_zero(count: &usize) -> bool {
 
 impl PathState {
     fn has_content(&self) -> bool {
-        !self.index.is_empty() || self.worktree.is_some()
+        !self.index.is_empty() || self.worktree.is_some() || self.directory
     }
 
     /// Whether restoring `saved` over this state changes anything: its index

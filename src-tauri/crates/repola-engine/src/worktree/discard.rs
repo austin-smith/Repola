@@ -1792,6 +1792,29 @@ mod tests {
         assert_eq!(folder.permissions().mode() & 0o777, 0o700);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_restore_saves_the_empty_folder_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = repository();
+        let path = root(&directory);
+        git(&path, &["commit", "--allow-empty", "-m", "base"]);
+        write(&path, "x", b"untracked\n");
+        let discarded = discard(&path, file(&path, "x"));
+        std::fs::create_dir(path.join("x")).expect("empty folder");
+        std::fs::set_permissions(path.join("x"), std::fs::Permissions::from_mode(0o700))
+            .expect("private");
+
+        let replaced = restore(&path, &discarded.recovery_point)
+            .replaced
+            .expect("the folder is saved before the file replaces it");
+        assert_eq!(std::fs::read(path.join("x")).expect("file"), b"untracked\n");
+        restore(&path, &replaced);
+        let folder = std::fs::metadata(path.join("x")).expect("folder");
+        assert!(folder.is_dir());
+        assert_eq!(folder.permissions().mode() & 0o777, 0o700);
+    }
+
     fn effect_of(plan: &DiscardPlan, display: &str) -> DiscardEffect {
         plan.entries
             .iter()
