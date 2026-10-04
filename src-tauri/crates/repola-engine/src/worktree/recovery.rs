@@ -311,8 +311,10 @@ fn prepare_path(worktree: &Path, path: &WorktreePath, display: &str) -> Result<P
 /// Observes the index entries and working-tree content of `paths`. With
 /// `store`, every working-tree blob is also written to the object store, so
 /// the oids returned are exactly the content a recovery point will hold.
+/// `head` is the commit HEAD names, or `None` on an unborn branch.
 pub(super) fn observe_paths(
     worktree: &Path,
+    head: Option<&str>,
     paths: &[GitPath],
     store: bool,
 ) -> Result<Vec<PathState>, String> {
@@ -320,7 +322,7 @@ pub(super) fn observe_paths(
         .iter()
         .map(WorktreePath::new)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut index = index_entries(worktree, &validated)?;
+    let mut index = index_entries(worktree, head, &validated)?;
 
     enum Source {
         File(OsString),
@@ -438,12 +440,16 @@ fn link_target_bytes(target: PathBuf, display: &str) -> Result<Vec<u8>, String> 
 /// Observes only the index entries of `paths`, for changes that leave their
 /// working tree untouched. Whatever occupies such a path on disk is not part
 /// of the change, so it is neither fingerprinted nor saved.
-pub(super) fn observe_index(worktree: &Path, paths: &[GitPath]) -> Result<Vec<PathState>, String> {
+pub(super) fn observe_index(
+    worktree: &Path,
+    head: Option<&str>,
+    paths: &[GitPath],
+) -> Result<Vec<PathState>, String> {
     let validated = paths
         .iter()
         .map(WorktreePath::new)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut index = index_entries(worktree, &validated)?;
+    let mut index = index_entries(worktree, head, &validated)?;
     Ok(paths
         .iter()
         .zip(&validated)
@@ -458,8 +464,13 @@ pub(super) fn observe_index(worktree: &Path, paths: &[GitPath]) -> Result<Vec<Pa
 
 fn index_entries(
     worktree: &Path,
+    head: Option<&str>,
     paths: &[WorktreePath],
 ) -> Result<HashMap<Vec<u8>, Vec<IndexEntry>>, String> {
+    let base = match head {
+        Some(head) => head.to_string(),
+        None => empty_tree(worktree)?,
+    };
     let wanted: HashSet<&[u8]> = paths.iter().map(|path| path.bytes.as_slice()).collect();
     let arguments = paths
         .iter()
@@ -467,21 +478,7 @@ fn index_entries(
         .collect::<Result<Vec<_>, _>>()?;
     let mut entries: HashMap<Vec<u8>, Vec<IndexEntry>> = HashMap::new();
     for chunk in argument_chunks(arguments) {
-        // `ls-files` omits the intent-to-add flag; comparing the index with
-        // the working tree reports exactly those entries as added.
-        let mut args = vec![
-            OsString::from("diff-files"),
-            OsString::from("--name-only"),
-            OsString::from("--diff-filter=A"),
-            OsString::from("-z"),
-            OsString::from("--"),
-        ];
-        args.extend(chunk.iter().cloned());
-        let output = git_stdout(worktree, args, "read the intent-to-add entries")?;
-        let intent_to_add: HashSet<&[u8]> = output
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-            .collect();
+        let intent_to_add = intent_to_add_paths(worktree, &base, &chunk)?;
         let mut args = vec![
             OsString::from("ls-files"),
             OsString::from("--stage"),
@@ -518,6 +515,50 @@ fn index_entries(
         }
     }
     Ok(entries)
+}
+
+/// The paths among `pathspecs` whose index entry was recorded with `git add
+/// --intent-to-add`, which `ls-files` does not report. Comparing the index with
+/// `base` lists such an entry only when asked to show it, whether or not its
+/// file is still on disk.
+fn intent_to_add_paths(
+    worktree: &Path,
+    base: &str,
+    pathspecs: &[OsString],
+) -> Result<HashSet<Vec<u8>>, String> {
+    let listed = |visibility: &str| -> Result<HashSet<Vec<u8>>, String> {
+        let mut args = [
+            "diff-index",
+            "--cached",
+            "--name-only",
+            "-z",
+            visibility,
+            base,
+            "--",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        args.extend(pathspecs.iter().cloned());
+        let output = git_stdout(worktree, args, "read the intent-to-add entries")?;
+        Ok(output
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect())
+    };
+    let visible = listed("--ita-visible-in-index")?;
+    let hidden = listed("--ita-invisible-in-index")?;
+    Ok(visible.difference(&hidden).cloned().collect())
+}
+
+/// The empty tree's object ID in this repository's hash format, which Git
+/// knows without storing it.
+fn empty_tree(worktree: &Path) -> Result<String, String> {
+    let output =
+        command::git_at_with_input(worktree, ["hash-object", "-t", "tree", "--stdin"], b"")
+            .map_err(|error| error.to_string())?;
+    let oid = successful_stdout(output, "name the empty tree")?;
+    Ok(String::from_utf8_lossy(&oid).trim().to_string())
 }
 
 fn hash_files(worktree: &Path, files: Vec<OsString>, store: bool) -> Result<Vec<String>, String> {
@@ -945,7 +986,7 @@ pub fn plan_recovery_restore(request: RecoveryPointRequest) -> Result<RecoveryRe
     let worktree = Path::new(&snapshot.worktree_path);
     let (point, saved) = load_point(worktree, &request.point)?;
     let paths: Vec<GitPath> = saved.iter().map(|state| state.path.clone()).collect();
-    let current = observe_paths(worktree, &paths, false)?;
+    let current = observe_paths(worktree, snapshot.head.as_deref(), &paths, false)?;
     refuse_replacing_directories(&saved, &current)?;
     let entries = saved
         .iter()
@@ -1007,7 +1048,7 @@ pub fn restore_recovery_point(
     let worktree = PathBuf::from(&snapshot.worktree_path);
     let (point, saved) = load_point(&worktree, &request.point)?;
     let paths: Vec<GitPath> = saved.iter().map(|state| state.path.clone()).collect();
-    let current = observe_paths(&worktree, &paths, true)?;
+    let current = observe_paths(&worktree, snapshot.head.as_deref(), &paths, true)?;
     if fingerprint(snapshot.head.as_deref(), snapshot.operation, &current)? != request.fingerprint {
         return Err(
             "The working copy changed after this restore was reviewed. Review it again.".into(),
@@ -1066,6 +1107,7 @@ fn apply_restore(
     let absent = "0".repeat(point.oid.len());
     let mut input = Vec::new();
     let mut intents = Vec::new();
+    let mut placeholders = Vec::new();
     for (saved, current) in changed {
         if saved.index == current.index {
             continue;
@@ -1079,6 +1121,9 @@ fn apply_restore(
                 intents.extend_from_slice(b":(literal)");
                 intents.extend_from_slice(&path);
                 intents.push(0);
+                if saved.worktree.is_none() {
+                    placeholders.push(&saved.path);
+                }
                 continue;
             }
             input.extend_from_slice(
@@ -1094,25 +1139,45 @@ fn apply_restore(
                 .map_err(|error| error.to_string())?;
         successful_stdout(output, "restore the saved index entries")?;
     }
-    // Plumbing cannot set the flag, so these entries are recorded the way they
-    // were made. The saved file is already back on disk, which `add -N`
-    // requires; `--force` covers a path an ignore rule also matches.
-    if !intents.is_empty() {
-        let output = command::git_at_with_input(
-            worktree,
-            [
-                "add",
-                "--force",
-                "--intent-to-add",
-                "--pathspec-from-file=-",
-                "--pathspec-file-nul",
-            ],
-            &intents,
-        )
-        .map_err(|error| error.to_string())?;
-        successful_stdout(output, "restore the intent-to-add entries")?;
+    if intents.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    // Plumbing cannot set the flag, so these entries are recorded the way they
+    // were made, and `add -N` needs a file on disk. Saved files are already
+    // back; an entry whose file was deleted gets an empty stand-in for the
+    // moment `add -N` runs. `--force` covers a path an ignore rule matches.
+    let mut created = Vec::new();
+    let recorded = placeholders
+        .iter()
+        .try_for_each(|path| {
+            let target = prepare_path(worktree, &WorktreePath::new(path)?, &path.display)?;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .map_err(|error| format!("{} could not be restored: {error}", path.display))?;
+            created.push(*path);
+            Ok(())
+        })
+        .and_then(|()| {
+            let output = command::git_at_with_input(
+                worktree,
+                [
+                    "add",
+                    "--force",
+                    "--intent-to-add",
+                    "--pathspec-from-file=-",
+                    "--pathspec-file-nul",
+                ],
+                &intents,
+            )
+            .map_err(|error| error.to_string())?;
+            successful_stdout(output, "restore the intent-to-add entries").map(drop)
+        });
+    for path in created {
+        remove_worktree_entry(worktree, path)?;
+    }
+    recorded
 }
 
 fn core_symlinks(worktree: &Path) -> Result<bool, String> {
@@ -1735,7 +1800,8 @@ mod tests {
     fn recovery_refs_never_appear_in_branch_tag_history_or_reflog_queries() {
         let (_directory, path) = repository();
         fs::write(path.join("base.txt"), "edited\n").expect("edit");
-        let states = observe_paths(&path, &[git_path(b"base.txt")], true).expect("observe");
+        let states =
+            observe_paths(&path, Some("HEAD"), &[git_path(b"base.txt")], true).expect("observe");
         let point = store(&path, &states);
         assert!(point.id.starts_with("refs/repola/discarded/"));
         assert_eq!(git(&path, &["cat-file", "-t", &point.id]).trim(), "tree");

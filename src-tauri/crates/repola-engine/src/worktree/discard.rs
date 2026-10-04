@@ -230,7 +230,12 @@ pub fn plan_discard(request: DiscardPlanRequest) -> Result<DiscardPlan, String> 
         worktree_path: request.worktree_path,
     })?;
     let selection = select(&snapshot, &request.target)?;
-    let states = observe(Path::new(&snapshot.worktree_path), &selection, false)?;
+    let states = observe(
+        Path::new(&snapshot.worktree_path),
+        snapshot.head.as_deref(),
+        &selection,
+        false,
+    )?;
     Ok(DiscardPlan {
         target: request.target,
         entries: selection.entries,
@@ -251,7 +256,7 @@ pub fn discard_changes(request: DiscardRequest) -> Result<DiscardResult, String>
     let worktree = Path::new(&snapshot.worktree_path);
     // Hashing with `store` writes the very bytes being fingerprinted, so the
     // recovery point holds exactly the reviewed content.
-    let states = observe(worktree, &selection, true)?;
+    let states = observe(worktree, snapshot.head.as_deref(), &selection, true)?;
     if fingerprint(snapshot.head.as_deref(), snapshot.operation, &states)? != request.fingerprint {
         return Err(STALE_PLAN.into());
     }
@@ -280,8 +285,13 @@ pub fn discard_changes(request: DiscardRequest) -> Result<DiscardResult, String>
 
 /// Observes every path the selection changes, in the same order whenever it
 /// is called, so a plan's fingerprint and an execution's agree.
-fn observe(worktree: &Path, selection: &Selection, store: bool) -> Result<Vec<PathState>, String> {
-    let mut states = observe_paths(worktree, &selection.touched, store)?;
+fn observe(
+    worktree: &Path,
+    head: Option<&str>,
+    selection: &Selection,
+    store: bool,
+) -> Result<Vec<PathState>, String> {
+    let mut states = observe_paths(worktree, head, &selection.touched, store)?;
     // Git replaces a directory in the way of a restored file together with
     // everything inside it, so a discard never runs over one.
     if let Some(state) = states.iter().find(|state| state.directory) {
@@ -290,7 +300,7 @@ fn observe(worktree: &Path, selection: &Selection, store: bool) -> Result<Vec<Pa
             state.path.display
         ));
     }
-    states.extend(observe_index(worktree, &selection.unstage)?);
+    states.extend(observe_index(worktree, head, &selection.unstage)?);
     Ok(states)
 }
 
@@ -1320,25 +1330,38 @@ mod tests {
 
     #[test]
     fn intent_to_add_entries_restore_exactly() {
-        let directory = repository();
-        let path = root(&directory);
-        write(&path, ".gitignore", b"*.log\n");
-        git(&path, &["add", "."]);
-        git(&path, &["commit", "-m", "base"]);
-        write(&path, "intended.txt", b"not staged yet\n");
-        write(&path, "forced.log", b"ignored, but intended\n");
-        git(&path, &["add", "--intent-to-add", "intended.txt"]);
-        git(&path, &["add", "--force", "--intent-to-add", "forced.log"]);
-        // The same index entry, made by staging an empty file.
-        write(&path, "empty.txt", b"");
-        git(&path, &["add", "empty.txt"]);
-        write(&path, "empty.txt", b"edited after staging\n");
-        let before = exact_state(&path);
+        for unborn in [false, true] {
+            let directory = repository();
+            let path = root(&directory);
+            write(&path, ".gitignore", b"*.log\n");
+            if !unborn {
+                git(&path, &["add", "."]);
+                git(&path, &["commit", "-m", "base"]);
+            }
+            write(&path, "intended.txt", b"not staged yet\n");
+            write(&path, "forced.log", b"ignored, but intended\n");
+            write(&path, "nested/gone.txt", b"deleted after git add -N\n");
+            git(
+                &path,
+                &["add", "--intent-to-add", "intended.txt", "nested/gone.txt"],
+            );
+            git(&path, &["add", "--force", "--intent-to-add", "forced.log"]);
+            std::fs::remove_file(path.join("nested/gone.txt")).expect("delete");
+            // The same index entry, made by staging an empty file.
+            write(&path, "empty.txt", b"");
+            git(&path, &["add", "empty.txt"]);
+            write(&path, "empty.txt", b"edited after staging\n");
+            let before = exact_state(&path);
 
-        let all = discard(&path, DiscardTarget::All);
-        assert!(all.snapshot.changes.is_empty());
-        restore(&path, &all.recovery_point);
-        assert_eq!(exact_state(&path), before);
+            let all = discard(&path, DiscardTarget::All);
+            assert!(
+                all.snapshot.changes.iter().all(|change| change.untracked),
+                "unborn: {unborn}"
+            );
+            restore(&path, &all.recovery_point);
+            assert_eq!(exact_state(&path), before, "unborn: {unborn}");
+            assert!(!path.join("nested/gone.txt").exists(), "unborn: {unborn}");
+        }
     }
 
     #[test]
