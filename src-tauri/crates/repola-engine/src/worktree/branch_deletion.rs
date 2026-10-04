@@ -1309,7 +1309,9 @@ fn single_push_url(worktree: &Path, remote: &str) -> Result<String, String> {
 
 /// Asks the URL the remote deletion pushes to which branch its HEAD names,
 /// because the local `refs/remotes/<remote>/HEAD` can be missing or stale.
-/// Refuses when it cannot answer, or answers without naming a branch.
+/// Refuses when it cannot answer, answers without naming a branch, or does not
+/// show its HEAD at all: a server can hide HEAD from fetching while it still
+/// names the branch a push would delete.
 ///
 /// `git push` has already applied any URL rewriting to the push URL, but
 /// `ls-remote` rewrites the URL it is given with `url.<base>.insteadOf` again,
@@ -1348,9 +1350,13 @@ fn confirm_not_remote_default(
             "{} is the default branch of {} at {}. Repola does not delete a remote's default branch.",
             remote.display_name, remote.remote, remote.push_url
         )),
-        RemoteHead::Branch(_) | RemoteHead::Absent => Ok(()),
+        RemoteHead::Branch(_) => Ok(()),
         RemoteHead::Unnamed => Err(format!(
             "{} at {} did not say which branch is its default, so nothing was deleted.",
+            remote.remote, remote.push_url
+        )),
+        RemoteHead::Absent => Err(format!(
+            "{} at {} did not show which branch is its default, so nothing was deleted.",
             remote.remote, remote.push_url
         )),
     }
@@ -1362,7 +1368,7 @@ enum RemoteHead {
     Branch(String),
     /// HEAD exists, but the remote did not report what it points to.
     Unnamed,
-    /// The remote has no HEAD, so it has no default branch.
+    /// The remote showed no HEAD: it has none, or hides it.
     Absent,
 }
 
@@ -3856,6 +3862,26 @@ mod tests {
             executing.plan.confirmation,
             BranchDeletionConfirmation::TypeBranchName
         );
+    }
+
+    #[test]
+    fn a_remote_that_hides_its_head_is_not_deleted_from() {
+        let fixture = Fixture::new();
+        // Fetching no longer shows HEAD, which still names main.
+        git(&fixture.remote, &["config", "uploadpack.hideRefs", "HEAD"]);
+        git(
+            &fixture.repository,
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        );
+        let plan = fixture.plan("refs/remotes/origin/main", false, true);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+
+        let error = execute(&plan, None).expect_err("the default branch cannot be ruled out");
+        assert!(
+            error.contains("did not show which branch is its default"),
+            "{error}"
+        );
+        assert!(fixture.remote_has_branch("main"));
     }
 
     #[test]
