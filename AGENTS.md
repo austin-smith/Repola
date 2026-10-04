@@ -49,6 +49,7 @@ CI (`.github/workflows/ci.yml`) runs this suite on Ubuntu, macOS, and Windows; a
 ## Branches, commits, and pull requests
 
 - Use plain lowercase kebab-case for branch names. Keep names descriptive and do not include issue numbers, prefixes, or namespaces such as `feature/`, `fix/`, usernames, or agent names.
+- Start stable release drafts with `pnpm release`; preview with `pnpm release --dry-run`. Use this command instead of manually creating or pushing stable tags.
 - Before every commit or amend, show the exact current diff and validation, then get explicit approval. Branch or pull-request requests are not commit approval; later changes require fresh approval.
 - Never amend, rebase, squash, reset, rewrite history, or force-push without explicit approval for that exact operation.
 - Write commit messages entirely lowercase. Use the imperative mood for the subject, keep each commit focused on one logical change, do not use type or scope prefixes, and do not end the subject with a period. Add a body when the reason or important tradeoffs are not clear from the subject.
