@@ -35,7 +35,13 @@
     "active": true,
     "targets": "all",
     "macOS": {
-      "signingIdentity": "-"
+      "signingIdentity": "-",
+      "dmg": {
+        "background": "assets/dmg/background.png",
+        "windowSize": { "width": 660, "height": 420 },
+        "appPosition": { "x": 180, "y": 194 },
+        "applicationFolderPosition": { "x": 480, "y": 194 }
+      }
     },
     "icon": [
       "assets/icons/32x32.png",
