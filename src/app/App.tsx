@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   AlertTriangleIcon,
@@ -81,7 +81,7 @@ import { RepositoryProvider, type RepositoryContextValue } from "../workspace/co
 import { AppSidebar, type MachineConnection } from "../workspace/AppSidebar";
 import { RepositoryToolbar } from "../workspace/RepositoryToolbar";
 import { ChangesWorkbench } from "../workspace/ChangesWorkbench";
-import { HistoryWorkbench } from "../workspace/HistoryWorkbench";
+import { HistoryWorkbench } from "../workspace/lazy";
 import { WorktreeDetails, type PullState } from "../workspace/WorktreeDetails";
 import { PaneResizeHandle } from "../workspace/PaneResizeHandle";
 import { LazyDialog } from "../workspace/LazyDialog";
@@ -1079,7 +1079,9 @@ function App() {
         {workspaceToolbar}
         {currentRepository && currentWorktree ? (
           <ErrorBoundary label="The history view" resetKey={currentWorktree.id}>
-            <HistoryWorkbench key={currentWorktree.id} />
+            <Suspense fallback={<div className="grid min-h-0 flex-1 place-items-center"><Spinner className="size-6" /></div>}>
+              <HistoryWorkbench key={currentWorktree.id} />
+            </Suspense>
           </ErrorBoundary>
         ) : noWorkingCopy("No history available", "Select an available working copy.")}
         {overlays}
