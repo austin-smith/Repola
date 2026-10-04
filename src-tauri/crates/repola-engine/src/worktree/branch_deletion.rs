@@ -3419,9 +3419,17 @@ mod tests {
         git(&fixture.repository, &["branch", "unknown"]);
         git(&fixture.repository, &["push", "origin", "unknown"]);
         let plan = fixture.plan("refs/remotes/origin/unknown", false, true);
+        // Asking afterwards goes through the remote's name, now pointed at a
+        // repository that does not exist. Moving the remote itself would fail
+        // on Windows, where the running push keeps it open.
+        let missing = fixture.root.join("missing.git");
         failing_pre_push(
             &fixture.repository,
-            &format!("mv '{0}' '{0}.moved'", remote_path(&fixture)),
+            &format!(
+                "git -C '{}' config remote.origin.pushurl '{}'",
+                fixture.repository.to_string_lossy().replace('\\', "/"),
+                missing.to_string_lossy().replace('\\', "/")
+            ),
         );
         let result = execute(&plan, None).expect("an unknown outcome is not a refusal");
         assert_eq!(
