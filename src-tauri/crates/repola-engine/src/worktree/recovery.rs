@@ -471,7 +471,7 @@ pub(super) fn observe_paths(
             }
             Err(error) => return Err(format!("{} could not be inspected: {error}", path.display)),
         };
-        if let Some(identity) = entry_identity(&location, &metadata, &mut folder_listings)? {
+        for identity in entry_identity(&location, &metadata, &mut folder_listings)? {
             if let Some(other) = entries_on_disk.insert(identity, path) {
                 return Err(format!(
                     "{} and {} are spelled differently but are one file on this file system, so Repola cannot save them separately. Undo this change with Git instead.",
@@ -649,18 +649,34 @@ struct ParentChain {
     permissions: Vec<u32>,
 }
 
-/// What names one entry on disk, so two paths with the same identity are one
-/// entry under two spellings. On Unix it is the device and inode of a folder
-/// or of a file with one link; hard links are separate entries by design.
+/// What names one entry on disk, so two paths sharing any of these are one
+/// entry under two spellings. On Unix it is the real path, which on macOS is
+/// spelled as the folder stores the name, and, for a folder or a file with one
+/// link, its device and inode, which also covers file systems whose real paths
+/// keep the spelling asked for. Hard links are separate entries by design.
 #[cfg(unix)]
 fn entry_identity(
-    _location: &Path,
+    location: &Path,
     metadata: &fs::Metadata,
     _folder_listings: &mut HashMap<PathBuf, Vec<OsString>>,
-) -> Result<Option<OsString>, String> {
+) -> Result<Vec<OsString>, String> {
     use std::os::unix::fs::MetadataExt;
-    Ok((metadata.is_dir() || metadata.nlink() == 1)
-        .then(|| OsString::from(format!("{}:{}", metadata.dev(), metadata.ino()))))
+    let mut identities = Vec::new();
+    if !metadata.file_type().is_symlink() {
+        let real = dunce::canonicalize(location)
+            .map_err(|error| format!("{} could not be inspected: {error}", location.display()))?;
+        let mut identity = OsString::from("path:");
+        identity.push(real);
+        identities.push(identity);
+    }
+    if metadata.is_dir() || metadata.nlink() == 1 {
+        identities.push(OsString::from(format!(
+            "inode:{}:{}",
+            metadata.dev(),
+            metadata.ino()
+        )));
+    }
+    Ok(identities)
 }
 
 /// What names one entry on disk, so two paths with the same identity are one
@@ -672,9 +688,9 @@ fn entry_identity(
     location: &Path,
     _metadata: &fs::Metadata,
     folder_listings: &mut HashMap<PathBuf, Vec<OsString>>,
-) -> Result<Option<OsString>, String> {
+) -> Result<Vec<OsString>, String> {
     let (Some(parent), Some(name)) = (location.parent(), location.file_name()) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let folder = dunce::canonicalize(parent)
         .map_err(|error| format!("{} could not be inspected: {error}", parent.display()))?;
@@ -695,7 +711,10 @@ fn entry_identity(
                 .iter()
                 .find(|stored| stored.to_string_lossy().to_lowercase() == wanted)
         });
-    Ok(stored.map(|stored| folder.join(stored).into_os_string()))
+    Ok(stored
+        .map(|stored| folder.join(stored).into_os_string())
+        .into_iter()
+        .collect())
 }
 
 #[cfg(unix)]
@@ -3416,13 +3435,24 @@ mod tests {
             let error = observe_paths(&path, None, &paths, false).expect_err("one file");
             assert!(error.contains("spelled differently"), "{error}");
         }
-        // Hard links are separate names on purpose and stay allowed.
+        // Hard links are separate names on purpose and stay allowed, and a
+        // file having one does not hide another spelling of its own name.
         fs::hard_link(path.join("caf\u{e9}.txt"), path.join("linked.txt")).expect("link");
         let paths = [
             git_path("caf\u{e9}.txt".as_bytes()),
             git_path(b"linked.txt"),
         ];
         observe_paths(&path, None, &paths, false).expect("hard links");
+        for other in ["CAF\u{c9}.TXT", "cafe\u{301}.txt"] {
+            if path.join(other).exists() {
+                let paths = [
+                    git_path("caf\u{e9}.txt".as_bytes()),
+                    git_path(other.as_bytes()),
+                ];
+                let error = observe_paths(&path, None, &paths, false).expect_err("one file");
+                assert!(error.contains("spelled differently"), "{error}");
+            }
+        }
     }
 
     #[test]
