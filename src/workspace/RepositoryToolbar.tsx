@@ -150,10 +150,11 @@ function RepositoryPicker({
     >
       <ComboboxTrigger
         id="current-repository"
-        render={<Button variant="ghost" className="w-56 justify-between font-medium" aria-label="Current repository" />}
+        className="w-56 font-medium"
+        aria-label="Current repository"
       >
         <span className="flex min-w-0 items-center gap-1.5">
-          <DatabaseIcon data-icon="inline-start" aria-hidden="true" />
+          <DatabaseIcon aria-hidden="true" />
           <span className="truncate">
             <ComboboxValue placeholder="Select a repository…" />
           </span>
@@ -213,10 +214,11 @@ function WorktreePicker({
     >
       <ComboboxTrigger
         id="current-worktree"
-        render={<Button variant="ghost" className="w-52 justify-between" aria-label="Current worktree" />}
+        className="w-52"
+        aria-label="Current worktree"
       >
         <span className="flex min-w-0 items-center gap-1.5">
-          <FolderOpenIcon data-icon="inline-start" aria-hidden="true" />
+          <FolderOpenIcon aria-hidden="true" />
           <span className="truncate">
             <ComboboxValue placeholder="Select a worktree…" />
           </span>
@@ -336,7 +338,7 @@ function BranchControl() {
   return (
     <div className="flex min-w-0 flex-1 items-center gap-1">
         <Select items={items} value={current?.fullName ?? null} disabled={busy || branches === null} onValueChange={selectBranch}>
-          <SelectTrigger id="current-branch" className="w-56 border-transparent bg-transparent hover:bg-accent" aria-label="Current branch">
+          <SelectTrigger id="current-branch" className="w-56" aria-label="Current branch">
             {busy || branches === null
               ? <Spinner />
               : <GitBranchIcon aria-hidden="true" />}

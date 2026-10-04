@@ -5,6 +5,7 @@ import { Combobox as ComboboxPrimitive } from "@base-ui/react/combobox"
 import { cn } from "@/lib/utils"
 
 import { Button } from "@/components/ui/button"
+import { selectTriggerClassName } from "@/components/ui/select"
 import {
   InputGroup,
   InputGroupAddon,
@@ -22,12 +23,20 @@ function ComboboxValue({ ...props }: ComboboxPrimitive.Value.Props) {
 function ComboboxTrigger({
   className,
   children,
+  variant = "field",
   ...props
-}: ComboboxPrimitive.Trigger.Props) {
+}: ComboboxPrimitive.Trigger.Props & {
+  /** `field` matches SelectTrigger; `plain` is for triggers rendered inside another control. */
+  variant?: "field" | "plain"
+}) {
   return (
     <ComboboxPrimitive.Trigger
       data-slot="combobox-trigger"
-      className={cn("[&_svg:not([class*='size-'])]:size-4", className)}
+      className={cn(
+        variant === "field" && [selectTriggerClassName, "h-8"],
+        "[&_svg:not([class*='size-'])]:size-4",
+        className
+      )}
       {...props}
     >
       {children}
@@ -71,7 +80,7 @@ function ComboboxInput({
           <InputGroupButton
             size="icon-xs"
             variant="ghost"
-            render={<ComboboxTrigger />}
+            render={<ComboboxTrigger variant="plain" />}
             data-slot="input-group-button"
             className="group-has-data-[slot=combobox-clear]/input-group:hidden data-pressed:bg-transparent"
             disabled={disabled}
