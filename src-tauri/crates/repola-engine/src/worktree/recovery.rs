@@ -1551,20 +1551,27 @@ pub(super) struct Removals<'a> {
 }
 
 impl Removals<'_> {
-    /// Whether a folder at `path` holds nothing but files removed first, so
-    /// it is empty by the time a file is written in its place.
+    /// Whether the folder at `path` is gone, or empty, by the time a file is
+    /// written in its place: everything in it is removed first.
     pub(super) fn empties_folder(&self, worktree: &Path, path: &GitPath) -> Result<bool, String> {
+        let valid = WorktreePath::new(path)?;
+        let Some(location) = inspect_path(worktree, &valid)? else {
+            return Ok(true);
+        };
         let bytes = decode_path_token_bytes(&path.token)?;
-        let removed = self
-            .files
-            .iter()
-            .filter(|removed| {
-                removed.len() > bytes.len()
-                    && removed.starts_with(&bytes)
-                    && removed[bytes.len()] == b'/'
-            })
-            .count();
-        Ok(files_beneath(worktree, path)? == removed)
+        let mut removed = HashSet::new();
+        for file in self.files.iter().filter(|removed| {
+            removed.len() > bytes.len()
+                && removed.starts_with(&bytes)
+                && removed[bytes.len()] == b'/'
+        }) {
+            let mut location = worktree.to_path_buf();
+            for component in file.split(|byte| *byte == b'/') {
+                location.push(os_string_from_path_bytes(component.to_vec())?);
+            }
+            removed.insert(location);
+        }
+        Ok(folder_vanishes(&location, &removed)?.0)
     }
 
     /// Whether writing `path` would replace something not removed first: a
@@ -1976,29 +1983,29 @@ pub(super) fn remove_empty_directory(worktree: &Path, path: &GitPath) -> Result<
     Ok(())
 }
 
-/// How many files and links lie anywhere beneath the folder at `path`,
-/// without following links.
-fn files_beneath(worktree: &Path, path: &GitPath) -> Result<usize, String> {
-    let valid = WorktreePath::new(path)?;
-    let Some(location) = inspect_path(worktree, &valid)? else {
-        return Ok(0);
-    };
-    let mut count = 0;
-    let mut folders = vec![location];
-    while let Some(folder) = folders.pop() {
-        let entries = fs::read_dir(&folder)
-            .map_err(|error| format!("{} could not be read: {error}", folder.display()))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| error.to_string())?;
-            let kind = entry.file_type().map_err(|error| error.to_string())?;
-            if kind.is_dir() {
-                folders.push(entry.path());
-            } else {
-                count += 1;
-            }
+/// Whether everything in `folder` goes once `removed` are removed, and
+/// whether any of them lies in it. Removing a folder's last file removes the
+/// folder too, so a subfolder goes only when it holds a removed file and
+/// everything else in it goes as well; an empty one stays.
+fn folder_vanishes(folder: &Path, removed: &HashSet<PathBuf>) -> Result<(bool, bool), String> {
+    let mut everything = true;
+    let mut any = false;
+    let entries = fs::read_dir(folder)
+        .map_err(|error| format!("{} could not be read: {error}", folder.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let kind = entry.file_type().map_err(|error| error.to_string())?;
+        if kind.is_dir() {
+            let (inside, holds_removed) = folder_vanishes(&entry.path(), removed)?;
+            everything &= inside && holds_removed;
+            any |= holds_removed;
+        } else if removed.contains(&entry.path()) {
+            any = true;
+        } else {
+            everything = false;
         }
     }
-    Ok(count)
+    Ok((everything, any))
 }
 
 /// Removes the file or symbolic link at `path`, never a directory and never

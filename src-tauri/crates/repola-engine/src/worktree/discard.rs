@@ -1732,6 +1732,27 @@ mod tests {
         assert_eq!(exact_state(&path), before);
     }
 
+    #[test]
+    fn a_folder_with_an_empty_subfolder_is_never_replaced_partway() {
+        let directory = repository();
+        let path = root(&directory);
+        write(&path, "f", b"committed\n");
+        git(&path, &["add", "."]);
+        git(&path, &["commit", "-m", "base"]);
+        std::fs::remove_file(path.join("f")).expect("remove file");
+        write(&path, "f/untracked.txt", b"saved\n");
+        std::fs::create_dir(path.join("f/empty")).expect("empty subfolder");
+        write(&path, "other.txt", b"untracked\n");
+
+        // Removing the untracked file would leave the empty subfolder behind,
+        // so the committed file cannot come back and the folder is left alone.
+        let all = plan(&path, DiscardTarget::All);
+        assert_eq!(kept_paths(&all), ["f"]);
+        discard(&path, DiscardTarget::All);
+        assert!(path.join("f/empty").is_dir());
+        assert!(!path.join("other.txt").exists());
+    }
+
     fn effect_of(plan: &DiscardPlan, display: &str) -> DiscardEffect {
         plan.entries
             .iter()
