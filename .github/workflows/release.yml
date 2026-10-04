@@ -198,7 +198,8 @@ jobs:
           $installers = @(Get-ChildItem -LiteralPath "$release/bundle/nsis" -Filter '*-setup.exe' -File)
           if ($installers.Count -ne 1) { throw "Expected one Windows installer; found $($installers.Count)." }
           ./scripts/release/windows-signing.ps1 -Operation verify -FilePath "$release/repola-agent.exe"
-          ./scripts/release/windows-signing.ps1 -Operation verify-installer -FilePath $installers[0].FullName
+          $binaryName = (Get-Content -LiteralPath 'src-tauri/tauri.release.conf.json' -Raw | ConvertFrom-Json).mainBinaryName
+          ./scripts/release/windows-signing.ps1 -Operation verify-installer -FilePath $installers[0].FullName -DesktopBinaryName $binaryName
       - name: Notarize and verify macOS bundles
         if: runner.os == 'macOS'
         env:

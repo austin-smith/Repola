@@ -1,4 +1,5 @@
 import { LaptopIcon, ServerIcon, SettingsIcon, WifiIcon, WifiOffIcon } from "lucide-react";
+import { applicationChannelLabel } from "@/app/release";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
@@ -52,7 +53,10 @@ export function AppSidebar({
           <span className="block h-px bg-brand-foreground" />
           <span className="block h-px bg-brand-foreground" />
         </div>
-        <h1 className="min-w-0 truncate text-base font-semibold tracking-tight" translate="no">Repola</h1>
+        <h1 className="flex min-w-0 items-baseline gap-2 text-base font-semibold tracking-tight" translate="no">
+          <span className="truncate">Repola</span>{" "}
+          {applicationChannelLabel ? <span className="shrink-0 text-xs font-normal tracking-normal text-sidebar-foreground/70">{applicationChannelLabel}</span> : null}
+        </h1>
       </div>
 
       <WorkspaceNavigation view={view} onViewChange={onViewChange} />

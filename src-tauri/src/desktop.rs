@@ -26,7 +26,8 @@ pub fn application_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>
     let select_all =
         MenuItemBuilder::with_id("changes-select-all", "Select All Files").build(app)?;
 
-    let application = SubmenuBuilder::new(app, "Repola")
+    let name = app.config().product_name.as_deref().unwrap_or("Repola");
+    let application = SubmenuBuilder::new(app, name)
         .about(None)
         .separator()
         .item(&settings)
