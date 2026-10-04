@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import { buildReleaseConfig, buildInstallerConfig } from "./prepare-release.mjs";
 import { planRelease } from "./release-metadata.mjs";
 import { fileURLToPath } from "node:url";
+import { readFile } from "node:fs/promises";
+import { buildIdentityConfig } from "../build-identity.mjs";
 
 const rawPublicKey = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
 const publicKey = Buffer.from(`untrusted comment: minisign public key\n${rawPublicKey}\n`).toString("base64");
@@ -47,13 +49,27 @@ function build(overrides = {}) {
 }
 
 describe("release trust preparation", () => {
-  it("permits a manual installer build from a branch while keeping release source restrictions", () => {
+  it("keeps source and manual installer builds isolated as development while preserving release restrictions", async () => {
     const branchEnvironment = environment({ GITHUB_REF: "refs/heads/release-channels", ...windowsSigning });
-    const config = buildInstallerConfig(branchEnvironment);
+    const sourceConfig = JSON.parse(await readFile(new URL("../../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+    const config = buildInstallerConfig(branchEnvironment, sourceConfig);
+    expect(config.productName).toBe("Repola (Dev)");
+    expect(config.identifier).toBe("net.crapshack.repola.dev");
+    expect(config.mainBinaryName).toBe("repola-dev");
+    for (const key of ["productName", "identifier", "mainBinaryName"]) expect(sourceConfig[key]).toBe(config[key]);
+    expect(sourceConfig.bundle.icon).toEqual(config.bundle.icon);
     expect(config.bundle.createUpdaterArtifacts).toBe(true);
     expect(config.bundle.windows.signCommand.cmd).toBe("pwsh");
     expect(config.plugins.updater).toEqual({ pubkey: publicKey, requireSignedVersion: true, endpoints: [] });
     expect(() => build({ GITHUB_REF: branchEnvironment.GITHUB_REF })).toThrow(/validated workflow metadata/);
+  });
+
+  it("preserves window settings when assigning release identity", () => {
+    const windows = [{ label: "main", width: 1440, minWidth: 1080, resizable: true, title: "Repola (Dev)" }];
+    const sourceConfig = { app: { windows } };
+    const config = buildInstallerConfig(environment(), sourceConfig, "nightly");
+    expect(config.app.windows).toEqual([{ ...windows[0], title: "Repola (Nightly)" }]);
+    expect(sourceConfig.app.windows[0].title).toBe("Repola (Dev)");
   });
 
   it("requires the configured signing trust for installer tests", () => {
@@ -65,7 +81,9 @@ describe("release trust preparation", () => {
 
   it("generates the pinned updater channel for a tagged Linux release", () => {
     expect(build()).toEqual({
+      ...buildIdentityConfig("stable", tauriConfig),
       bundle: {
+        ...buildIdentityConfig("stable", tauriConfig).bundle,
         createUpdaterArtifacts: true,
         targets: ["appimage", "deb"],
       },
@@ -108,6 +126,7 @@ describe("release trust preparation", () => {
     expect(() => build({ ...windowsSigning, REPOLA_WINDOWS_SIGNING_DIRECTORY: "" })).toThrow(/REPOLA_WINDOWS_SIGNING_DIRECTORY/);
     expect(build(windowsSigning).bundle)
       .toEqual({
+        ...buildIdentityConfig("stable", tauriConfig).bundle,
         createUpdaterArtifacts: true,
         targets: ["nsis"],
         windows: {
@@ -125,12 +144,15 @@ describe("release trust preparation", () => {
 
   it("configures complete API-key notarization and explicit macOS bundles", () => {
     const config = build({ RUNNER_OS: "macOS", APPLE_SIGNING_IDENTITY: "A".repeat(40), APPLE_TEAM_ID: "ABCDEFGHIJ", APPLE_API_KEY: "key-id", APPLE_API_ISSUER: "issuer", APPLE_API_KEY_PATH: "/runner/key.p8" });
-    expect(config.bundle).toEqual({ createUpdaterArtifacts: true, targets: ["app", "dmg"], macOS: { signingIdentity: "A".repeat(40), hardenedRuntime: true } });
+    expect(config.bundle).toEqual({ ...buildIdentityConfig("stable", tauriConfig).bundle, createUpdaterArtifacts: true, targets: ["app", "dmg"], macOS: { signingIdentity: "A".repeat(40), hardenedRuntime: true } });
   });
 
   it("isolates nightly builds from the stable feed", () => {
     const nightly = planRelease({ ...release, version: "0.1.0", tag: null, runNumber: "10", sourceRef: "refs/heads/main" });
     const config = buildReleaseConfig({ environment: environment({ GITHUB_REF: nightly.sourceRef }), packageJson: { version: nightly.version }, tauriConfig: { version: nightly.version }, cargoManifest: cargoManifest.replace('version = "0.1.0"', `version = "${nightly.version}"`), release: nightly });
     expect(config.plugins.updater.endpoints).toEqual(["https://austin-smith.github.io/Repola/updates/nightly.json"]);
+    expect(config.productName).toBe("Repola (Nightly)");
+    expect(config.identifier).toBe("net.crapshack.repola.nightly");
+    expect(config.bundle.icon.every((path) => path.startsWith("assets/icons/nightly/"))).toBe(true);
   });
 });

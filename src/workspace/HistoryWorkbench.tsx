@@ -23,9 +23,11 @@ import { toast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
 import { toMessage } from "@/lib/errors";
 import { ActionableGitError } from "../components/ActionableGitError";
+import { activeChangeKinds, countChangeKinds, filterByChangeKind, type ChangeKindFilterKind } from "../domain/change-kind-filter";
 import { shortSha } from "../domain/format";
 import { loadBranches, loadCommitFiles, loadHistory } from "../ipc/worktrees";
 import type { BranchInfo, CommitChangedFile, CommitSummary } from "../ipc/types";
+import { ChangeKindFilter, ChangeKindIcon } from "./ChangeKindFilter";
 import { useWorkingCopy } from "./context";
 import { ActivityFact } from "./facts";
 import { historyMutationTitles, sectionHeadingClass } from "./labels";
@@ -41,6 +43,7 @@ export function HistoryWorkbench() {
   const [error, setError] = useState<string | null>(null);
   const [files, setFiles] = useState<CommitChangedFile[] | null>(null);
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
+  const [kindFilter, setKindFilter] = useState<ChangeKindFilterKind[]>([]);
   const [historyQuery, setHistoryQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [comparisonBase, setComparisonBase] = useState<string | null>(null);
@@ -129,7 +132,10 @@ export function HistoryWorkbench() {
       .catch((cause: unknown) => { if (!controller.signal.aborted) setError(toMessage(cause)); });
     return () => controller.abort();
   }, [machineId, repository.path, selected?.oid, worktree.path]);
-  const selectedFile = files?.find((file) => file.id === selectedFileId) ?? files?.[0] ?? null;
+  const kindCounts = countChangeKinds(files ?? []);
+  const activeKinds = activeChangeKinds(kindFilter, kindCounts);
+  const listedFiles = filterByChangeKind(files ?? [], activeKinds);
+  const selectedFile = listedFiles.find((file) => file.id === selectedFileId) ?? listedFiles[0] ?? null;
   const comparisonBranches = historyBranches?.filter((branch) => !branch.current) ?? [];
   const comparisonItems = Object.fromEntries([
     ["none", "Current branch"],
@@ -288,11 +294,19 @@ export function HistoryWorkbench() {
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
-            <div className="flex h-11 shrink-0 items-center border-b px-4"><strong className="text-sm">Changed files</strong>{files ? <Badge variant="secondary" className="ml-2">{files.length}</Badge> : <Spinner className="ml-auto size-4" />}</div>
+            <div className="flex h-11 shrink-0 items-center border-b px-4">
+              <strong className="text-sm">Changed files</strong>
+              {files ? <Badge variant="secondary" className="ml-2">{files.length}</Badge> : <Spinner className="ml-auto size-4" />}
+              {kindCounts.length > 1 ? (
+                <div className="ml-auto text-muted-foreground">
+                  <ChangeKindFilter counts={kindCounts} value={activeKinds} onValueChange={setKindFilter} />
+                </div>
+              ) : null}
+            </div>
             <div className="min-h-0 flex-1 overflow-y-auto">
-              {(files ?? []).map((file) => (
+              {listedFiles.map((file) => (
                 <button key={file.id} type="button" className={cn("flex w-full items-center gap-2 border-b px-3 py-1 text-left", selectedFile?.id === file.id && "bg-accent")} onClick={() => setSelectedFileId(file.id)}>
-                  <span className="w-6 shrink-0 text-center font-mono text-xs font-medium text-brand">{file.status}</span>
+                  <span className="grid w-6 shrink-0 place-items-center"><ChangeKindIcon kind={file.kind} /></span>
                   <span className="min-w-0 flex-1 truncate text-sm" title={file.path.display}><span className="text-muted-foreground">{file.path.display.slice(0, file.path.display.search(/[^\\/]*$/))}</span><span className="text-foreground">{file.path.display.split(/[\\/]/).pop()}</span></span>
                 </button>
               ))}
