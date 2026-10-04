@@ -1,7 +1,6 @@
 import { LaptopIcon, ServerIcon, SettingsIcon, WifiIcon, WifiOffIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
 import { Spinner } from "@/components/ui/spinner";
 import { TooltipButton } from "@/components/tooltip-button";
 import { cn } from "@/lib/utils";
@@ -47,7 +46,7 @@ export function AppSidebar({
 
   return (
     <aside className="flex w-56 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground" aria-label="Repola application sidebar">
-      <div className="flex h-16 shrink-0 items-center gap-3 px-4">
+      <div className="flex h-16 shrink-0 items-center gap-3 border-b px-4">
         <div className="grid size-8 shrink-0 content-center gap-1 border border-foreground bg-brand p-2" aria-hidden="true">
           <span className="block h-px bg-brand-foreground" />
           <span className="block h-px bg-brand-foreground" />
@@ -56,7 +55,6 @@ export function AppSidebar({
         <h1 className="min-w-0 truncate text-base font-semibold tracking-tight" translate="no">Repola</h1>
       </div>
 
-      <Separator />
       <WorkspaceNavigation view={view} onViewChange={onViewChange} />
 
       <div className="mt-auto flex flex-col gap-1 border-t p-3">
