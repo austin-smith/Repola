@@ -499,7 +499,8 @@ mod tests {
             path,
             &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
         );
-        let index = git(path, &["ls-files", "--stage", "-z"]);
+        // `-v` tags each entry with its assume-unchanged and skip-worktree flags.
+        let index = git(path, &["ls-files", "--stage", "-v", "-z"]);
         let mut files: Vec<(String, Option<Vec<u8>>)> = working_copy_snapshot(request(path))
             .expect("snapshot")
             .changes
@@ -1362,6 +1363,32 @@ mod tests {
             assert_eq!(exact_state(&path), before, "unborn: {unborn}");
             assert!(!path.join("nested/gone.txt").exists(), "unborn: {unborn}");
         }
+    }
+
+    #[test]
+    fn index_flags_restore_exactly() {
+        let directory = repository();
+        let path = root(&directory);
+        for name in ["assumed.txt", "sparse.txt"] {
+            write(&path, name, b"committed\n");
+        }
+        git(&path, &["add", "."]);
+        git(&path, &["commit", "-m", "base"]);
+        for name in ["assumed.txt", "sparse.txt"] {
+            write(&path, name, b"staged\n");
+            git(&path, &["add", name]);
+        }
+        git(
+            &path,
+            &["update-index", "--assume-unchanged", "assumed.txt"],
+        );
+        git(&path, &["update-index", "--skip-worktree", "sparse.txt"]);
+        let before = exact_state(&path);
+
+        let all = discard(&path, DiscardTarget::All);
+        assert!(all.snapshot.changes.is_empty());
+        restore(&path, &all.recovery_point);
+        assert_eq!(exact_state(&path), before);
     }
 
     #[test]

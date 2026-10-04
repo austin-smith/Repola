@@ -95,6 +95,12 @@ pub(super) struct IndexEntry {
     /// file.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub intent_to_add: bool,
+    /// Set with `git update-index --assume-unchanged`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub assume_unchanged: bool,
+    /// Set with `git update-index --skip-worktree`, as sparse checkouts do.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_worktree: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,6 +488,9 @@ fn index_entries(
         let mut args = vec![
             OsString::from("ls-files"),
             OsString::from("--stage"),
+            // Prefixes each entry with a tag that carries its flags: `S` for
+            // skip-worktree, and lowercase for assume-unchanged.
+            OsString::from("-v"),
             OsString::from("-z"),
             OsString::from("--"),
         ];
@@ -498,9 +507,13 @@ fn index_entries(
             }
             let fields = String::from_utf8_lossy(fields);
             let mut fields = fields.split(' ');
-            let (Some(mode), Some(oid), Some(stage), None) =
-                (fields.next(), fields.next(), fields.next(), fields.next())
-            else {
+            let (Some(tag), Some(mode), Some(oid), Some(stage), None) = (
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+            ) else {
                 return Err("Git returned a malformed index entry.".into());
             };
             let stage = stage
@@ -511,6 +524,8 @@ fn index_entries(
                 oid: oid.to_string(),
                 stage,
                 intent_to_add: stage == 0 && intent_to_add.contains(path),
+                assume_unchanged: tag.chars().all(|tag| tag.is_ascii_lowercase()),
+                skip_worktree: tag.eq_ignore_ascii_case("S"),
             });
         }
     }
@@ -1147,13 +1162,21 @@ fn apply_restore(
                 .map_err(|error| error.to_string())?;
         successful_stdout(output, "restore the saved index entries")?;
     }
-    if intents.is_empty() {
-        return Ok(());
+    if !intents.is_empty() {
+        restore_intents(worktree, &intents, &placeholders)?;
     }
-    // Plumbing cannot set the flag, so these entries are recorded the way they
-    // were made, and `add -N` needs a file on disk. Saved files are already
-    // back; an entry whose file was deleted gets an empty stand-in for the
-    // moment `add -N` runs. `--force` covers a path an ignore rule matches.
+    restore_index_flags(worktree, changed)
+}
+
+/// Records intent-to-add entries the way they were made, since plumbing cannot
+/// set that flag. `add -N` needs a file on disk: saved files are already back,
+/// and an entry whose file was deleted gets an empty stand-in for the moment
+/// `add -N` runs. `--force` covers a path an ignore rule matches.
+fn restore_intents(
+    worktree: &Path,
+    intents: &[u8],
+    placeholders: &[&GitPath],
+) -> Result<(), String> {
     let mut created = Vec::new();
     let recorded = placeholders
         .iter()
@@ -1177,7 +1200,7 @@ fn apply_restore(
                     "--pathspec-from-file=-",
                     "--pathspec-file-nul",
                 ],
-                &intents,
+                intents,
             )
             .map_err(|error| error.to_string())?;
             successful_stdout(output, "restore the intent-to-add entries").map(drop)
@@ -1373,6 +1396,42 @@ fn create_symlink(link: &[u8], path: &Path) -> std::io::Result<()> {
     } else {
         std::os::windows::fs::symlink_file(&link, path)
     }
+}
+
+/// Sets the assume-unchanged and skip-worktree flags of restored entries,
+/// which `update-index --index-info` cannot record.
+fn restore_index_flags(
+    worktree: &Path,
+    changed: &[(&PathState, &PathState)],
+) -> Result<(), String> {
+    set_index_flag(worktree, changed, "--assume-unchanged", |entry| {
+        entry.assume_unchanged
+    })?;
+    set_index_flag(worktree, changed, "--skip-worktree", |entry| {
+        entry.skip_worktree
+    })
+}
+
+fn set_index_flag(
+    worktree: &Path,
+    changed: &[(&PathState, &PathState)],
+    flag: &str,
+    flagged: impl Fn(&IndexEntry) -> bool,
+) -> Result<(), String> {
+    let mut input = Vec::new();
+    for (saved, current) in changed {
+        if saved.index != current.index && saved.index.iter().any(&flagged) {
+            input.extend(decode_path_token_bytes(&saved.path.token)?);
+            input.push(0);
+        }
+    }
+    if input.is_empty() {
+        return Ok(());
+    }
+    let output =
+        command::git_at_with_input(worktree, ["update-index", "-z", flag, "--stdin"], &input)
+            .map_err(|error| error.to_string())?;
+    successful_stdout(output, "restore the saved index flags").map(drop)
 }
 
 /// The change restoring one saved path would make, as a patch from the
