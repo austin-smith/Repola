@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "@/components/ui/toast";
 import DeleteBranchDialog from "./DeleteBranchDialog";
 import type {
   BranchDeletionPlan,
@@ -128,6 +129,7 @@ describe("DeleteBranchDialog", () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+    vi.restoreAllMocks();
   });
 
   it("reviews only the local branch until the remote is explicitly chosen", async () => {
@@ -214,6 +216,7 @@ describe("DeleteBranchDialog", () => {
   });
 
   it("reports a completed deletion however long the caller takes to follow up", async () => {
+    const notify = vi.spyOn(toast, "add");
     const onDeleted = vi.fn(() => new Promise<void>(() => undefined));
     const { onClose } = renderDialog(onDeleted);
     await screen.findByText(/branch -d -- feature/);
@@ -221,6 +224,7 @@ describe("DeleteBranchDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "Delete Branch" }));
 
     await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ type: "success", title: "Deleted local branch feature." }));
     expect(onDeleted).toHaveBeenCalledWith(result);
     expect(screen.queryByText("The branch was not deleted")).not.toBeInTheDocument();
   });

@@ -1,4 +1,4 @@
-import type { BranchDeletionPlan, BranchInfo } from "../ipc/types";
+import type { BranchDeletionPlan, BranchDeletionResult, BranchInfo } from "../ipc/types";
 
 export interface DeletionScope {
   deleteLocal: boolean;
@@ -83,4 +83,26 @@ export function describeObservedAt(seconds: number | null, nowMs = Date.now()): 
 
 function plural(count: number, unit: string): string {
   return `${count} ${unit}${count === 1 ? "" : "s"} ago`;
+}
+
+export interface DeletionNotice {
+  type: "success" | "warning";
+  title: string;
+  description?: string;
+}
+
+/**
+ * Reports a finished deletion: why a step failed or left something undone, how to restore what
+ * was deleted, and whether the audit log missed it.
+ */
+export function deletionNotice(result: BranchDeletionResult): DeletionNotice {
+  const steps = [result.local, result.remote].flatMap((step) => (step ? [step] : []));
+  const problems = steps.flatMap((step) => [step.succeeded ? "" : step.output, step.warning ?? ""]).filter(Boolean);
+  const recovery = steps.flatMap((step) => (step.recoveryCommand ? [step.recoveryCommand] : [])).join("; ");
+  const description = [
+    ...problems,
+    recovery && `To restore: ${recovery}`,
+    result.auditWarning && `Audit warning: ${result.auditWarning}`,
+  ].filter(Boolean).join(" ");
+  return { type: problems.length > 0 ? "warning" : "success", title: result.message, description: description || undefined };
 }

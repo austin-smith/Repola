@@ -1,4 +1,4 @@
-import type { BranchDeletionPlan, BranchDeletionResult } from "../ipc/types";
+import type { BranchDeletionPlan, FollowUpAction } from "../ipc/types";
 
 // Kept apart from branch-deletion.ts so the startup bundle carries only what runs outside the dialog.
 
@@ -12,24 +12,22 @@ export function batchDeletionRefusal(plan: BranchDeletionPlan): string | null {
   return `${plan.branchName} is not contained in ${plan.local?.mergeReference ?? "the branch it is checked against"}. Review it from the branch menu instead.`;
 }
 
-export interface DeletionNotice {
-  type: "success" | "warning";
-  title: string;
-  description?: string;
+/** A finished worktree removal and the branch it left behind, if any could be reviewed. */
+export interface Removal {
+  repositoryPath: string;
+  followUp: FollowUpAction | null;
 }
 
 /**
- * Reports a finished deletion: why a step failed or left something undone, how to restore what
- * was deleted, and whether the audit log missed it.
+ * The branches a batch of removals left behind, each reviewed from a checkout that still exists.
+ * A follow-up names the checkout that remained right after its own removal, which a later removal
+ * in the batch may take away. The latest removal in a repository saw every earlier one, so its
+ * checkout is the one left at the end; when it found none, nothing remains to review from.
  */
-export function deletionNotice(result: BranchDeletionResult): DeletionNotice {
-  const steps = [result.local, result.remote].flatMap((step) => (step ? [step] : []));
-  const problems = steps.flatMap((step) => [step.succeeded ? "" : step.output, step.warning ?? ""]).filter(Boolean);
-  const recovery = steps.flatMap((step) => (step.recoveryCommand ? [step.recoveryCommand] : [])).join("; ");
-  const description = [
-    ...problems,
-    recovery && `To restore: ${recovery}`,
-    result.auditWarning && `Audit warning: ${result.auditWarning}`,
-  ].filter(Boolean).join(" ");
-  return { type: problems.length > 0 ? "warning" : "success", title: result.message, description: description || undefined };
+export function settleFollowUps(removals: Removal[]): FollowUpAction[] {
+  const checkouts = new Map(removals.map((removal) => [removal.repositoryPath, removal.followUp?.worktreePath]));
+  return removals.flatMap(({ repositoryPath, followUp }) => {
+    const worktreePath = checkouts.get(repositoryPath);
+    return followUp && worktreePath ? [{ ...followUp, worktreePath }] : [];
+  });
 }

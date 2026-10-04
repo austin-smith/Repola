@@ -1,15 +1,16 @@
 import type { ComponentProps } from "react";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type * as WorktreeIpc from "../ipc/worktrees";
-import type { BranchDeletionRequest, BranchInfo, RepositorySummary, WorktreeRecord } from "../ipc/types";
+import type { BranchDeletionPlan, BranchDeletionRequest, BranchDeletionResult, BranchInfo, RepositorySummary, WorktreeRecord } from "../ipc/types";
 import { fileManagerName } from "../domain/platform";
-import { RepositoryProvider } from "./context";
+import { RepositoryProvider, type RepositoryContextValue } from "./context";
 import { RepositoryToolbar } from "./RepositoryToolbar";
 
 const ipc = vi.hoisted(() => ({
   loadBranches: vi.fn(),
   prepareBranchDeletionReview: vi.fn(),
+  executeBranchDeletion: vi.fn(),
 }));
 
 vi.mock("../ipc/worktrees", async (importOriginal) => ({
@@ -56,7 +57,11 @@ function worktree(path: string, branch: string, isPrimary = false): WorktreeReco
   };
 }
 
-function renderToolbar(overrides: Partial<ComponentProps<typeof RepositoryToolbar>> = {}, selected: WorktreeRecord | null = null) {
+function renderToolbar(
+  overrides: Partial<ComponentProps<typeof RepositoryToolbar>> = {},
+  selected: WorktreeRecord | null = null,
+  context: Partial<RepositoryContextValue> = {},
+) {
   return render(
     <RepositoryProvider value={{
       machineId: "local",
@@ -66,6 +71,8 @@ function renderToolbar(overrides: Partial<ComponentProps<typeof RepositoryToolba
       worktree: selected,
       refreshWorkspace: vi.fn(),
       showChanges: vi.fn(),
+      recordAuditPath: vi.fn(),
+      ...context,
     }}>
       <RepositoryToolbar
         repositories={[repository]}
@@ -82,7 +89,10 @@ function renderToolbar(overrides: Partial<ComponentProps<typeof RepositoryToolba
 }
 
 describe("RepositoryToolbar", () => {
-  afterEach(cleanup);
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
 
   it("puts repository actions in the repository picker", () => {
     const onAddRepository = vi.fn();
@@ -181,5 +191,58 @@ describe("RepositoryToolbar", () => {
       deleteRemote: false,
     };
     expect(ipc.prepareBranchDeletionReview).toHaveBeenCalledWith("local", request, expect.any(AbortSignal));
+  });
+
+  it("points the audit log at a deletion made from the branch actions menu", async () => {
+    const main = worktree("/repos/repola", "main", true);
+    ipc.loadBranches.mockResolvedValue([
+      { name: "main", fullName: "refs/heads/main", head: "1234567890abcdef", remote: false, current: true, upstream: null, ahead: 0, behind: 0, occupiedWorktreePath: "/repos/repola" },
+      { name: "old-work", fullName: "refs/heads/old-work", head: "abcdef1234567890", remote: false, current: false, upstream: null, ahead: 0, behind: 0, occupiedWorktreePath: null },
+    ] satisfies BranchInfo[]);
+    const plan: BranchDeletionPlan = {
+      repositoryPath: "/repos/repola",
+      worktreePath: "/repos/repola",
+      branchRef: "refs/heads/old-work",
+      branchName: "old-work",
+      deleteLocal: true,
+      deleteRemote: false,
+      local: null,
+      remote: null,
+      remoteUnavailableReason: null,
+      requiresForce: false,
+      confirmation: "confirm",
+      commands: ["git -C /repos/repola branch -d -- old-work"],
+      warnings: [],
+      blockers: [],
+      fingerprint: {
+        localTip: "abcdef1234567890",
+        mergeReferenceOid: null,
+        requiresForce: false,
+        remote: null,
+        remoteRef: null,
+        remoteOid: null,
+        confirmation: "confirm",
+      },
+    };
+    const result: BranchDeletionResult = {
+      message: "Deleted local branch old-work.",
+      local: { target: "old-work", deletedOid: "abcdef1234567890", succeeded: true, output: "", warning: null, recoveryCommand: "git -C /repos/repola branch -- old-work abcdef1234567890" },
+      remote: null,
+      auditPath: "/logs/actions.jsonl",
+      auditWarning: null,
+    };
+    ipc.prepareBranchDeletionReview.mockResolvedValue(plan);
+    ipc.executeBranchDeletion.mockResolvedValue(result);
+    const recordAuditPath = vi.fn();
+    renderToolbar({ worktrees: [main] }, main, { recordAuditPath });
+
+    const actions = screen.getByRole("button", { name: "Branch actions" });
+    await vi.waitFor(() => expect(actions).toBeEnabled());
+    fireEvent.click(actions);
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Delete branch…" }));
+    await screen.findByText(/branch -d -- old-work/);
+    fireEvent.click(screen.getByRole("button", { name: "Delete Branch" }));
+
+    await waitFor(() => expect(recordAuditPath).toHaveBeenCalledWith("/logs/actions.jsonl"));
   });
 });

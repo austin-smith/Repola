@@ -43,7 +43,7 @@ import { useShortPath } from "./environment";
 import { formatAge, formatBytes, formatMeasuredBytes } from "../domain/format";
 import { performFocusedSelectAll } from "../domain/select-all";
 import { actionForWorktree, computeTotals, filterAndSortWorktrees, isRemovable } from "../domain/inventory";
-import { batchDeletionRefusal, deletionNotice } from "../domain/branch-deletion-outcomes";
+import { batchDeletionRefusal, settleFollowUps, type Removal } from "../domain/branch-deletion-outcomes";
 import type { AgeFilter, StateFilter } from "../domain/inventory";
 import type {
   ActionKind,
@@ -431,6 +431,7 @@ function App() {
     worktree: currentWorktree,
     refreshWorkspace,
     showChanges,
+    recordAuditPath: setAuditPath,
   }), [currentRepository, currentWorktree, refreshWorkspace, selectedMachine?.kind, selectedMachineId, selectedMachineOs, showChanges]);
 
   useEffect(() => {
@@ -586,7 +587,6 @@ function App() {
 
   const followUpBranchDeleted = async (result: BranchDeletionResult) => {
     if (result.auditPath) setAuditPath(result.auditPath);
-    toast.add(deletionNotice(result));
     await refreshWorkspace();
   };
 
@@ -650,8 +650,8 @@ function App() {
     if (!bulk || bulk.stage !== "review") return;
     const kind = bulk.kind;
     const items = bulk.items.map((item) => ({ ...item }));
-    const followUps: FollowUpAction[] = [];
-    setBulk({ kind, stage: "running", items, followUps });
+    const removals: Removal[] = [];
+    setBulk({ kind, stage: "running", items, followUps: [] });
     for (let index = 0; index < items.length; index += 1) {
       const item = items[index];
       if (!item.plan || item.error || item.done) continue;
@@ -659,7 +659,7 @@ function App() {
         if (item.plan.kind === "remove") {
           const result = await executeWorktreeAction(selectedMachineId, item.plan.plan);
           if (result.auditPath) setAuditPath(result.auditPath);
-          if (result.followUp) followUps.push(result.followUp);
+          removals.push({ repositoryPath: item.plan.plan.repositoryPath, followUp: result.followUp });
         } else {
           const result = await executeBranchDeletion(selectedMachineId, item.plan.plan, null);
           if (result.auditPath) setAuditPath(result.auditPath);
@@ -668,9 +668,9 @@ function App() {
       } catch (cause) {
         items[index] = { ...item, error: toMessage(cause) };
       }
-      setBulk({ kind, stage: "running", items: items.map((entry) => ({ ...entry })), followUps: [...followUps] });
+      setBulk({ kind, stage: "running", items: items.map((entry) => ({ ...entry })), followUps: [] });
     }
-    setBulk({ kind, stage: "done", items, followUps });
+    setBulk({ kind, stage: "done", items, followUps: settleFollowUps(removals) });
     setChecked(new Set());
     await refreshWorkspace();
   };

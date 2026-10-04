@@ -27,7 +27,6 @@ import { fileManagerName, machinePathSeparator } from "../domain/platform";
 import { usePathSeparator } from "../app/environment";
 import { ActionableGitError } from "../components/ActionableGitError";
 import type { HistoryTarget } from "../dialogs/HistoryMutationDialog";
-import { deletionNotice } from "../domain/branch-deletion-outcomes";
 import { shortSha } from "../domain/format";
 import { matchesRepositoryQuery } from "../domain/repository-picker";
 import { groupWorktreesForPicker, matchesWorktreeQuery, worktreeBranchLabel, worktreeFolderName, type WorktreePickerGroup } from "../domain/worktree-picker";
@@ -250,7 +249,7 @@ function WorktreePicker({
 }
 
 function BranchControl() {
-  const { machineId, repository, worktree, refreshWorkspace: onChanged, showChanges: onNeedsResolution } = useWorkingCopy();
+  const { machineId, repository, worktree, refreshWorkspace: onChanged, showChanges: onNeedsResolution, recordAuditPath } = useWorkingCopy();
   const [branches, setBranches] = useState<BranchInfo[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [dialogKind, setDialogKind] = useState<"create" | "rename" | null>(null);
@@ -320,7 +319,7 @@ function BranchControl() {
   };
 
   const branchDeleted = async (result: BranchDeletionResult) => {
-    toast.add(deletionNotice(result));
+    if (result.auditPath) recordAuditPath(result.auditPath);
     reloadBranches();
     await onChanged();
   };

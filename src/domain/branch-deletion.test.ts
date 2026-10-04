@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type { BranchDeletionPlan, BranchInfo } from "../ipc/types";
+import type { BranchDeletionPlan, BranchDeletionResult, BranchInfo } from "../ipc/types";
 import {
   canExecuteDeletion,
   confirmationSatisfied,
   deletionButtonLabel,
+  deletionNotice,
   describeObservedAt,
   initialDeletionBranch,
   initialScope,
@@ -129,5 +130,57 @@ describe("describeObservedAt", () => {
     expect(describeObservedAt(now / 1000 - 7_200, now)).toBe("2 hours ago");
     expect(describeObservedAt(now / 1000 - 3 * 86_400, now)).toBe("3 days ago");
     expect(describeObservedAt(now / 1000 + 30, now)).toBe("just now");
+  });
+});
+
+describe("deletionNotice", () => {
+  const step = (target: string, recoveryCommand: string | null, succeeded = true, warning: string | null = null) => ({
+    target,
+    deletedOid: "a".repeat(40),
+    succeeded,
+    output: succeeded ? "Deleted branch feature (was aaaa)." : "! [remote rejected] (stale info)",
+    warning,
+    recoveryCommand,
+  });
+  const result = (overrides: Partial<BranchDeletionResult>): BranchDeletionResult => ({
+    message: "Deleted feature.",
+    local: null,
+    remote: null,
+    auditPath: null,
+    auditWarning: null,
+    ...overrides,
+  });
+
+  it("lists every way to restore what was deleted", () => {
+    expect(deletionNotice(result({
+      local: step("feature", "git branch -- feature aaaa"),
+      remote: step("origin/feature", "git push -- origin aaaa:refs/heads/feature"),
+      auditWarning: "disk full",
+    }))).toEqual({
+      type: "success",
+      title: "Deleted feature.",
+      description: "To restore: git branch -- feature aaaa; git push -- origin aaaa:refs/heads/feature Audit warning: disk full",
+    });
+  });
+
+  it("keeps the local recovery when the remote step failed", () => {
+    expect(deletionNotice(result({
+      local: step("feature", "git branch -- feature aaaa"),
+      remote: step("origin/feature", null, false),
+      auditWarning: "disk full",
+    }))).toEqual({
+      type: "warning",
+      title: "Deleted feature.",
+      description: "! [remote rejected] (stale info) To restore: git branch -- feature aaaa Audit warning: disk full",
+    });
+  });
+
+  it("warns about anything a successful step left undone", () => {
+    const leftover = "feature was deleted, but its configuration was not removed.";
+    expect(deletionNotice(result({ local: step("feature", "git branch -- feature aaaa", true, leftover) }))).toEqual({
+      type: "warning",
+      title: "Deleted feature.",
+      description: `${leftover} To restore: git branch -- feature aaaa`,
+    });
   });
 });

@@ -3,8 +3,8 @@ import type { MachineProfile, RepositorySummary, WorktreeRecord } from "../ipc/t
 
 /**
  * The machine → repository → worktree selection the workbench operates on, plus the
- * two callbacks every Git action needs: re-scan after Git state changed, and jump to
- * Changes when an operation needs conflict resolution.
+ * callbacks Git actions need: re-scan after Git state changed, jump to Changes when an
+ * operation needs conflict resolution, and point "Show audit log" at a recorded action.
  */
 export interface RepositoryContextValue {
   machineId: string;
@@ -15,6 +15,7 @@ export interface RepositoryContextValue {
   worktree: WorktreeRecord | null;
   refreshWorkspace: () => Promise<void>;
   showChanges: () => void;
+  recordAuditPath: (path: string) => void;
 }
 
 /** The context narrowed to a selected repository and worktree. */

@@ -8,11 +8,13 @@ import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
+import { toast } from "@/components/ui/toast";
 import { toMessage } from "@/lib/errors";
 import { ActionableGitError } from "../components/ActionableGitError";
 import {
   canExecuteDeletion,
   deletionButtonLabel,
+  deletionNotice,
   describeObservedAt,
   hasScope,
   initialDeletionBranch,
@@ -33,6 +35,7 @@ interface DeleteBranchDialogProps {
   /** Opens on this branch, or on no branch once it is gone, instead of the first one that is free to delete. */
   initialBranchRef?: string;
   onClose: () => void;
+  /** Runs after the dialog has closed and reported the outcome. */
   onDeleted: (result: BranchDeletionResult) => void | Promise<void>;
 }
 
@@ -120,6 +123,7 @@ export default function DeleteBranchDialog({
     }
     // The deletion has happened, so nothing the caller does next may report it as refused.
     onClose();
+    toast.add(deletionNotice(result));
     await onDeleted(result);
   };
 

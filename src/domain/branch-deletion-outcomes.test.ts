@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { BranchDeletionPlan, BranchDeletionResult, LocalBranchDeletion } from "../ipc/types";
-import { batchDeletionRefusal, deletionNotice } from "./branch-deletion-outcomes";
+import type { BranchDeletionPlan, FollowUpAction, LocalBranchDeletion } from "../ipc/types";
+import { batchDeletionRefusal, settleFollowUps } from "./branch-deletion-outcomes";
 
 function plan(overrides: Partial<BranchDeletionPlan>): BranchDeletionPlan {
   return {
@@ -66,54 +66,35 @@ describe("batch branch deletion", () => {
   });
 });
 
-describe("deletionNotice", () => {
-  const step = (target: string, recoveryCommand: string | null, succeeded = true, warning: string | null = null) => ({
-    target,
-    deletedOid: "a".repeat(40),
-    succeeded,
-    output: succeeded ? "Deleted branch feature (was aaaa)." : "! [remote rejected] (stale info)",
-    warning,
-    recoveryCommand,
-  });
-  const result = (overrides: Partial<BranchDeletionResult>): BranchDeletionResult => ({
-    message: "Deleted feature.",
-    local: null,
-    remote: null,
-    auditPath: null,
-    auditWarning: null,
-    ...overrides,
+describe("settleFollowUps", () => {
+  const followUp = (repositoryPath: string, branch: string, worktreePath: string): FollowUpAction => ({
+    repositoryPath,
+    worktreePath,
+    branch,
+    description: `Branch ${branch} was retained.`,
   });
 
-  it("lists every way to restore what was deleted", () => {
-    expect(deletionNotice(result({
-      local: step("feature", "git branch -- feature aaaa"),
-      remote: step("origin/feature", "git push -- origin aaaa:refs/heads/feature"),
-      auditWarning: "disk full",
-    }))).toEqual({
-      type: "success",
-      title: "Deleted feature.",
-      description: "To restore: git branch -- feature aaaa; git push -- origin aaaa:refs/heads/feature Audit warning: disk full",
-    });
+  it("reviews every retained branch from the checkout left after the batch", () => {
+    const settled = settleFollowUps([
+      { repositoryPath: "/repos/bare.git", followUp: followUp("/repos/bare.git", "one", "/work/two") },
+      { repositoryPath: "/repos/other", followUp: followUp("/repos/other", "solo", "/repos/other") },
+      { repositoryPath: "/repos/bare.git", followUp: followUp("/repos/bare.git", "two", "/work/three") },
+    ]);
+
+    expect(settled.map(({ branch, worktreePath }) => [branch, worktreePath])).toEqual([
+      ["one", "/work/three"],
+      ["solo", "/repos/other"],
+      ["two", "/work/three"],
+    ]);
   });
 
-  it("keeps the local recovery when the remote step failed", () => {
-    expect(deletionNotice(result({
-      local: step("feature", "git branch -- feature aaaa"),
-      remote: step("origin/feature", null, false),
-      auditWarning: "disk full",
-    }))).toEqual({
-      type: "warning",
-      title: "Deleted feature.",
-      description: "! [remote rejected] (stale info) To restore: git branch -- feature aaaa Audit warning: disk full",
-    });
-  });
+  it("drops a repository's branches once no checkout remains to review them from", () => {
+    const settled = settleFollowUps([
+      { repositoryPath: "/repos/bare.git", followUp: followUp("/repos/bare.git", "one", "/work/two") },
+      { repositoryPath: "/repos/bare.git", followUp: null },
+      { repositoryPath: "/repos/other", followUp: followUp("/repos/other", "solo", "/repos/other") },
+    ]);
 
-  it("warns about anything a successful step left undone", () => {
-    const leftover = "feature was deleted, but its configuration was not removed.";
-    expect(deletionNotice(result({ local: step("feature", "git branch -- feature aaaa", true, leftover) }))).toEqual({
-      type: "warning",
-      title: "Deleted feature.",
-      description: `${leftover} To restore: git branch -- feature aaaa`,
-    });
+    expect(settled.map(({ branch }) => branch)).toEqual(["solo"]);
   });
 });
