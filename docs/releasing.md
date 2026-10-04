@@ -25,8 +25,8 @@ Generate the updater key with `pnpm tauri signer generate -w <private-key-path>`
 
 ## Publish stable
 
-1. Set the version in `package.json`, `src-tauri/tauri.conf.json`, `[workspace.package]` in `src-tauri/Cargo.toml`, and both workspace packages in `src-tauri/Cargo.lock`. Merge and wait for green CI.
-2. Push the matching `vX.Y.Z` tag at that commit and wait for the draft.
+1. Set the version in `package.json`, `src-tauri/tauri.conf.json`, `[workspace.package]` in `src-tauri/Cargo.toml`, and both workspace packages in `src-tauri/Cargo.lock`. Merge to `main`.
+2. Run `pnpm release` from any checkout with an authenticated GitHub CLI (`gh`). It reads the version from GitHub's current `main`, checks all version files, waits for that commit's CI, and creates the matching annotated `vX.Y.Z` tag to build a draft. It refuses existing tags and stops if `main` advances. Use `pnpm release --dry-run` to check the target without creating a tag. Wait for the draft build to finish.
 3. Review the notes and smoke-test installation, updates, and SSH agent bootstrap on supported platforms.
 4. Run **Publish release** from `main` with the draft tag and channel `stable`, then approve the environment.
 5. Check the feed and an installed client's update. Bump `main` to the next stable version before another nightly.

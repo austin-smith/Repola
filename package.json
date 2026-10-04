@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "icons": "tauri icon src-tauri/assets/icons/app-icon.png --output src-tauri/assets/icons",
+    "release": "node scripts/release/start-release.mjs",
     "test": "cross-env NODE_ENV=test vitest run",
     "test:watch": "cross-env NODE_ENV=test vitest",
     "typecheck": "tsc --noEmit",
