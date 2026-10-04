@@ -1,6 +1,19 @@
+import type { ChangeKindFilterKind } from "../domain/change-kind-filter";
 import type { CommitSigning, HistoryMutationKind } from "../ipc/types";
 
 export const sectionHeadingClass = "text-xs font-medium tracking-widest text-muted-foreground uppercase";
+
+export const changeKindLabels: Record<ChangeKindFilterKind, string> = {
+  added: "Added",
+  modified: "Modified",
+  deleted: "Deleted",
+  renamed: "Renamed",
+  copied: "Copied",
+  typeChanged: "Type changed",
+  unmerged: "Conflicted",
+  unknown: "Unknown",
+  ignored: "Ignored",
+};
 
 export const signingItems: Record<CommitSigning, string> = {
   default: "Use Git configuration",
