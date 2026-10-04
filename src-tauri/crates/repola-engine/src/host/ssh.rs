@@ -124,16 +124,13 @@ where
     let diagnostic_reader = thread::spawn(move || bounded_diagnostics(stderr));
 
     let (wire_sender, wire_receiver) = mpsc::channel();
+    // Reads every frame until the agent closes its output: the handshake's
+    // answer comes before the request's, and only the loop below knows which
+    // one ends the exchange.
     let wire_reader = thread::spawn(move || loop {
         let response = read_frame::<_, ResponseEnvelope>(&mut output);
-        let terminal = !matches!(
-            &response,
-            Ok(Some(ResponseEnvelope {
-                body: ResponseBody::Event { .. },
-                ..
-            }))
-        );
-        if wire_sender.send(response).is_err() || terminal {
+        let finished = !matches!(response, Ok(Some(_)));
+        if wire_sender.send(response).is_err() || finished {
             break;
         }
     });
