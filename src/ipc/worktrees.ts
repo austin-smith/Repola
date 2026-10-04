@@ -17,6 +17,7 @@ import type {
   ConflictResolutionKind,
   ConflictFile,
   DiscardScope,
+  DiffDisplayOptions,
   BranchInfo,
   BranchMutationKind,
   BranchMutationResult,
@@ -143,11 +144,13 @@ export function fetchFileDiff(
   repositoryPath: string,
   worktreePath: string,
   path: GitPath,
+  options: DiffDisplayOptions,
   signal?: AbortSignal,
 ): Promise<FileDiff> {
   return invokeOperation<FileDiff>("file_diff", {
     machineId,
     request: { repositoryPath, worktreePath, path },
+    options,
   }, { signal });
 }
 
@@ -430,11 +433,13 @@ export function fetchCommitFileDiff(
   worktreePath: string,
   commit: string,
   path: GitPath,
+  options: DiffDisplayOptions,
   signal?: AbortSignal,
 ): Promise<FileDiff> {
   return invokeOperation<FileDiff>("commit_file_diff", {
     machineId,
     request: { repositoryPath, worktreePath, commit, path },
+    options,
   }, { signal });
 }
 

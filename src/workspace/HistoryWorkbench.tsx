@@ -32,6 +32,7 @@ import { useWorkingCopy } from "./context";
 import { ActivityFact } from "./facts";
 import { historyMutationTitles, sectionHeadingClass } from "./labels";
 import { LazyDialog } from "./LazyDialog";
+import { useHideWhitespace } from "./diff-preferences";
 import { CommitFileDiffView, HistoryMutationDialog, ReflogDialog, TagsDialog } from "./lazy";
 
 export function HistoryWorkbench() {
@@ -41,6 +42,8 @@ export function HistoryWorkbench() {
   const [selectedOid, setSelectedOid] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [diffControls, setDiffControls] = useState<HTMLDivElement | null>(null);
+  const [hideWhitespace, setHideWhitespace] = useHideWhitespace("history");
   const [files, setFiles] = useState<CommitChangedFile[] | null>(null);
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
   const [kindFilter, setKindFilter] = useState<ChangeKindFilterKind[]>([]);
@@ -322,13 +325,23 @@ export function HistoryWorkbench() {
       <section className="flex min-h-0 flex-col bg-background" aria-label="Commit file diff">
         <div className="flex h-12 shrink-0 items-center border-b px-4">
           <div className="min-w-0"><strong className="block truncate text-sm">{selectedFile?.path.display ?? "Commit diff"}</strong>{selectedFile?.previousPath ? <span className="block truncate text-xs text-muted-foreground">renamed from {selectedFile.previousPath.display}</span> : null}</div>
+          <div ref={setDiffControls} className="ml-auto flex shrink-0 items-center pl-2" />
         </div>
         <div className="min-h-0 flex-1 overflow-auto">
-          {selected && selectedFile ? (
+          {selected && selectedFile ? (hideWhitespace === null ? null : (
             <Suspense fallback={<div className="grid h-full place-items-center"><Spinner className="size-6" /></div>}>
-              <CommitFileDiffView machineId={machineId} repositoryPath={repository.path} worktreePath={worktree.path} commit={selected.oid} file={selectedFile} />
+              <CommitFileDiffView
+                machineId={machineId}
+                repositoryPath={repository.path}
+                worktreePath={worktree.path}
+                commit={selected.oid}
+                file={selectedFile}
+                hideWhitespace={hideWhitespace}
+                onHideWhitespaceChange={setHideWhitespace}
+                controlsElement={diffControls}
+              />
             </Suspense>
-          ) : <div className="grid h-full place-items-center text-sm text-muted-foreground">Select a changed file.</div>}
+          )) : <div className="grid h-full place-items-center text-sm text-muted-foreground">Select a changed file.</div>}
         </div>
       </section>
       {pendingHistoryAction && selected ? (

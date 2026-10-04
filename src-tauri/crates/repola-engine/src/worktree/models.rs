@@ -336,6 +336,16 @@ pub struct FileDiffRequest {
     pub path: GitPath,
 }
 
+/// How a diff is rendered for review. These options only shape what the user
+/// sees; a diff produced with any of them enabled never carries hunks that can
+/// be staged, committed, or discarded.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DiffDisplayOptions {
+    /// Compare lines ignoring all whitespace (`git diff -w`).
+    pub ignore_whitespace: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileDiff {

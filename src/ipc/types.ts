@@ -46,6 +46,12 @@ export interface AppPreferences {
   terminalId: string | null;
   defaultSignCommits: boolean;
   textGenerationSelections: Record<string, TextGenerationPreferences>;
+  diff: DiffPreferences;
+}
+
+export interface DiffPreferences {
+  hideWhitespaceInChanges: boolean;
+  hideWhitespaceInHistory: boolean;
 }
 
 export interface TextGenerationPreferences {
@@ -262,6 +268,14 @@ export interface WorktreeChanges {
   truncated: boolean;
   untracked: string[];
   reason: string | null;
+}
+
+/**
+ * How a diff is rendered for review. A diff loaded with any option enabled
+ * carries no hunks, so it can never be staged, discarded, or committed.
+ */
+export interface DiffDisplayOptions {
+  ignoreWhitespace: boolean;
 }
 
 export interface FileDiff {

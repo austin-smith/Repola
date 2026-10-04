@@ -11,11 +11,11 @@ use super::images::{
 use super::models::{
     ApplyPatchHunkRequest, CommitFileSelection, CommitHunkSelection, CommitPerson, CommitRequest,
     CommitResult, CommitSigning, CommitTrailer, ConflictFile, ConflictFileRequest,
-    ConflictResolutionKind, DiscardAllRequest, DiscardFileRequest, DiscardScope, FileChange,
-    FileChangeKind, FileDiff, FileDiffRequest, FileModeChange, GenerateCommitMessageRequest,
-    GitPath, ImageVersion, PatchHunk, PatchHunkAction, RepositoryOperation, ResolveConflictRequest,
-    ReviewedFileChange, SetFileStagingRequest, UndoCommitRequest, UndoCommitResult,
-    WorkingCopyRequest, WorkingCopySnapshot,
+    ConflictResolutionKind, DiffDisplayOptions, DiscardAllRequest, DiscardFileRequest,
+    DiscardScope, FileChange, FileChangeKind, FileDiff, FileDiffRequest, FileModeChange,
+    GenerateCommitMessageRequest, GitPath, ImageVersion, PatchHunk, PatchHunkAction,
+    RepositoryOperation, ResolveConflictRequest, ReviewedFileChange, SetFileStagingRequest,
+    UndoCommitRequest, UndoCommitResult, WorkingCopyRequest, WorkingCopySnapshot,
 };
 
 const MAX_COMMIT_SUMMARY_BYTES: usize = 998;
@@ -157,12 +157,27 @@ pub fn set_file_staging(request: SetFileStagingRequest) -> Result<WorkingCopySna
     })
 }
 
+/// The exact diff of a changed path. Its hunks are the only ones staging,
+/// discarding, and committing ever validate against.
 pub fn file_diff(request: FileDiffRequest) -> Result<FileDiff, String> {
-    file_diff_with_options(request, &[])
+    file_diff_with_options(request, DiffDisplayOptions::default(), &[])
+}
+
+/// The diff of a changed path as the user chose to review it. When a display
+/// option filters the diff, its hunks are withheld: a patch built from a
+/// filtered diff does not describe the working copy and cannot be applied
+/// safely, so partial staging, discarding, and committing stay tied to
+/// [`file_diff`].
+pub fn file_diff_for_display(
+    request: FileDiffRequest,
+    options: DiffDisplayOptions,
+) -> Result<FileDiff, String> {
+    file_diff_with_options(request, options, &[])
 }
 
 fn file_diff_with_options(
     request: FileDiffRequest,
+    display: DiffDisplayOptions,
     git_options: &[OsString],
 ) -> Result<FileDiff, String> {
     let snapshot = working_copy_snapshot_with_options(
@@ -190,14 +205,15 @@ fn file_diff_with_options(
     let paths = diff_paths(change)?;
     let (patch_output, numstat_output) = if change.untracked {
         let null_device = null_device();
-        let mut patch_args = vec![
-            OsString::from("diff"),
+        let mut patch_args = vec![OsString::from("diff")];
+        patch_args.extend(display_diff_args(display));
+        patch_args.extend([
             OsString::from("--no-index"),
             OsString::from("--no-color"),
             OsString::from("--no-ext-diff"),
             OsString::from("--"),
             null_device.clone(),
-        ];
+        ]);
         patch_args.extend(paths.iter().cloned());
         let mut numstat_args = vec![
             OsString::from("diff"),
@@ -216,14 +232,15 @@ fn file_diff_with_options(
             Some(head) => head.to_string(),
             None => empty_tree(&worktree)?,
         };
-        let mut patch_args = vec![
-            OsString::from("diff"),
+        let mut patch_args = vec![OsString::from("diff")];
+        patch_args.extend(display_diff_args(display));
+        patch_args.extend([
             OsString::from("--no-color"),
             OsString::from("--no-ext-diff"),
             OsString::from("--find-renames"),
             OsString::from(&base),
             OsString::from("--"),
-        ];
+        ]);
         patch_args.extend(paths.iter().cloned());
         let mut numstat_args = vec![
             OsString::from("diff"),
@@ -268,12 +285,13 @@ fn file_diff_with_options(
     };
     let binary = binary || image.is_some();
     let (patch, truncated) = truncate_file_patch(&patch_output);
-    let hunks = if binary || truncated || change.conflicted {
-        Vec::new()
-    } else {
+    let selectable = !binary && !truncated && !change.conflicted && !filters_diff(display);
+    let hunks = if selectable {
         split_patch_hunks(&patch_output)
+    } else {
+        Vec::new()
     };
-    let (staged_hunks, unstaged_hunks) = if binary || truncated || change.conflicted {
+    let (staged_hunks, unstaged_hunks) = if !selectable {
         (Vec::new(), Vec::new())
     } else {
         let (staged, unstaged) = partial_patch_outputs(
@@ -1094,6 +1112,21 @@ fn ensure_success(output: std::process::Output, intent: &str) -> Result<(), Stri
             diagnostic
         })
     }
+}
+
+/// Git arguments that apply the reviewer's display options to a patch.
+pub(super) fn display_diff_args(options: DiffDisplayOptions) -> Vec<OsString> {
+    let mut args = Vec::new();
+    if options.ignore_whitespace {
+        args.push(OsString::from("--ignore-all-space"));
+    }
+    args
+}
+
+/// Whether a diff rendered with these options can differ from the exact
+/// working-copy diff, which makes its hunks unsafe to apply.
+fn filters_diff(options: DiffDisplayOptions) -> bool {
+    options.ignore_whitespace
 }
 
 fn diff_paths(change: &FileChange) -> Result<Vec<OsString>, String> {
@@ -2007,6 +2040,7 @@ fn populate_commit_index(
                 worktree_path: snapshot.worktree_path.clone(),
                 path: selection.path.clone(),
             },
+            DiffDisplayOptions::default(),
             git_options,
         )?;
         if diff.binary || diff.truncated {
@@ -3885,6 +3919,166 @@ mod tests {
         );
         assert_eq!(result.snapshot.changes.len(), 1);
         assert_eq!(result.snapshot.changes[0].path.display, "lines.txt");
+    }
+
+    fn whitespace_fixture() -> (tempfile::TempDir, WorkingCopySnapshot) {
+        let repository = repository();
+        std::fs::write(repository.path().join("mixed.txt"), "one\ntwo\nthree\n")
+            .expect("mixed base");
+        std::fs::write(repository.path().join("spacing.txt"), "alpha\nbeta\n")
+            .expect("spacing base");
+        command::successful_git_at(repository.path(), ["add", "--", "."]).expect("stage base");
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"])
+            .expect("commit base");
+        std::fs::write(repository.path().join("mixed.txt"), "one  \ntwo\nTHREE\n")
+            .expect("edit mixed");
+        std::fs::write(repository.path().join("spacing.txt"), "alpha\n\tbeta \n")
+            .expect("edit spacing");
+        std::fs::write(repository.path().join("new.txt"), "fresh \n").expect("untracked file");
+        let snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
+        (repository, snapshot)
+    }
+
+    fn diff_request(snapshot: &WorkingCopySnapshot, display: &str) -> FileDiffRequest {
+        let change = snapshot
+            .changes
+            .iter()
+            .find(|change| change.path.display == display)
+            .expect("changed path");
+        FileDiffRequest {
+            repository_path: snapshot.repository_path.clone(),
+            worktree_path: snapshot.worktree_path.clone(),
+            path: change.path.clone(),
+        }
+    }
+
+    const HIDE_WHITESPACE: DiffDisplayOptions = DiffDisplayOptions {
+        ignore_whitespace: true,
+    };
+
+    #[test]
+    fn whitespace_hidden_diffs_omit_whitespace_changes_and_withhold_hunks() {
+        let (_repository, snapshot) = whitespace_fixture();
+
+        let exact = file_diff(diff_request(&snapshot, "mixed.txt")).expect("exact diff");
+        assert!(exact.patch.contains("+one  \n"));
+        assert!(exact.patch.contains("+THREE\n"));
+        assert!(!exact.hunks.is_empty());
+        assert!(!exact.unstaged_hunks.is_empty());
+
+        let hidden = file_diff_for_display(diff_request(&snapshot, "mixed.txt"), HIDE_WHITESPACE)
+            .expect("whitespace-hidden diff");
+        assert!(!hidden.patch.contains("+one  "));
+        assert!(hidden.patch.contains("-three\n+THREE\n"));
+        assert!(hidden.hunks.is_empty());
+        assert!(hidden.staged_hunks.is_empty());
+        assert!(hidden.unstaged_hunks.is_empty());
+
+        let spacing =
+            file_diff_for_display(diff_request(&snapshot, "spacing.txt"), HIDE_WHITESPACE)
+                .expect("whitespace-only diff");
+        assert_eq!(spacing.patch, "");
+        assert!(!spacing.binary && !spacing.truncated && spacing.hunks.is_empty());
+
+        let untracked = file_diff_for_display(diff_request(&snapshot, "new.txt"), HIDE_WHITESPACE)
+            .expect("untracked whitespace-hidden diff");
+        assert!(untracked.patch.contains("+fresh \n"));
+        assert!(untracked.hunks.is_empty() && untracked.unstaged_hunks.is_empty());
+
+        let shown = file_diff_for_display(
+            diff_request(&snapshot, "mixed.txt"),
+            DiffDisplayOptions::default(),
+        )
+        .expect("default display diff");
+        assert_eq!(shown.patch, exact.patch);
+        assert_eq!(shown.hunks.len(), exact.hunks.len());
+    }
+
+    #[test]
+    fn commits_and_hunks_applied_while_whitespace_is_hidden_use_the_exact_patch() {
+        let (repository, snapshot) = whitespace_fixture();
+        let change = snapshot
+            .changes
+            .iter()
+            .find(|change| change.path.display == "mixed.txt")
+            .expect("mixed change")
+            .clone();
+        let hidden = file_diff_for_display(diff_request(&snapshot, "mixed.txt"), HIDE_WHITESPACE)
+            .expect("whitespace-hidden diff");
+        let partial = |expected_patch: String, selected_line_indices: Vec<u32>| CommitRequest {
+            repository_path: snapshot.repository_path.clone(),
+            worktree_path: snapshot.worktree_path.clone(),
+            expected_head: snapshot.head.clone(),
+            included_changes: vec![CommitFileSelection {
+                path: change.path.clone(),
+                previous_path: change.previous_path.clone(),
+                expected_index_status: change.index_status.clone(),
+                expected_worktree_status: change.worktree_status.clone(),
+                include_all: false,
+                hunks: vec![CommitHunkSelection {
+                    expected_patch,
+                    selected_line_indices,
+                }],
+            }],
+            summary: "partial".into(),
+            description: String::new(),
+            amend: false,
+            author: None,
+            co_authors: Vec::new(),
+            trailers: Vec::new(),
+            signing: CommitSigning::DoNotSign,
+        };
+        let changed_lines = |patch: &str, wanted: &[&str]| {
+            let offset = patch.find("@@ ").expect("hunk header");
+            patch[offset..]
+                .lines()
+                .skip(1)
+                .enumerate()
+                .filter_map(|(index, line)| wanted.contains(&line).then_some(index as u32))
+                .collect::<Vec<_>>()
+        };
+
+        // A selection can never be built from the filtered diff: its patch does
+        // not describe the working copy, so the commit refuses it.
+        let filtered_lines = changed_lines(&hidden.patch, &["-three", "+THREE"]);
+        assert_eq!(filtered_lines.len(), 2);
+        assert!(commit(partial(hidden.patch.clone(), filtered_lines.clone())).is_err());
+        assert!(apply_patch_hunk(ApplyPatchHunkRequest {
+            repository_path: snapshot.repository_path.clone(),
+            worktree_path: snapshot.worktree_path.clone(),
+            path: change.path.clone(),
+            action: PatchHunkAction::Stage,
+            hunk_index: 0,
+            expected_patch: hidden.patch.clone(),
+            expected_head: snapshot.head.clone(),
+            selected_line_indices: filtered_lines,
+        })
+        .is_err());
+        assert_eq!(
+            git_text(repository.path(), ["rev-list", "--count", "HEAD"]).expect("history"),
+            "1"
+        );
+        assert_eq!(
+            git_text(repository.path(), ["diff", "--cached", "--name-only"]).expect("index"),
+            ""
+        );
+
+        // A selection reviewed before whitespace was hidden stays exact: the
+        // commit rebuilds it from the unfiltered diff, so the hidden
+        // whitespace-only line it includes is committed byte for byte.
+        let exact = file_diff(diff_request(&snapshot, "mixed.txt")).expect("exact diff");
+        let hunk = exact.hunks.first().expect("exact hunk");
+        let whitespace_lines = changed_lines(&hunk.patch, &["-one", "+one  "]);
+        assert_eq!(whitespace_lines.len(), 2);
+        commit(partial(hunk.patch.clone(), whitespace_lines)).expect("partial commit");
+        assert_eq!(
+            git_text(repository.path(), ["show", "HEAD:mixed.txt"]).expect("committed file"),
+            "one  \ntwo\nthree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("mixed.txt")).expect("working file"),
+            "one  \ntwo\nTHREE\n"
+        );
     }
 
     #[test]

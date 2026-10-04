@@ -5,10 +5,12 @@ use super::command;
 use super::images::{image_comparison, revision_image_preview};
 use super::models::{
     CommitChangedFile, CommitFileDiffRequest, CommitFilesRequest, CommitSignature, CommitSummary,
-    FileChangeKind, FileDiff, HistoryPage, HistoryRequest, ImageVersion, ReflogEntry,
-    ReflogRequest,
+    DiffDisplayOptions, FileChangeKind, FileDiff, HistoryPage, HistoryRequest, ImageVersion,
+    ReflogEntry, ReflogRequest,
 };
-use super::working_copy::{empty_tree, git_path, path_from_token, truncate_file_patch};
+use super::working_copy::{
+    display_diff_args, empty_tree, git_path, path_from_token, truncate_file_patch,
+};
 
 const MAX_HISTORY_PAGE: u16 = 100;
 const MAX_REFLOG_PAGE: u16 = 500;
@@ -183,7 +185,10 @@ pub fn commit_files(request: CommitFilesRequest) -> Result<Vec<CommitChangedFile
     parse_changed_files(&output.stdout)
 }
 
-pub fn commit_file_diff(request: CommitFileDiffRequest) -> Result<FileDiff, String> {
+pub fn commit_file_diff(
+    request: CommitFileDiffRequest,
+    options: DiffDisplayOptions,
+) -> Result<FileDiff, String> {
     let files = commit_files(CommitFilesRequest {
         repository_path: request.repository_path.clone(),
         worktree_path: request.worktree_path.clone(),
@@ -202,15 +207,16 @@ pub fn commit_file_diff(request: CommitFileDiffRequest) -> Result<FileDiff, Stri
         paths.push(path_from_token(&previous.token)?);
     }
     paths.push(path_from_token(&file.path.token)?);
-    let mut patch_args = vec![
-        OsString::from("diff"),
+    let mut patch_args = vec![OsString::from("diff")];
+    patch_args.extend(display_diff_args(options));
+    patch_args.extend([
         OsString::from("--no-color"),
         OsString::from("--no-ext-diff"),
         OsString::from("--find-renames"),
         OsString::from(&base),
         OsString::from(&request.commit),
         OsString::from("--"),
-    ];
+    ]);
     patch_args.extend(paths.iter().cloned());
     let mut numstat_args = vec![
         OsString::from("diff"),
@@ -465,12 +471,15 @@ mod tests {
         name: &str,
     ) -> super::super::models::ImageComparison {
         let path = repository.to_string_lossy().into_owned();
-        let diff = commit_file_diff(CommitFileDiffRequest {
-            repository_path: path.clone(),
-            worktree_path: path,
-            commit: commit.into(),
-            path: git_path(name.as_bytes()),
-        })
+        let diff = commit_file_diff(
+            CommitFileDiffRequest {
+                repository_path: path.clone(),
+                worktree_path: path,
+                commit: commit.into(),
+                path: git_path(name.as_bytes()),
+            },
+            DiffDisplayOptions::default(),
+        )
         .unwrap();
         assert!(diff.binary);
         diff.image.expect("image comparison")
@@ -550,12 +559,15 @@ mod tests {
                 }
                 let commit = commit_image_files(repository.path());
                 let path = repository.path().to_string_lossy().into_owned();
-                let diff = commit_file_diff(CommitFileDiffRequest {
-                    repository_path: path.clone(),
-                    worktree_path: path,
-                    commit,
-                    path: git_path(b"new.txt"),
-                })
+                let diff = commit_file_diff(
+                    CommitFileDiffRequest {
+                        repository_path: path.clone(),
+                        worktree_path: path,
+                        commit,
+                        path: git_path(b"new.txt"),
+                    },
+                    DiffDisplayOptions::default(),
+                )
                 .unwrap();
                 assert!(
                     !diff.binary,
@@ -683,15 +695,81 @@ mod tests {
         .expect("commit files");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path.display, "file.txt");
-        let diff = commit_file_diff(CommitFileDiffRequest {
-            repository_path: path.clone(),
-            worktree_path: path,
-            commit: newest,
-            path: files[0].path.clone(),
-        })
+        let diff = commit_file_diff(
+            CommitFileDiffRequest {
+                repository_path: path.clone(),
+                worktree_path: path,
+                commit: newest,
+                path: files[0].path.clone(),
+            },
+            DiffDisplayOptions::default(),
+        )
         .expect("commit file diff");
         assert!(diff.patch.contains("+3"));
         assert!(!diff.binary);
+    }
+
+    #[test]
+    fn commit_diffs_can_hide_whitespace_changes() {
+        let repository = tempfile::tempdir().expect("repository");
+        command::successful_git_at(repository.path(), ["init"]).expect("init");
+        command::successful_git_at(repository.path(), ["config", "core.autocrlf", "false"])
+            .expect("line endings");
+        command::successful_git_at(repository.path(), ["config", "user.name", "History Test"])
+            .expect("name");
+        command::successful_git_at(
+            repository.path(),
+            ["config", "user.email", "history@example.invalid"],
+        )
+        .expect("email");
+        let commit_files_with = |mixed: &str, spacing: &str, message: &str| {
+            std::fs::write(repository.path().join("mixed.txt"), mixed).expect("write mixed");
+            std::fs::write(repository.path().join("spacing.txt"), spacing).expect("write spacing");
+            command::successful_git_at(repository.path(), ["add", "--", "."]).expect("stage");
+            command::successful_git_at(repository.path(), ["commit", "-m", message])
+                .expect("commit");
+        };
+        commit_files_with("one\ntwo\n", "alpha\n", "base");
+        commit_files_with("one \nTWO\n", "  alpha\n", "edit");
+        let path = repository.path().to_string_lossy().into_owned();
+        let head = String::from_utf8(
+            command::successful_git_at(repository.path(), ["rev-parse", "HEAD"])
+                .expect("head")
+                .stdout,
+        )
+        .expect("utf-8 head")
+        .trim()
+        .to_string();
+        let files = commit_files(CommitFilesRequest {
+            repository_path: path.clone(),
+            worktree_path: path.clone(),
+            commit: head.clone(),
+        })
+        .expect("commit files");
+        let diff_of = |display: &str, ignore_whitespace: bool| {
+            let file = files
+                .iter()
+                .find(|file| file.path.display == display)
+                .expect("changed file");
+            commit_file_diff(
+                CommitFileDiffRequest {
+                    repository_path: path.clone(),
+                    worktree_path: path.clone(),
+                    commit: head.clone(),
+                    path: file.path.clone(),
+                },
+                DiffDisplayOptions { ignore_whitespace },
+            )
+            .expect("commit file diff")
+        };
+
+        let exact = diff_of("mixed.txt", false);
+        assert!(exact.patch.contains("+one \n") && exact.patch.contains("+TWO\n"));
+        let hidden = diff_of("mixed.txt", true);
+        assert!(!hidden.patch.contains("+one "));
+        assert!(hidden.patch.contains("-two\n+TWO\n"));
+        assert_eq!(diff_of("spacing.txt", true).patch, "");
+        assert!(diff_of("spacing.txt", false).patch.contains("+  alpha\n"));
     }
 
     #[test]
