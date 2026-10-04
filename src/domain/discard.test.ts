@@ -82,6 +82,7 @@ describe("discard rules", () => {
     expect(discardEffectLabel(entry({ effect: "remove", tracked: false }))).toBe("Delete the untracked file");
     expect(discardEffectLabel(entry({ effect: "remove" }))).toBe("Remove the new file");
     expect(discardEffectLabel(entry({ effect: "unstage", onDisk: false }))).toBe("Unstage the new file, which is already deleted");
+    expect(discardEffectLabel(entry({ effect: "restoreCommittedStaged", onDisk: false }))).toBe("Restore the committed version in the index; sparse checkout keeps the file off disk");
   });
 
   it("warns only above the large recovery point threshold", () => {

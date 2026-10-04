@@ -184,6 +184,9 @@ struct Planned {
     /// Input for `update-index --index-info`: removals, then writes.
     index_removals: Vec<u8>,
     index_writes: Vec<u8>,
+    /// Rewritten entries that keep these flags, NUL-terminated.
+    skip_worktree: Vec<u8>,
+    assume_unchanged: Vec<u8>,
     /// Paths `checkout-index` writes from the index, NUL-terminated.
     checkout: Vec<u8>,
 }
@@ -280,16 +283,22 @@ fn plan(snapshot: &WorkingCopySnapshot, target: &DiscardTarget) -> Result<Planne
         remove: Vec::new(),
         index_removals: Vec::new(),
         index_writes: Vec::new(),
+        skip_worktree: Vec::new(),
+        assume_unchanged: Vec::new(),
         checkout: Vec::new(),
     };
     for candidate in &candidates {
         let state = &candidate.state;
-        let writes = matches!(
+        let writes_disk = matches!(
             candidate.effect,
             DiscardEffect::RestoreCommitted | DiscardEffect::RestoreStaged
         );
-        if writes {
-            if state.directory && !removals.empties_folder(worktree, &state.path)? {
+        let writes_index = matches!(
+            candidate.effect,
+            DiscardEffect::RestoreCommitted | DiscardEffect::RestoreCommittedStaged
+        );
+        if writes_disk || writes_index {
+            if writes_disk && state.directory && !removals.empties_folder(worktree, &state.path)? {
                 keep_or_refuse(
                     candidate.target,
                     KeptChangeReason::FileFolderConflict,
@@ -300,8 +309,7 @@ fn plan(snapshot: &WorkingCopySnapshot, target: &DiscardTarget) -> Result<Planne
                 )?;
                 continue;
             }
-            let writes_index = candidate.effect == DiscardEffect::RestoreCommitted;
-            let crosses = removals.crossed_by(&candidate.bytes, state, true, writes_index);
+            let crosses = removals.crossed_by(&candidate.bytes, state, writes_disk, writes_index);
             if crosses {
                 keep_or_refuse(
                     candidate.target,
@@ -310,7 +318,7 @@ fn plan(snapshot: &WorkingCopySnapshot, target: &DiscardTarget) -> Result<Planne
                 )?;
                 continue;
             }
-            if state.directory {
+            if writes_disk && state.directory {
                 planned.empty_folders.push(state.path.clone());
             }
         }
@@ -365,7 +373,15 @@ fn effect_of(
         return Some(DiscardEffect::RestoreStaged);
     }
     if scope == DiscardScope::All && head.is_some_and(|entry| entry.kind == "blob") {
-        return Some(DiscardEffect::RestoreCommitted);
+        let sparse = state
+            .index
+            .iter()
+            .any(|entry| entry.stage == 0 && entry.skip_worktree);
+        return Some(if sparse && state.worktree.is_none() {
+            DiscardEffect::RestoreCommittedStaged
+        } else {
+            DiscardEffect::RestoreCommitted
+        });
     }
     if state.worktree.is_some() {
         Some(DiscardEffect::Remove)
@@ -389,16 +405,39 @@ fn add_effect(planned: &mut Planned, candidate: &Candidate) -> Result<(), String
             );
         }
     };
+    // A rewritten entry keeps the flags it had, which `--index-info` drops:
+    // sparse checkout's skip-worktree and the user's assume-unchanged.
+    let restore_committed = |planned: &mut Planned| -> Result<(), String> {
+        let head = candidate
+            .head
+            .ok_or_else(|| "The last commit no longer has this path.".to_string())?;
+        // A stage-zero entry replaces every conflict stage of the path.
+        push_index_info(&mut planned.index_writes, &head.mode, &head.oid, path);
+        for entry in candidate
+            .state
+            .index
+            .iter()
+            .filter(|entry| entry.stage == 0)
+        {
+            for (flagged, list) in [
+                (entry.skip_worktree, &mut planned.skip_worktree),
+                (entry.assume_unchanged, &mut planned.assume_unchanged),
+            ] {
+                if flagged {
+                    list.extend_from_slice(path);
+                    list.push(0);
+                }
+            }
+        }
+        Ok(())
+    };
     match candidate.effect {
         DiscardEffect::RestoreCommitted => {
-            let head = candidate
-                .head
-                .ok_or_else(|| "The last commit no longer has this path.".to_string())?;
-            // A stage-zero entry replaces every conflict stage of the path.
-            push_index_info(&mut planned.index_writes, &head.mode, &head.oid, path);
+            restore_committed(planned)?;
             planned.checkout.extend_from_slice(path);
             planned.checkout.push(0);
         }
+        DiscardEffect::RestoreCommittedStaged => restore_committed(planned)?,
         DiscardEffect::RestoreStaged => {
             planned.checkout.extend_from_slice(path);
             planned.checkout.push(0);
@@ -489,14 +528,36 @@ fn execute(worktree: &Path, planned: &Planned) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
         ensure_success(output, "update the index")?;
     }
+    for (flag, paths) in [
+        ("--skip-worktree", &planned.skip_worktree),
+        ("--assume-unchanged", &planned.assume_unchanged),
+    ] {
+        if !paths.is_empty() {
+            let output = command::git_at_with_input(
+                worktree,
+                ["update-index", "-z", flag, "--stdin"],
+                paths,
+            )
+            .map_err(|error| error.to_string())?;
+            ensure_success(output, "keep the index flags")?;
+        }
+    }
     if !planned.checkout.is_empty() {
         // Writes each listed index entry as Git would on checkout, applying
-        // filters and line-ending settings. Without `-u` it leaves the index
-        // alone, so a run cut short never leaves the index locked; the
-        // refresh afterwards records the written files' stat data.
+        // filters and line-ending settings. A skip-worktree entry is listed
+        // only when its file is on disk, so it is written like any other.
+        // Without `-u` it leaves the index alone, so a run cut short never
+        // leaves the index locked; the refresh afterwards records the written
+        // files' stat data.
         let output = command::git_at_with_input(
             worktree,
-            ["checkout-index", "--force", "-z", "--stdin"],
+            [
+                "checkout-index",
+                "--force",
+                "--ignore-skip-worktree-bits",
+                "-z",
+                "--stdin",
+            ],
             &planned.checkout,
         )
         .map_err(|error| error.to_string())?;
@@ -1605,6 +1666,51 @@ mod tests {
         assert!(error.contains(&points[0].id), "{error}");
         git(&path, &["config", "filter.strict.smudge", "cat"]);
         restore(&path, &points[0]);
+        assert_eq!(exact_state(&path), before);
+    }
+
+    #[test]
+    fn a_discard_keeps_index_flags_and_leaves_sparse_files_off_disk() {
+        let directory = repository();
+        let path = root(&directory);
+        write(&path, "sparse.txt", b"committed\n");
+        write(&path, "assumed.txt", b"committed\n");
+        git(&path, &["add", "."]);
+        git(&path, &["commit", "-m", "base"]);
+        write(&path, "sparse.txt", b"staged\n");
+        write(&path, "assumed.txt", b"staged\n");
+        git(&path, &["add", "."]);
+        git(&path, &["update-index", "--skip-worktree", "sparse.txt"]);
+        git(
+            &path,
+            &["update-index", "--assume-unchanged", "assumed.txt"],
+        );
+        std::fs::remove_file(path.join("sparse.txt")).expect("leave the sparse file off disk");
+        let before = exact_state(&path);
+
+        let all = plan(&path, DiscardTarget::All);
+        assert_eq!(
+            effect_of(&all, "sparse.txt"),
+            DiscardEffect::RestoreCommittedStaged
+        );
+        assert_eq!(
+            effect_of(&all, "assumed.txt"),
+            DiscardEffect::RestoreCommitted
+        );
+        let discarded = discard(&path, DiscardTarget::All);
+        let flags = git(&path, &["ls-files", "-v"]);
+        assert!(flags.contains("S sparse.txt"), "{flags}");
+        assert!(flags.contains("h assumed.txt"), "{flags}");
+        assert!(!path.join("sparse.txt").exists());
+        assert_eq!(
+            std::fs::read(path.join("assumed.txt")).expect("read"),
+            b"committed\n"
+        );
+        assert_eq!(
+            git(&path, &["diff-index", "--cached", "--name-only", "HEAD"]),
+            ""
+        );
+        restore(&path, &discarded.recovery_point);
         assert_eq!(exact_state(&path), before);
     }
 

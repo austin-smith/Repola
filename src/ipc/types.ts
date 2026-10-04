@@ -350,7 +350,7 @@ export type DiscardTarget =
   | { kind: "file"; path: GitPath; scope: DiscardScope }
   | { kind: "all" };
 
-export type DiscardEffect = "restoreCommitted" | "restoreStaged" | "remove" | "unstage";
+export type DiscardEffect = "restoreCommitted" | "restoreStaged" | "remove" | "unstage" | "restoreCommittedStaged";
 
 /** One path a discard changes. A rename is two entries: its new name and its original one. */
 export interface DiscardPlanEntry {

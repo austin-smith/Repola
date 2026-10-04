@@ -49,6 +49,8 @@ export function discardEffectLabel(entry: DiscardPlanEntry): string {
       return entry.onDisk ? "Replace unstaged edits with the staged version" : "Restore the staged version of the deleted file";
     case "restoreCommitted":
       return entry.onDisk ? "Restore the committed version" : "Restore the deleted file";
+    case "restoreCommittedStaged":
+      return "Restore the committed version in the index; sparse checkout keeps the file off disk";
   }
 }
 

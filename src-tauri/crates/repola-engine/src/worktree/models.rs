@@ -760,6 +760,9 @@ pub enum DiscardEffect {
     /// The last commit lacks the path and its file is already gone, so only
     /// its index entry is removed.
     Unstage,
+    /// The index entry returns to the last commit's version; the file stays
+    /// off disk, where sparse checkout leaves it.
+    RestoreCommittedStaged,
 }
 
 /// A change a discard deliberately leaves alone because its content cannot be
