@@ -1408,12 +1408,20 @@ mod tests {
             write(&path, "intended.txt", b"not staged yet\n");
             write(&path, "forced.log", b"ignored, but intended\n");
             write(&path, "nested/gone.txt", b"deleted after git add -N\n");
+            write(&path, "made/for/it.txt", b"deleted with its folders\n");
             git(
                 &path,
-                &["add", "--intent-to-add", "intended.txt", "nested/gone.txt"],
+                &[
+                    "add",
+                    "--intent-to-add",
+                    "intended.txt",
+                    "nested/gone.txt",
+                    "made/for/it.txt",
+                ],
             );
             git(&path, &["add", "--force", "--intent-to-add", "forced.log"]);
             std::fs::remove_file(path.join("nested/gone.txt")).expect("delete");
+            std::fs::remove_dir_all(path.join("made")).expect("delete folders");
             // The same index entry, made by staging an empty file.
             write(&path, "empty.txt", b"");
             git(&path, &["add", "empty.txt"]);
@@ -1425,9 +1433,14 @@ mod tests {
                 all.snapshot.changes.iter().all(|change| change.untracked),
                 "unborn: {unborn}"
             );
+            // An empty folder made since the discard is not the restore's to
+            // remove, and the restore makes no folders for deleted entries.
+            std::fs::create_dir_all(path.join("nested")).expect("folder");
             restore(&path, &all.recovery_point);
             assert_eq!(exact_state(&path), before, "unborn: {unborn}");
             assert!(!path.join("nested/gone.txt").exists(), "unborn: {unborn}");
+            assert!(path.join("nested").is_dir(), "unborn: {unborn}");
+            assert!(!path.join("made").exists(), "unborn: {unborn}");
         }
     }
 

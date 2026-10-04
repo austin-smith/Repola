@@ -284,10 +284,16 @@ fn real_directory(worktree: &Path, components: &[OsString]) -> Result<Option<Pat
     Ok(Some(current))
 }
 
-/// Like `inspect_path`, but creates missing parent directories one at a time
-/// and refuses any parent that is not a real directory, so a restore can never
-/// write through a symbolic link or outside the working copy.
-fn prepare_path(worktree: &Path, path: &WorktreePath, display: &str) -> Result<PathBuf, String> {
+/// Like `inspect_path`, but creates missing parent directories one at a time,
+/// adding each to `created`, and refuses any parent that is not a real
+/// directory, so a restore can never write through a symbolic link or outside
+/// the working copy.
+fn prepare_path(
+    worktree: &Path,
+    path: &WorktreePath,
+    display: &str,
+    created: &mut Vec<PathBuf>,
+) -> Result<PathBuf, String> {
     let mut current = worktree.to_path_buf();
     let (name, parents) = path
         .components
@@ -307,6 +313,7 @@ fn prepare_path(worktree: &Path, path: &WorktreePath, display: &str) -> Result<P
                 fs::create_dir(&current).map_err(|error| {
                     format!("{} could not be created: {error}", current.display())
                 })?;
+                created.push(current.clone());
             }
             Err(error) => {
                 return Err(format!(
@@ -1250,10 +1257,16 @@ fn restore_intents(
     placeholders: &[&GitPath],
 ) -> Result<(), String> {
     let mut created = Vec::new();
+    let mut directories = Vec::new();
     let recorded = placeholders
         .iter()
         .try_for_each(|path| {
-            let target = prepare_path(worktree, &WorktreePath::new(path)?, &path.display)?;
+            let target = prepare_path(
+                worktree,
+                &WorktreePath::new(path)?,
+                &path.display,
+                &mut directories,
+            )?;
             fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -1277,8 +1290,14 @@ fn restore_intents(
             .map_err(|error| error.to_string())?;
             successful_stdout(output, "restore the intent-to-add entries").map(drop)
         });
+    // Only the stand-ins and the folders made for them go; folders that were
+    // already there stay, even when empty. Innermost first, and a folder that
+    // something else has since filled stays too.
     for path in created {
-        remove_worktree_entry(worktree, path)?;
+        remove_worktree_file(worktree, &WorktreePath::new(path)?, path)?;
+    }
+    for directory in directories.iter().rev() {
+        let _ = fs::remove_dir(directory);
     }
     recorded
 }
@@ -1307,7 +1326,7 @@ fn restore_worktree_entry(
     let Some(entry) = entry else {
         return remove_worktree_entry(worktree, path);
     };
-    let target = prepare_path(worktree, &valid, &path.display)?;
+    let target = prepare_path(worktree, &valid, &path.display, &mut Vec::new())?;
     if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.file_type().is_dir()) {
         return Err(format!(
             "{} is now a directory, so Repola will not replace it.",
@@ -1338,8 +1357,20 @@ fn restore_worktree_entry(
 /// anything reached through a symbolic link.
 pub(super) fn remove_worktree_entry(worktree: &Path, path: &GitPath) -> Result<(), String> {
     let valid = WorktreePath::new(path)?;
-    let Some(target) = inspect_path(worktree, &valid)? else {
-        return Ok(());
+    if remove_worktree_file(worktree, &valid, path)? {
+        remove_empty_parents(worktree, &valid);
+    }
+    Ok(())
+}
+
+/// Removes the file or link at `valid`, reporting whether there was one.
+fn remove_worktree_file(
+    worktree: &Path,
+    valid: &WorktreePath,
+    path: &GitPath,
+) -> Result<bool, String> {
+    let Some(target) = inspect_path(worktree, valid)? else {
+        return Ok(false);
     };
     match fs::symlink_metadata(&target) {
         Ok(metadata) if metadata.file_type().is_dir() => Err(format!(
@@ -1349,10 +1380,9 @@ pub(super) fn remove_worktree_entry(worktree: &Path, path: &GitPath) -> Result<(
         Ok(_) => {
             fs::remove_file(&target)
                 .map_err(|error| format!("{} could not be removed: {error}", path.display))?;
-            remove_empty_parents(worktree, &valid);
-            Ok(())
+            Ok(true)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(format!("{} could not be inspected: {error}", path.display)),
     }
 }
