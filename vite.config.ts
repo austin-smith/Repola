@@ -74,6 +74,10 @@ export default defineConfig(async ({ mode }) => {
     test: {
       environment: "jsdom",
       setupFiles: "./src/test-setup.ts",
+      // The first render in each test file pays jsdom and React warm-up (1-2.5s
+      // idle), which exceeded the 5s default under heavy CPU load. This is only
+      // a hang detector; tests must not depend on wall-clock timing.
+      testTimeout: 20_000,
     },
     build: {
       // Shiki grammars are emitted as independently loaded chunks. The largest
