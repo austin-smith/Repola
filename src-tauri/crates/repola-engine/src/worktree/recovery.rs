@@ -437,7 +437,8 @@ pub(super) fn observe_paths(
     }
     // Two Git paths that are one entry on disk, as case or Unicode
     // normalization can make them, would be saved as two copies of one file.
-    let mut entries_on_disk: HashMap<(u64, u64), &GitPath> = HashMap::new();
+    let mut entries_on_disk: HashMap<OsString, &GitPath> = HashMap::new();
+    let mut folder_listings = HashMap::new();
     let mut observed = Vec::with_capacity(paths.len());
     for (path, valid) in paths.iter().zip(&validated) {
         let chain = parent_chain(worktree, valid)?;
@@ -464,7 +465,7 @@ pub(super) fn observe_paths(
             }
             Err(error) => return Err(format!("{} could not be inspected: {error}", path.display)),
         };
-        if let Some(identity) = single_entry_identity(&metadata) {
+        if let Some(identity) = entry_identity(&location, &metadata, &mut folder_listings)? {
             if let Some(other) = entries_on_disk.insert(identity, path) {
                 return Err(format!(
                     "{} and {} are spelled differently but are one file on this file system, so Repola cannot save them separately. Undo this change with Git instead.",
@@ -642,20 +643,53 @@ struct ParentChain {
     permissions: Vec<u32>,
 }
 
-/// The device and inode of an entry no other name links to: a folder, or a
-/// file with one link. Two paths with the same identity are one entry under
-/// two spellings; hard links are separate entries by design.
+/// What names one entry on disk, so two paths with the same identity are one
+/// entry under two spellings. On Unix it is the device and inode of a folder
+/// or of a file with one link; hard links are separate entries by design.
 #[cfg(unix)]
-fn single_entry_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+fn entry_identity(
+    _location: &Path,
+    metadata: &fs::Metadata,
+    _folder_listings: &mut HashMap<PathBuf, Vec<OsString>>,
+) -> Result<Option<OsString>, String> {
     use std::os::unix::fs::MetadataExt;
-    (metadata.is_dir() || metadata.nlink() == 1).then(|| (metadata.dev(), metadata.ino()))
+    Ok((metadata.is_dir() || metadata.nlink() == 1)
+        .then(|| OsString::from(format!("{}:{}", metadata.dev(), metadata.ino()))))
 }
 
-/// Windows compares names exactly apart from case, which `core.ignorecase`
-/// already covers.
+/// What names one entry on disk, so two paths with the same identity are one
+/// entry under two spellings. On Windows it is the folder's real path and the
+/// name the folder stores, whatever spelling found it and whatever
+/// `core.ignorecase` says.
 #[cfg(windows)]
-fn single_entry_identity(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
-    None
+fn entry_identity(
+    location: &Path,
+    _metadata: &fs::Metadata,
+    folder_listings: &mut HashMap<PathBuf, Vec<OsString>>,
+) -> Result<Option<OsString>, String> {
+    let (Some(parent), Some(name)) = (location.parent(), location.file_name()) else {
+        return Ok(None);
+    };
+    let folder = dunce::canonicalize(parent)
+        .map_err(|error| format!("{} could not be inspected: {error}", parent.display()))?;
+    if !folder_listings.contains_key(&folder) {
+        let names = fs::read_dir(&folder)
+            .map_err(|error| format!("{} could not be read: {error}", folder.display()))?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        folder_listings.insert(folder.clone(), names);
+    }
+    let wanted = name.to_string_lossy().to_lowercase();
+    let stored = folder_listings[&folder]
+        .iter()
+        .find(|stored| stored.as_os_str() == name)
+        .or_else(|| {
+            folder_listings[&folder]
+                .iter()
+                .find(|stored| stored.to_string_lossy().to_lowercase() == wanted)
+        });
+    Ok(stored.map(|stored| folder.join(stored).into_os_string()))
 }
 
 #[cfg(unix)]
@@ -3369,15 +3403,12 @@ mod tests {
             assert!(error.contains("spelled differently"), "{error}");
         }
         // Hard links are separate names on purpose and stay allowed.
-        #[cfg(unix)]
-        {
-            fs::hard_link(path.join("caf\u{e9}.txt"), path.join("linked.txt")).expect("link");
-            let paths = [
-                git_path("caf\u{e9}.txt".as_bytes()),
-                git_path(b"linked.txt"),
-            ];
-            observe_paths(&path, None, &paths, false).expect("hard links");
-        }
+        fs::hard_link(path.join("caf\u{e9}.txt"), path.join("linked.txt")).expect("link");
+        let paths = [
+            git_path("caf\u{e9}.txt".as_bytes()),
+            git_path(b"linked.txt"),
+        ];
+        observe_paths(&path, None, &paths, false).expect("hard links");
     }
 
     #[test]
