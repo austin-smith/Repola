@@ -1076,6 +1076,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_case_only_rename_is_refused_where_case_is_ignored() {
+        let directory = repository();
+        let path = root(&directory);
+        base_commit(&path);
+        git(&path, &["config", "core.ignorecase", "true"]);
+        git(&path, &["mv", "rename-me.txt", "Rename-Me.txt"]);
+        let before = exact_state(&path);
+        for target in [file(&path, "Rename-Me.txt"), DiscardTarget::All] {
+            let error = plan_error(&path, target);
+            assert!(error.contains("differ only in letter case"), "{error}");
+        }
+        assert_eq!(exact_state(&path), before);
+    }
+
     fn effect_of(plan: &DiscardPlan, display: &str) -> DiscardEffect {
         plan.entries
             .iter()

@@ -320,6 +320,28 @@ fn prepare_path(worktree: &Path, path: &WorktreePath, display: &str) -> Result<P
     Ok(current)
 }
 
+/// On a case-insensitive file system, paths that differ only in case name one
+/// file: observing both would save it twice and lose which spelling it had.
+fn refuse_case_collisions(paths: &[GitPath], validated: &[WorktreePath]) -> Result<(), String> {
+    let mut seen: HashMap<String, (&GitPath, &[u8])> = HashMap::new();
+    for (path, valid) in paths.iter().zip(validated) {
+        let folded = String::from_utf8_lossy(&valid.bytes).to_lowercase();
+        match seen.get(&folded) {
+            Some((other, bytes)) if *bytes != valid.bytes.as_slice() => {
+                return Err(format!(
+                    "{} and {} differ only in letter case, so they are one file on this file system and Repola cannot save them separately. Undo this change with Git instead.",
+                    other.display, path.display
+                ));
+            }
+            Some(_) => {}
+            None => {
+                seen.insert(folded, (path, &valid.bytes));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Observes the index entries and working-tree content of `paths`. With
 /// `store`, every working-tree blob is also written to the object store, so
 /// the oids returned are exactly the content a recovery point will hold.
@@ -334,6 +356,9 @@ pub(super) fn observe_paths(
         .iter()
         .map(WorktreePath::new)
         .collect::<Result<Vec<_>, _>>()?;
+    if config_bool(worktree, "core.ignorecase", false)? {
+        refuse_case_collisions(paths, &validated)?;
+    }
     let mut index = index_entries(worktree, head, &validated)?;
 
     enum Source {
@@ -1256,14 +1281,15 @@ fn restore_intents(
 }
 
 fn core_symlinks(worktree: &Path) -> Result<bool, String> {
-    let output = command::git_at(
-        worktree,
-        ["config", "--type=bool", "--get", "core.symlinks"],
-    )
-    .map_err(|error| error.to_string())?;
+    config_bool(worktree, "core.symlinks", DEFAULT_CORE_SYMLINKS)
+}
+
+fn config_bool(worktree: &Path, key: &str, default: bool) -> Result<bool, String> {
+    let output = command::git_at(worktree, ["config", "--type=bool", "--get", key])
+        .map_err(|error| error.to_string())?;
     match output.status.code() {
         Some(0) => Ok(String::from_utf8_lossy(&output.stdout).trim() == "true"),
-        Some(1) => Ok(DEFAULT_CORE_SYMLINKS),
+        Some(1) => Ok(default),
         _ => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
     }
 }
