@@ -1319,6 +1319,29 @@ mod tests {
     }
 
     #[test]
+    fn intent_to_add_entries_restore_exactly() {
+        let directory = repository();
+        let path = root(&directory);
+        write(&path, ".gitignore", b"*.log\n");
+        git(&path, &["add", "."]);
+        git(&path, &["commit", "-m", "base"]);
+        write(&path, "intended.txt", b"not staged yet\n");
+        write(&path, "forced.log", b"ignored, but intended\n");
+        git(&path, &["add", "--intent-to-add", "intended.txt"]);
+        git(&path, &["add", "--force", "--intent-to-add", "forced.log"]);
+        // The same index entry, made by staging an empty file.
+        write(&path, "empty.txt", b"");
+        git(&path, &["add", "empty.txt"]);
+        write(&path, "empty.txt", b"edited after staging\n");
+        let before = exact_state(&path);
+
+        let all = discard(&path, DiscardTarget::All);
+        assert!(all.snapshot.changes.is_empty());
+        restore(&path, &all.recovery_point);
+        assert_eq!(exact_state(&path), before);
+    }
+
+    #[test]
     fn restoring_saves_what_it_replaces() {
         let directory = repository();
         let path = root(&directory);

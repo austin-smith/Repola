@@ -90,6 +90,11 @@ pub(super) struct IndexEntry {
     pub mode: String,
     pub oid: String,
     pub stage: u8,
+    /// Recorded with `git add --intent-to-add`. The index stores such an entry
+    /// as an empty blob, so only this flag tells it apart from a staged empty
+    /// file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub intent_to_add: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,6 +467,21 @@ fn index_entries(
         .collect::<Result<Vec<_>, _>>()?;
     let mut entries: HashMap<Vec<u8>, Vec<IndexEntry>> = HashMap::new();
     for chunk in argument_chunks(arguments) {
+        // `ls-files` omits the intent-to-add flag; comparing the index with
+        // the working tree reports exactly those entries as added.
+        let mut args = vec![
+            OsString::from("diff-files"),
+            OsString::from("--name-only"),
+            OsString::from("--diff-filter=A"),
+            OsString::from("-z"),
+            OsString::from("--"),
+        ];
+        args.extend(chunk.iter().cloned());
+        let output = git_stdout(worktree, args, "read the intent-to-add entries")?;
+        let intent_to_add: HashSet<&[u8]> = output
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .collect();
         let mut args = vec![
             OsString::from("ls-files"),
             OsString::from("--stage"),
@@ -493,6 +513,7 @@ fn index_entries(
                 mode: mode.to_string(),
                 oid: oid.to_string(),
                 stage,
+                intent_to_add: stage == 0 && intent_to_add.contains(path),
             });
         }
     }
@@ -1044,6 +1065,7 @@ fn apply_restore(
     }
     let absent = "0".repeat(point.oid.len());
     let mut input = Vec::new();
+    let mut intents = Vec::new();
     for (saved, current) in changed {
         if saved.index == current.index {
             continue;
@@ -1053,6 +1075,12 @@ fn apply_restore(
         // entries are added back.
         push_index_info(&mut input, "0", &absent, &path);
         for entry in &saved.index {
+            if entry.intent_to_add {
+                intents.extend_from_slice(b":(literal)");
+                intents.extend_from_slice(&path);
+                intents.push(0);
+                continue;
+            }
             input.extend_from_slice(
                 format!("{} {} {}\t", entry.mode, entry.oid, entry.stage).as_bytes(),
             );
@@ -1065,6 +1093,24 @@ fn apply_restore(
             command::git_at_with_input(worktree, ["update-index", "-z", "--index-info"], &input)
                 .map_err(|error| error.to_string())?;
         successful_stdout(output, "restore the saved index entries")?;
+    }
+    // Plumbing cannot set the flag, so these entries are recorded the way they
+    // were made. The saved file is already back on disk, which `add -N`
+    // requires; `--force` covers a path an ignore rule also matches.
+    if !intents.is_empty() {
+        let output = command::git_at_with_input(
+            worktree,
+            [
+                "add",
+                "--force",
+                "--intent-to-add",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ],
+            &intents,
+        )
+        .map_err(|error| error.to_string())?;
+        successful_stdout(output, "restore the intent-to-add entries")?;
     }
     Ok(())
 }
