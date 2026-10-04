@@ -55,6 +55,11 @@ export async function publishRelease(client, tag, channel, directory, feedDirect
   const manifest = await readJson(path.join(directory, "latest.json"));
   validateUpdaterManifest(manifest, release, signatures);
   const releases = await client.list("/releases");
+  const latestStable = publishedReleases(releases, "stable")[0];
+  if (githubRelease.draft && channel === "nightly" && latestStable
+    && compareVersions(release.version, latestStable.tag_name.slice(1)) <= 0) {
+    throw new Error("Bump main's upcoming stable version before publishing another nightly.");
+  }
   const latest = publishedReleases(releases, channel)[0];
   if (latest && compareVersions(latest.tag_name.slice(1), release.version) > 0) throw new Error("A newer release is already published; channel regression is refused.");
   if (githubRelease.draft) await client.request(`/releases/${githubRelease.id}`, { method: "PATCH", body: { draft: false, make_latest: channel === "stable" ? "true" : "false" } });

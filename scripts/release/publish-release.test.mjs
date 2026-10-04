@@ -85,6 +85,36 @@ describe("verified release publication", () => {
     expect(client.request).toHaveBeenCalledWith("/releases/1", { method: "PATCH", body: { draft: false, make_latest: "false" } });
   });
 
+  it.each(["v0.1.0", "v0.2.0"])("refuses a nightly draft when stable %s was published during its build", async (tag) => {
+    const a = fakeGitHub(nightly, { id: 1 });
+    const b = fakeGitHub(planRelease({ ...source, version: tag.slice(1), sourceRef: `refs/tags/${tag}`, tag }), { published: true, id: 2 });
+    const client = {
+      request: (url, options) => (url.startsWith("/releases/assets/") && Number(url.split("/").at(-1)) >= 200 ? b.client : a.client).request(url, options),
+      list: (url) => url === "/releases" ? [a.githubRelease, b.githubRelease] : (url.includes("/releases/2/") ? b.client : a.client).list(url),
+    };
+    await expect(publishRelease(client, nightly.tag, "nightly", directory, path.join(directory, "updates"))).rejects.toThrow(/before publishing another nightly/);
+    expect(a.client.request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
+    expect(fetch).not.toHaveBeenCalled();
+    await expect(readJson(path.join(directory, "updates/nightly.json"))).rejects.toThrow();
+  });
+
+  it.each([
+    { version: "0.2.0", published: false },
+    { version: "0.1.0", published: true },
+  ])("allows a newer-base nightly or repairs an already-published nightly ($version, published=$published)", async ({ version, published }) => {
+    const release = planRelease({ ...source, version, sourceRef: "refs/heads/main", runNumber: "10" });
+    const a = fakeGitHub(release, { published, id: 1 });
+    const b = fakeGitHub(stable, { published: true, id: 2 });
+    const client = {
+      request: (url, options) => (url.startsWith("/releases/assets/") && Number(url.split("/").at(-1)) >= 200 ? b.client : a.client).request(url, options),
+      list: (url) => url === "/releases" ? [a.githubRelease, b.githubRelease] : (url.includes("/releases/2/") ? b.client : a.client).list(url),
+    };
+    await publishRelease(client, release.tag, "nightly", directory, path.join(directory, "updates"));
+    expect(a.client.request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(!published);
+    expect((await readJson(path.join(directory, "updates/nightly.json"))).version).toBe(release.version);
+    expect((await readJson(path.join(directory, "updates/stable.json"))).version).toBe(stable.version);
+  });
+
   it.each([
     { options: { missing: "repola-agent-aarch64-unknown-linux-gnu.sig" }, error: /incomplete/ },
     { options: { corruptManifest: true }, error: /unexpected URL/ },
