@@ -950,11 +950,20 @@ fn discard_tracked_path(
     change: &FileChange,
     current: OsString,
 ) -> Result<(), String> {
-    if change.submodule && absent_from_head(change) {
+    // Rename and copy records report HEAD's mode for the original path, so only
+    // ordinary records can name a path HEAD lacks.
+    let addition = !matches!(
+        change.kind,
+        FileChangeKind::Renamed | FileChangeKind::Copied
+    ) && absent_from_head(change);
+    if addition && change.submodule {
         return Err(
             "Repola does not delete a newly added submodule. Remove its repository explicitly."
                 .into(),
         );
+    }
+    if addition && change.worktree_status != "D" {
+        return remove_staged_addition(worktree, current);
     }
     let previous = change
         .previous_path
@@ -976,9 +985,6 @@ fn discard_tracked_path(
     let output = command::git_at(worktree, reset).map_err(|error| error.to_string())?;
     ensure_success(output, "reset the selected path in the index")?;
 
-    // Once the index matches HEAD, `git restore --worktree` can only bring back
-    // a path HEAD records; a path HEAD lacks is removed instead. Rename and copy
-    // records report HEAD's mode for the original path, so they decide by kind.
     match change.kind {
         FileChangeKind::Copied => clean_path(worktree, current),
         FileChangeKind::Renamed => {
@@ -987,10 +993,10 @@ fn discard_tracked_path(
             restore_worktree_path(worktree, previous)?;
             clean_path(worktree, current)
         }
-        // A deleted addition leaves nothing of its own on disk. Whatever now
-        // occupies the path, such as a directory, is not part of this change.
-        _ if absent_from_head(change) && change.worktree_status == "D" => Ok(()),
-        _ if absent_from_head(change) => remove_unstaged_addition(worktree, current),
+        // An addition deleted from disk leaves nothing of its own there, so
+        // unstaging it is the whole discard. Whatever now occupies the path,
+        // such as a directory, is not part of this change.
+        _ if addition => Ok(()),
         _ => restore_worktree_path(worktree, current),
     }
 }
@@ -1000,32 +1006,53 @@ fn absent_from_head(change: &FileChange) -> bool {
     change.head_mode.as_deref() == Some("000000")
 }
 
-/// Removes the single file an unstaged addition leaves behind. The path names
-/// a file or symlink, never a directory, so the literal pathspec matches it
-/// alone; `-x` still removes it when an ignore rule covers it, as with a file
-/// that was force-added.
-fn remove_unstaged_addition(worktree: &Path, path: OsString) -> Result<(), String> {
+/// Removes a staged addition's index entry and file in one step. `git rm`
+/// deletes only that entry, regardless of ignore rules, and fails without
+/// changing anything when a directory has replaced the file since the
+/// snapshot. It does follow a leading directory that became a symlink, so the
+/// path is revalidated first.
+fn remove_staged_addition(worktree: &Path, path: OsString) -> Result<(), String> {
+    ensure_entry_inside_worktree(worktree, Path::new(&path))?;
     let mut pathspec = OsString::from(":(literal)");
     pathspec.push(&path);
     let output = command::git_at(
         worktree,
         [
-            OsString::from("clean"),
+            OsString::from("rm"),
             OsString::from("-f"),
-            OsString::from("-x"),
+            OsString::from("--quiet"),
             OsString::from("--"),
             pathspec,
         ],
     )
     .map_err(|error| error.to_string())?;
-    ensure_success(output, "remove the selected added path")?;
-    match fs::symlink_metadata(worktree.join(&path)) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => Err(
-            "The added path was unstaged, but Git left it on disk. Remove it explicitly.".into(),
-        ),
-        Err(error) => Err(error.to_string()),
+    ensure_success(output, "remove the selected added path")
+}
+
+/// Confirms a relative path still reaches a non-directory entry through real
+/// directories, so no symlink or junction can redirect a removal outside the
+/// worktree.
+fn ensure_entry_inside_worktree(worktree: &Path, relative: &Path) -> Result<(), String> {
+    let changed = || "The selected path changed on disk. Refresh and try again.".to_string();
+    if relative.as_os_str().is_empty() {
+        return Err(changed());
     }
+    let mut entry = worktree.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(changed());
+        };
+        entry.push(name);
+        let file_type = fs::symlink_metadata(&entry)
+            .map_err(|_| changed())?
+            .file_type();
+        let leaf = components.peek().is_none();
+        if file_type.is_dir() == leaf {
+            return Err(changed());
+        }
+    }
+    Ok(())
 }
 
 fn restore_worktree_path(worktree: &Path, path: OsString) -> Result<(), String> {
@@ -4101,6 +4128,83 @@ mod tests {
         );
         assert!(!repository.path().join("[x].txt").exists());
         assert!(!repository.path().join("forced.log").exists());
+    }
+
+    /// Snapshots one staged addition so a test can change the disk afterwards,
+    /// standing in for another process acting between revalidation and removal.
+    fn staged_addition(repository: &Path, name: &str) -> FileChange {
+        working_copy_snapshot(request(repository))
+            .expect("snapshot")
+            .changes
+            .into_iter()
+            .find(|change| change.path.display == name)
+            .expect("staged addition")
+    }
+
+    #[test]
+    fn removing_an_addition_never_deletes_a_directory_that_replaced_it() {
+        let repository = repository();
+        command::successful_git_at(repository.path(), ["commit", "--allow-empty", "-m", "base"])
+            .expect("commit");
+        std::fs::write(repository.path().join("swapped"), "staged\n").expect("new file");
+        command::successful_git_at(repository.path(), ["add", "swapped"]).expect("stage");
+        std::fs::write(repository.path().join("swapped"), "staged\nedited\n").expect("edit");
+        let change = staged_addition(repository.path(), "swapped");
+        std::fs::remove_file(repository.path().join("swapped")).expect("remove file");
+        std::fs::create_dir(repository.path().join("swapped")).expect("directory");
+        std::fs::write(repository.path().join("swapped/unreviewed.txt"), "keep\n")
+            .expect("unreviewed file");
+
+        let error = discard_tracked_path(
+            repository.path(),
+            &change,
+            path_from_token(&change.path.token).expect("path"),
+        )
+        .expect_err("directory replaced the addition");
+        assert!(error.contains("changed on disk"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("swapped/unreviewed.txt"))
+                .expect("unreviewed file kept"),
+            "keep\n"
+        );
+        assert_eq!(
+            git_text(repository.path(), ["diff", "--cached", "--name-only"]).expect("index"),
+            "swapped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_an_addition_never_follows_a_parent_replaced_by_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let repository = repository();
+        let outside = tempfile::tempdir().expect("outside directory");
+        std::fs::write(outside.path().join("file.txt"), "outside\n").expect("outside file");
+        command::successful_git_at(repository.path(), ["commit", "--allow-empty", "-m", "base"])
+            .expect("commit");
+        std::fs::create_dir(repository.path().join("parent")).expect("parent");
+        std::fs::write(repository.path().join("parent/file.txt"), "staged\n").expect("new file");
+        command::successful_git_at(repository.path(), ["add", "parent/file.txt"]).expect("stage");
+        std::fs::write(
+            repository.path().join("parent/file.txt"),
+            "staged\nedited\n",
+        )
+        .expect("edit");
+        let change = staged_addition(repository.path(), "parent/file.txt");
+        std::fs::remove_dir_all(repository.path().join("parent")).expect("remove parent");
+        symlink(outside.path(), repository.path().join("parent")).expect("symlinked parent");
+
+        let error = discard_tracked_path(
+            repository.path(),
+            &change,
+            path_from_token(&change.path.token).expect("path"),
+        )
+        .expect_err("symlinked parent");
+        assert!(error.contains("changed on disk"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("file.txt")).expect("outside file kept"),
+            "outside\n"
+        );
     }
 
     #[test]
