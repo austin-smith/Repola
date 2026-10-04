@@ -87,10 +87,12 @@ export default function DiscardDialog({ machineId, machineKind, repositoryPath, 
     }
   };
 
+  const total = plan ? plan.entries.length + plan.omitted : 0;
+  const keptTotal = plan ? plan.kept.length + plan.keptOmitted : 0;
   const title = change
     ? "Discard changes to this file?"
     : plan
-      ? `Discard ${plan.entries.length} changed file${plan.entries.length === 1 ? "" : "s"}?`
+      ? `Discard ${total} changed file${total === 1 ? "" : "s"}?`
       : "Discard all changes?";
 
   return (
@@ -130,16 +132,22 @@ export default function DiscardDialog({ machineId, machineKind, repositoryPath, 
                   <span className="shrink-0 text-muted-foreground">{discardEffectLabel(entry)}</span>
                 </div>
               ))}
+              {plan.omitted > 0 ? (
+                <p className="px-3 py-1.5 text-xs text-muted-foreground">
+                  {plan.omitted} more path{plan.omitted === 1 ? " is" : "s are"} too many to list here; the discard covers {plan.omitted === 1 ? "it" : "them"} too.
+                </p>
+              ) : null}
             </section>
-            {plan.kept.length > 0 ? (
+            {keptTotal > 0 ? (
               <Alert>
-                <AlertTitle>Left unchanged ({plan.kept.length})</AlertTitle>
+                <AlertTitle>Left unchanged ({keptTotal})</AlertTitle>
                 <AlertDescription>
                   <p>Repola leaves these alone, for the reason given with each.</p>
                   <ul className="mt-1.5 flex flex-col gap-1">
                     {plan.kept.map((kept) => (
                       <li key={kept.path.token}><code className="font-mono">{kept.path.display}</code> · {keptReasonLabel(kept.reason)}</li>
                     ))}
+                    {plan.keptOmitted > 0 ? <li>and {plan.keptOmitted} more</li> : null}
                   </ul>
                 </AlertDescription>
               </Alert>

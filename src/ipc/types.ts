@@ -372,6 +372,10 @@ export interface KeptChange {
 
 export interface DiscardPlan {
   target: DiscardTarget;
+  /** Paths the discard changes beyond `entries`, which lists as many as fit in one response. */
+  omitted: number;
+  /** Paths left alone beyond `kept`. */
+  keptOmitted: number;
   entries: DiscardPlanEntry[];
   kept: KeptChange[];
   /** Working-tree bytes the recovery point adds to the repository's object store. */

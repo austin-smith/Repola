@@ -17,9 +17,10 @@ use super::models::{
     RecoveryPointKind, WorkingCopyRequest, WorkingCopySnapshot,
 };
 use super::recovery::{
-    create_recovery_point, file_folder_conflict, fingerprint, head_entries, observe_paths,
-    prepare_recovery_point, push_index_info, remove_empty_directory, remove_worktree_entry,
-    store_contents, stored_bytes, HeadEntry, PathState, Removals, CHANGED_WHILE_SAVING,
+    create_recovery_point, file_folder_conflict, fingerprint, head_entries, keep_within,
+    observe_paths, prepare_recovery_point, push_index_info, remove_empty_directory,
+    remove_worktree_entry, store_contents, stored_bytes, HeadEntry, PathState, Removals,
+    CHANGED_WHILE_SAVING, MAX_LISTED_BYTES,
 };
 use super::working_copy::{decode_path_token_bytes, ensure_success, working_copy_snapshot};
 
@@ -457,12 +458,19 @@ pub fn plan_discard(request: DiscardPlanRequest) -> Result<DiscardPlan, String> 
         repository_path: request.repository_path,
         worktree_path: request.worktree_path,
     })?;
-    let planned = plan(&snapshot, &request.target)?;
+    let mut planned = plan(&snapshot, &request.target)?;
+    // Only as much as one response carries is listed; the fingerprint still
+    // covers the whole plan.
+    let mut budget = MAX_LISTED_BYTES;
+    let omitted = keep_within(&mut planned.entries, &mut budget)?;
+    let kept_omitted = keep_within(&mut planned.kept, &mut budget)?;
     Ok(DiscardPlan {
         target: request.target,
         backup_bytes: stored_bytes(&planned.states),
         entries: planned.entries,
+        omitted,
         kept: planned.kept,
+        kept_omitted,
         fingerprint: planned.fingerprint,
     })
 }

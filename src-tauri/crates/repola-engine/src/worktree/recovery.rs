@@ -46,8 +46,8 @@ pub(super) const CHANGED_WHILE_SAVING: &str =
     "The working copy changed while Repola was saving it. Nothing was changed; review it again.";
 /// Summaries read per Git invocation: at most 16 MiB, half the capture limit.
 const SUMMARIES_PER_READ: usize = 256;
-/// Listed points per response: half of what one SSH protocol frame carries.
-const MAX_LISTED_BYTES: usize = 8 * 1024 * 1024;
+/// Listed items per response: half of what one SSH protocol frame carries.
+pub(super) const MAX_LISTED_BYTES: usize = 8 * 1024 * 1024;
 /// Content hashed per Git process, well within the per-command time limit even
 /// when every byte is written to the object store.
 const HASH_CHUNK_BYTES: u64 = 1024 * 1024 * 1024;
@@ -1220,19 +1220,28 @@ pub fn list_recovery_points(request: WorkingCopyRequest) -> Result<RecoveryPoint
     let snapshot = working_copy_snapshot(request)?;
     let mut points = list(Path::new(&snapshot.worktree_path))?;
     let mut budget = MAX_LISTED_BYTES;
+    let omitted = keep_within(&mut points, &mut budget)?;
+    Ok(RecoveryPointList { points, omitted })
+}
+
+/// Keeps the leading `items` that fit in `budget` bytes once encoded, takes
+/// their size from it, and returns how many were left out.
+pub(super) fn keep_within<T: Serialize>(
+    items: &mut Vec<T>,
+    budget: &mut usize,
+) -> Result<u64, String> {
     let mut fits = 0;
-    for point in &points {
-        let size = serde_json::to_vec(point)
+    for item in items.iter() {
+        let size = serde_json::to_vec(item)
             .map_err(|error| error.to_string())?
             .len();
-        if size > budget {
+        if size > *budget {
             break;
         }
-        budget -= size;
+        *budget -= size;
         fits += 1;
     }
-    let omitted = points.split_off(fits).len() as u64;
-    Ok(RecoveryPointList { points, omitted })
+    Ok(items.split_off(fits).len() as u64)
 }
 
 fn list(worktree: &Path) -> Result<Vec<RecoveryPoint>, String> {
@@ -1518,18 +1527,7 @@ pub fn plan_recovery_restore(request: RecoveryPointRequest) -> Result<RecoveryRe
         .collect();
     // Only as many entries as one response carries; the rest are counted.
     let mut budget = MAX_LISTED_BYTES;
-    let mut fits = 0;
-    for entry in &entries {
-        let size = serde_json::to_vec(entry)
-            .map_err(|error| error.to_string())?
-            .len();
-        if size > budget {
-            break;
-        }
-        budget -= size;
-        fits += 1;
-    }
-    let omitted = entries.split_off(fits).len() as u64;
+    let omitted = keep_within(&mut entries, &mut budget)?;
     Ok(RecoveryRestorePlan {
         fingerprint: fingerprint(
             snapshot.head.as_deref(),
@@ -3256,6 +3254,19 @@ mod tests {
         .expect("preview");
         assert!(diff.truncated);
         assert!(diff.patch.is_empty());
+    }
+
+    #[test]
+    fn lists_keep_what_one_budget_carries_and_count_the_rest() {
+        // Each string encodes to its length plus two quotes.
+        let mut budget = 25;
+        let mut first = vec!["aaaaaaaa".to_string(); 3];
+        assert_eq!(keep_within(&mut first, &mut budget).expect("first"), 1);
+        assert_eq!(first.len(), 2);
+        assert_eq!(budget, 5);
+        let mut second = vec!["bbb".to_string(), "c".to_string()];
+        assert_eq!(keep_within(&mut second, &mut budget).expect("second"), 1);
+        assert_eq!(second, ["bbb"]);
     }
 
     #[test]

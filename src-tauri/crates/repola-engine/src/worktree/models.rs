@@ -726,8 +726,14 @@ pub struct DiscardPlanRequest {
 #[serde(rename_all = "camelCase")]
 pub struct DiscardPlan {
     pub target: DiscardTarget,
+    /// As many entries as fit in one response.
     pub entries: Vec<DiscardPlanEntry>,
+    /// Paths the discard changes beyond `entries`.
+    pub omitted: u64,
+    /// As many as fit in one response.
     pub kept: Vec<KeptChange>,
+    /// Paths left alone beyond `kept`.
+    pub kept_omitted: u64,
     /// Working-tree bytes the recovery point adds to the object store.
     pub backup_bytes: u64,
     pub fingerprint: String,

@@ -518,7 +518,7 @@ export function ChangesWorkbench() {
   const completeDiscard = (result: DiscardResult, plan: DiscardPlan) => {
     setPendingDiscard(null);
     const point = result.recoveryPoint;
-    const kept = plan.kept.length;
+    const kept = plan.kept.length + plan.keptOmitted;
     const show: ShowRecoveryPoint = { machineId, worktreePath: worktree.path, pointId: point.id };
     toast.add({
       type: "success",

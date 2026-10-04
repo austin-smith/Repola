@@ -37,7 +37,9 @@ function plan(overrides: Partial<DiscardPlan> = {}): DiscardPlan {
       { path: change.path, effect: "restoreCommitted", onDisk: true, tracked: true },
       { path: { display: "notes.txt", token: "6e6f7465732e747874" }, effect: "remove", onDisk: true, tracked: false },
     ],
+    omitted: 0,
     kept: [],
+    keptOmitted: 0,
     backupBytes: 2048,
     fingerprint: "fingerprint-1",
     ...overrides,
@@ -124,6 +126,15 @@ describe("DiscardDialog", () => {
     expect(await screen.findByText(/changed after this discard was reviewed/)).toBeInTheDocument();
     await waitFor(() => expect(ipc.planDiscard).toHaveBeenCalledTimes(2));
     expect(onDiscarded).not.toHaveBeenCalled();
+  });
+
+  it("counts the paths a large discard covers beyond those it lists", async () => {
+    ipc.planDiscard.mockResolvedValue(plan({ omitted: 3, kept: [{ path: { display: "vendor", token: "76656e646f72" }, reason: "submodule" }], keptOmitted: 2 }));
+    renderDialog();
+    expect(await screen.findByRole("heading", { name: "Discard 5 changed files?" })).toBeInTheDocument();
+    expect(screen.getByText("3 more paths are too many to list here; the discard covers them too.")).toBeInTheDocument();
+    expect(screen.getByText("Left unchanged (3)")).toBeInTheDocument();
+    expect(screen.getByText("and 2 more")).toBeInTheDocument();
   });
 
   it("still reports a failure that arrives after the dialog closed", async () => {
