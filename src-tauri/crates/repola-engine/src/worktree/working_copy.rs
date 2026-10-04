@@ -1021,8 +1021,6 @@ fn absent_from_head(change: &FileChange) -> bool {
 /// path is revalidated first.
 fn remove_staged_addition(worktree: &Path, path: OsString) -> Result<(), String> {
     ensure_entry_inside_worktree(worktree, Path::new(&path))?;
-    let mut pathspec = OsString::from(":(literal)");
-    pathspec.push(&path);
     let output = command::git_at(
         worktree,
         [
@@ -1030,7 +1028,7 @@ fn remove_staged_addition(worktree: &Path, path: OsString) -> Result<(), String>
             OsString::from("-f"),
             OsString::from("--quiet"),
             OsString::from("--"),
-            pathspec,
+            literal_pathspec(path),
         ],
     )
     .map_err(|error| error.to_string())?;
@@ -4134,13 +4132,19 @@ mod tests {
         std::fs::write(repository.path().join("[x].txt"), "changed\n").expect("modify");
         command::successful_git_at(repository.path(), ["mv", "old.txt", "[n].txt"]).expect("mv");
         std::fs::write(repository.path().join("n.txt"), "keep\n").expect("untracked neighbour");
+        for name in ["[a].txt", "a.txt"] {
+            std::fs::write(repository.path().join(name), "added\n").expect("addition");
+        }
+        command::successful_git_at(repository.path(), ["add", "--", "[a].txt", "a.txt"])
+            .expect("stage additions");
 
         let snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
         discard_named(snapshot, "[x].txt", DiscardScope::Unstaged);
         std::fs::write(repository.path().join("[x].txt"), "changed again\n").expect("modify");
         let snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
         let snapshot = discard_named(snapshot, "[x].txt", DiscardScope::All);
-        discard_named(snapshot, "[n].txt", DiscardScope::All);
+        let snapshot = discard_named(snapshot, "[n].txt", DiscardScope::All);
+        let snapshot = discard_named(snapshot, "[a].txt", DiscardScope::All);
 
         assert_eq!(
             std::fs::read_to_string(repository.path().join("[x].txt")).expect("restored"),
@@ -4160,6 +4164,12 @@ mod tests {
             std::fs::read_to_string(repository.path().join("n.txt")).expect("neighbour"),
             "keep\n"
         );
+        assert!(!repository.path().join("[a].txt").exists());
+        assert!(repository.path().join("a.txt").is_file());
+        assert!(snapshot
+            .changes
+            .iter()
+            .any(|change| change.path.display == "a.txt" && change.staged));
     }
 
     #[test]
