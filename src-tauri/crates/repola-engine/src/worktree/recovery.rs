@@ -48,6 +48,9 @@ const SUMMARIES_PER_READ: usize = 256;
 const MAX_LISTED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RECOVERY_ID_BYTES: usize = 128;
 /// Paths per Git invocation stay well inside the Windows command-line limit.
+/// No single path may exceed it, since a path is never split across chunks;
+/// UTF-8 is never shorter than the UTF-16 Windows counts, so one that fits in
+/// bytes fits there too.
 const ARGUMENT_BUDGET_BYTES: usize = 16 * 1024;
 /// Either side of a restore preview larger than this is not diffed.
 const MAX_PREVIEW_SIDE_BYTES: u64 = 8 * 1024 * 1024;
@@ -210,6 +213,12 @@ impl WorktreePath {
         let unsafe_path = || format!("{} is not a safe path inside a working copy.", path.display);
         if bytes.is_empty() || bytes.contains(&0) {
             return Err(unsafe_path());
+        }
+        if bytes.len() > ARGUMENT_BUDGET_BYTES {
+            return Err(format!(
+                "{} is too long a path for Repola to save. Rename it, or change it with Git instead.",
+                path.display
+            ));
         }
         let mut components = Vec::new();
         for component in bytes.split(|byte| *byte == b'/') {
@@ -2459,6 +2468,18 @@ mod tests {
         newest.truncate(list.points.len());
         let listed: Vec<String> = list.points.into_iter().map(|point| point.id).collect();
         assert_eq!(listed, newest);
+    }
+
+    #[test]
+    fn a_path_too_long_for_one_command_line_is_refused() {
+        let (_directory, path) = repository();
+        let fits = "d/".repeat(ARGUMENT_BUDGET_BYTES / 2 - 1) + "f";
+        assert_eq!(fits.len(), ARGUMENT_BUDGET_BYTES - 1);
+        observe_paths(&path, None, &[git_path(fits.as_bytes())], false).expect("observe");
+        let long = fits + "/x";
+        let error =
+            observe_paths(&path, None, &[git_path(long.as_bytes())], false).expect_err("too long");
+        assert!(error.contains("too long a path"), "{error}");
     }
 
     #[test]
