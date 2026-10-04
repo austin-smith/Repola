@@ -433,6 +433,14 @@ mod tests {
                     remote: Some("origin".into()),
                     remote_ref: Some("refs/heads/feature".into()),
                     remote_oid: Some("a".repeat(40)),
+                    local_exclusive_commits: Some(crate::worktree::CommitCount {
+                        count: 0,
+                        capped: false,
+                    }),
+                    remote_exclusive_commits: Some(crate::worktree::CommitCount {
+                        count: 2,
+                        capped: false,
+                    }),
                     confirmation: crate::worktree::BranchDeletionConfirmation::TypeBranchName,
                 },
                 typed_confirmation: Some("feature".into()),
@@ -450,11 +458,22 @@ mod tests {
             "typeBranchName"
         );
         assert_eq!(value["request"]["typedConfirmation"], "feature");
+        assert_eq!(
+            value["request"]["expected"]["remoteExclusiveCommits"]["count"],
+            2
+        );
         let decoded: AgentRequest = serde_json::from_value(value).expect("decode request");
         let AgentRequest::ExecuteBranchDeletion { request: decoded } = decoded else {
             panic!("wrong request type")
         };
         assert_eq!(decoded.expected.remote.as_deref(), Some("origin"));
+        assert_eq!(
+            decoded.expected.remote_exclusive_commits,
+            Some(crate::worktree::CommitCount {
+                count: 2,
+                capped: false,
+            })
+        );
         assert!(decoded.request.delete_local);
     }
 

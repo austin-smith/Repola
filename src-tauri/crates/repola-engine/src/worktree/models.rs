@@ -1122,7 +1122,19 @@ pub struct BranchDeletionFingerprint {
     pub remote: Option<String>,
     pub remote_ref: Option<String>,
     pub remote_oid: Option<String>,
+    /// The commits the local deletion would leave unreachable, as reviewed.
+    pub local_exclusive_commits: Option<CommitCount>,
+    /// The commits the remote deletion would leave unreachable, as reviewed.
+    pub remote_exclusive_commits: Option<CommitCount>,
     pub confirmation: BranchDeletionConfirmation,
+}
+
+/// A commit count that stops at a limit, recording whether it got there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitCount {
+    pub count: u64,
+    pub capped: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

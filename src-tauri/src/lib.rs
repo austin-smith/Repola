@@ -1702,6 +1702,8 @@ mod audit_tests {
                 remote: Some("origin".into()),
                 remote_ref: Some("refs/heads/feature".into()),
                 remote_oid: Some("c".repeat(40)),
+                local_exclusive_commits: None,
+                remote_exclusive_commits: None,
                 confirmation: BranchDeletionConfirmation::TypeBranchName,
             },
             typed_confirmation: Some("feature".into()),

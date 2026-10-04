@@ -618,7 +618,17 @@ export interface BranchDeletionFingerprint {
   remote: string | null;
   remoteRef: string | null;
   remoteOid: string | null;
+  /** The commits the local deletion would leave unreachable, as reviewed. */
+  localExclusiveCommits: CommitCount | null;
+  /** The commits the remote deletion would leave unreachable, as reviewed. */
+  remoteExclusiveCommits: CommitCount | null;
   confirmation: BranchDeletionConfirmation;
+}
+
+/** A commit count that stops at a limit, recording whether it got there. */
+export interface CommitCount {
+  count: number;
+  capped: boolean;
 }
 
 export interface BranchDeletionPlan {

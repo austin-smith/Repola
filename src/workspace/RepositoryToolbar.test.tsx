@@ -221,6 +221,8 @@ describe("RepositoryToolbar", () => {
         remote: null,
         remoteRef: null,
         remoteOid: null,
+        localExclusiveCommits: null,
+        remoteExclusiveCommits: null,
         confirmation: "confirm",
       },
     };

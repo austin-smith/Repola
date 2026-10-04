@@ -25,6 +25,8 @@ function plan(overrides: Partial<BranchDeletionPlan>): BranchDeletionPlan {
       remote: null,
       remoteRef: null,
       remoteOid: null,
+      localExclusiveCommits: null,
+      remoteExclusiveCommits: null,
       confirmation: "confirm",
     },
     ...overrides,

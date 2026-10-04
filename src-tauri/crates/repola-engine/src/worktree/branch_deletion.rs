@@ -1,11 +1,11 @@
 //! Reviewed deletion of a local branch, its remote branch, or both.
 //!
 //! Planning is read-only and never fetches. Execution plans again, requires the
-//! reviewed fingerprint to be unchanged, asks the remote which branch is its
-//! default before deleting anything there, and deletes the local branch first: a
-//! refusing `branch -d` then leaves the remote untouched, and the upstream that
-//! `-d` checks still exists. The remote branch is deleted last under a push lease
-//! pinned to the reviewed remote-tracking value.
+//! reviewed fingerprint to be unchanged, asks every URL the remote pushes to
+//! which branch is its default before deleting anything, and deletes the local
+//! branch first: a refusing `branch -d` then leaves the remote untouched, and the
+//! upstream that `-d` checks still exists. The remote branch is deleted last
+//! under a push lease pinned to the reviewed remote-tracking value.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -17,7 +17,7 @@ use super::discovery::{list_worktrees, repository_context};
 use super::models::{
     BranchDeletionConfirmation, BranchDeletionExecutionRequest, BranchDeletionFingerprint,
     BranchDeletionPlan, BranchDeletionRequest, BranchDeletionResult, BranchDeletionStep,
-    LocalBranchDeletion, MergeReferenceKind, RemoteBranchDeletion, WorkingCopyRequest,
+    CommitCount, LocalBranchDeletion, MergeReferenceKind, RemoteBranchDeletion, WorkingCopyRequest,
     WorkingCopySnapshot,
 };
 use super::working_copy::working_copy_snapshot;
@@ -257,6 +257,14 @@ fn review(request: BranchDeletionRequest) -> Result<Review, String> {
         remote: selected_remote.map(|remote| remote.remote.clone()),
         remote_ref: selected_remote.map(|remote| remote.remote_ref.clone()),
         remote_oid: selected_remote.map(|remote| remote.expected_oid.clone()),
+        local_exclusive_commits: local.as_ref().map(|local| CommitCount {
+            count: local.exclusive_commit_count,
+            capped: local.exclusive_commit_count_capped,
+        }),
+        remote_exclusive_commits: selected_remote.map(|remote| CommitCount {
+            count: remote.exclusive_commit_count,
+            capped: remote.exclusive_commit_count_capped,
+        }),
         confirmation,
     };
 
@@ -489,9 +497,10 @@ fn has_branch_config(worktree: &Path, name: &str) -> Result<bool, String> {
     }))
 }
 
-/// Asks the remote which branch its HEAD names, because the local
-/// `refs/remotes/<remote>/HEAD` can be missing or stale. Refuses when the remote
-/// cannot answer, or answers without naming a branch.
+/// Asks every URL the remote deletion pushes to which branch its HEAD names,
+/// because the local `refs/remotes/<remote>/HEAD` can be missing or stale, and
+/// the push can go to `pushurl`s rather than the URL that was fetched. Refuses
+/// when any of them cannot answer, or answers without naming a branch.
 ///
 /// This is a check, not a lock: a push cannot be made conditional on the
 /// remote's HEAD, so only the server can make this protection atomic.
@@ -502,17 +511,42 @@ fn confirm_not_remote_default(
     let output = command::git_at(
         worktree,
         [
-            "ls-remote",
-            "--symref",
+            "remote",
+            "get-url",
+            "--push",
+            "--all",
             "--",
             remote.remote.as_str(),
-            "HEAD",
         ],
     )
     .map_err(|error| error.to_string())?;
+    let urls = String::from_utf8_lossy(&output.stdout);
+    let urls: Vec<&str> = urls.lines().filter(|url| !url.is_empty()).collect();
+    if !output.status.success() || urls.is_empty() {
+        return Err(format!(
+            "Could not find where {} pushes, so nothing was deleted. {}",
+            remote.remote,
+            combined_output(&output.stdout, &output.stderr)
+        )
+        .trim()
+        .to_string());
+    }
+    for url in urls {
+        confirm_not_default_at(worktree, remote, url)?;
+    }
+    Ok(())
+}
+
+fn confirm_not_default_at(
+    worktree: &Path,
+    remote: &RemoteBranchDeletion,
+    url: &str,
+) -> Result<(), String> {
+    let output = command::git_at(worktree, ["ls-remote", "--symref", "--", url, "HEAD"])
+        .map_err(|error| error.to_string())?;
     if !output.status.success() {
         return Err(format!(
-            "Could not ask {} which branch is its default, so nothing was deleted. {}",
+            "Could not ask {} at {url} which branch is its default, so nothing was deleted. {}",
             remote.remote,
             combined_output(&output.stdout, &output.stderr)
         )
@@ -521,12 +555,12 @@ fn confirm_not_remote_default(
     }
     match parse_remote_head(&String::from_utf8_lossy(&output.stdout)) {
         RemoteHead::Branch(target) if target == remote.remote_ref => Err(format!(
-            "{} is the default branch of {}. Repola does not delete a remote's default branch.",
+            "{} is the default branch of {} at {url}. Repola does not delete a remote's default branch.",
             remote.display_name, remote.remote
         )),
         RemoteHead::Branch(_) | RemoteHead::Absent => Ok(()),
         RemoteHead::Unnamed => Err(format!(
-            "{} did not say which branch is its default, so nothing was deleted.",
+            "{} at {url} did not say which branch is its default, so nothing was deleted.",
             remote.remote
         )),
     }
@@ -1507,6 +1541,67 @@ mod tests {
         let error = execute(&plan, None).expect_err("the remote reports main as its default");
         assert!(error.contains("default branch"), "{error}");
         assert!(fixture.remote_has_branch("main"));
+    }
+
+    #[test]
+    fn the_default_branch_is_checked_where_the_deletion_pushes() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "topic"]);
+        git(&fixture.repository, &["push", "origin", "topic"]);
+        let mirror = fixture.root.join("mirror.git");
+        git(
+            &fixture.root,
+            &["clone", "--bare", path(&fixture.remote), path(&mirror)],
+        );
+        git(&mirror, &["symbolic-ref", "HEAD", "refs/heads/topic"]);
+        git(
+            &fixture.repository,
+            &["config", "remote.origin.pushurl", path(&mirror)],
+        );
+        let plan = fixture.plan("refs/remotes/origin/topic", false, true);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+
+        let error = execute(&plan, None).expect_err("topic is the push destination's default");
+        assert!(error.contains("default branch"), "{error}");
+        assert!(error.contains(path(&mirror)), "{error}");
+        let kept = command::git_at(
+            &mirror,
+            ["show-ref", "--verify", "--quiet", "refs/heads/topic"],
+        )
+        .expect("show-ref on the push destination");
+        assert!(kept.status.success());
+    }
+
+    #[test]
+    fn a_review_is_refused_once_more_commits_would_become_unreachable() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["switch", "--create", "feature"]);
+        commit(&fixture.repository, "also kept by another branch");
+        git(&fixture.repository, &["branch", "keeper"]);
+        commit(&fixture.repository, "only on feature");
+        git(&fixture.repository, &["switch", "main"]);
+        let plan = fixture.plan("refs/heads/feature", true, false);
+        assert!(plan.requires_force);
+        assert_eq!(
+            plan.fingerprint.local_exclusive_commits,
+            Some(CommitCount {
+                count: 1,
+                capped: false
+            })
+        );
+
+        // Nothing about feature itself changes, but deleting it would now lose
+        // a commit the review never reported.
+        git(
+            &fixture.repository,
+            &["branch", "--delete", "--force", "keeper"],
+        );
+        let error = execute(&plan, Some("feature")).expect_err("the loss grew after review");
+        assert!(
+            error.contains("changed after this deletion was reviewed"),
+            "{error}"
+        );
+        assert!(fixture.has_ref("refs/heads/feature"));
     }
 
     #[test]
