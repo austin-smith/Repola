@@ -1,11 +1,12 @@
 //! Reviewed deletion of a local branch, its remote branch, or both.
 //!
 //! Planning is read-only and never fetches. Execution plans again, requires the
-//! reviewed fingerprint to be unchanged, asks every URL the remote pushes to
-//! which branch is its default before deleting anything, and deletes the local
-//! branch first: a refusing `branch -d` then leaves the remote untouched, and the
-//! upstream that `-d` checks still exists. The remote branch is deleted last
-//! under a push lease pinned to the reviewed remote-tracking value.
+//! reviewed fingerprint to be unchanged, asks the URL the remote deletion pushes
+//! to which branch is its default before deleting anything, checks once more
+//! that no worktree uses the local branch, and deletes the local branch first: a
+//! refusing `branch -d` then leaves the remote untouched, and the upstream that
+//! `-d` checks still exists. The remote branch is deleted last under a push lease
+//! pinned to the reviewed remote-tracking value.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,17 +14,54 @@ use std::time::UNIX_EPOCH;
 
 use super::command;
 use super::command_display::git_command_line;
-use super::discovery::{list_worktrees, repository_context};
+use super::discovery::{list_worktrees, native_path, repository_context};
 use super::models::{
     BranchDeletionConfirmation, BranchDeletionExecutionRequest, BranchDeletionFingerprint,
     BranchDeletionPlan, BranchDeletionRequest, BranchDeletionResult, BranchDeletionStep,
-    CommitCount, LocalBranchDeletion, MergeReferenceKind, RemoteBranchDeletion, WorkingCopyRequest,
-    WorkingCopySnapshot,
+    CommitCount, LocalBranchDeletion, MergeReferenceKind, RemoteBranchDeletion, RepositoryContext,
+    WorkingCopyRequest, WorkingCopySnapshot,
 };
 use super::working_copy::working_copy_snapshot;
 
 /// Counting stops here so a deletion review stays bounded on very deep histories.
 const EXCLUSIVE_COMMIT_LIMIT: u64 = 10_000;
+
+/// How a worktree uses a branch that Git therefore refuses to delete.
+#[derive(Clone, Copy)]
+enum Activity {
+    CheckedOut,
+    Rebasing,
+    Bisecting,
+}
+
+#[derive(Clone)]
+struct BranchUse {
+    worktree: String,
+    activity: Activity,
+}
+
+impl BranchUse {
+    fn activity(&self) -> &'static str {
+        match self.activity {
+            Activity::CheckedOut => "checked out",
+            Activity::Rebasing => "being rebased",
+            Activity::Bisecting => "being bisected",
+        }
+    }
+
+    fn blocker(&self, name: &str) -> String {
+        let remedy = match self.activity {
+            Activity::CheckedOut => "Switch that worktree to another branch before deleting it.",
+            Activity::Rebasing => "Finish or abort the rebase before deleting it.",
+            Activity::Bisecting => "End the bisect before deleting it.",
+        };
+        format!(
+            "{name} is {} in the worktree at {}. {remedy}",
+            self.activity(),
+            self.worktree
+        )
+    }
+}
 
 struct RefRecord {
     oid: String,
@@ -49,16 +87,19 @@ struct Inspection<'a> {
     worktree: &'a Path,
     git_dir: &'a Path,
     refs: &'a BTreeMap<String, RefRecord>,
-    occupancy: &'a BTreeMap<String, String>,
+    occupancy: &'a BTreeMap<String, BranchUse>,
     snapshot: &'a WorkingCopySnapshot,
     default_target: Option<&'a str>,
 }
 
 /// A plan together with the exact local deletion commands it displays, so
-/// execution runs what the final review showed.
+/// execution runs what the final review showed, and the one URL a remote
+/// deletion pushes to.
 struct Review {
     plan: BranchDeletionPlan,
     local_commands: Vec<Vec<String>>,
+    repository: RepositoryContext,
+    push_url: Option<String>,
 }
 
 pub fn plan_branch_deletion(request: BranchDeletionRequest) -> Result<BranchDeletionPlan, String> {
@@ -78,10 +119,7 @@ fn review(request: BranchDeletionRequest) -> Result<Review, String> {
     let repository = repository_context(Path::new(&snapshot.repository_path))?;
     let refs = read_refs(worktree)?;
     let remotes = read_remotes(worktree)?;
-    let occupancy: BTreeMap<String, String> = list_worktrees(&repository.path)?
-        .into_iter()
-        .filter_map(|seed| seed.branch.map(|branch| (branch, seed.path)))
-        .collect();
+    let occupancy = branches_in_use(&repository)?;
 
     let inspection = Inspection {
         worktree,
@@ -107,6 +145,13 @@ fn review(request: BranchDeletionRequest) -> Result<Review, String> {
     let remote_target = match local_name {
         Some(name) => upstream_candidate(name, record, &refs, &remotes),
         None => tracking_candidate(worktree, &request.branch_ref, record, &remotes)?,
+    };
+    let (remote_target, push_url) = match remote_target {
+        RemoteTarget::Available(candidate) => match single_push_url(worktree, &candidate.remote) {
+            Ok(url) => (RemoteTarget::Available(candidate), Some(url)),
+            Err(reason) => (RemoteTarget::Unavailable(reason), None),
+        },
+        unavailable => (unavailable, None),
     };
     if local_name.is_none() && request.delete_local {
         blockers.push(format!(
@@ -139,11 +184,8 @@ fn review(request: BranchDeletionRequest) -> Result<Review, String> {
     };
 
     if let Some(local) = &local {
-        if let Some(path) = &local.occupied_worktree_path {
-            blockers.push(format!(
-                "{} is checked out in the worktree at {path}. Switch that worktree to another branch before deleting it.",
-                local.name
-            ));
+        if let Some(usage) = occupancy.get(&local.name) {
+            blockers.push(usage.blocker(&local.name));
         }
         if local.is_default_branch {
             warnings.push(format!(
@@ -290,6 +332,8 @@ fn review(request: BranchDeletionRequest) -> Result<Review, String> {
     Ok(Review {
         plan,
         local_commands,
+        repository,
+        push_url,
     })
 }
 
@@ -299,6 +343,8 @@ pub fn execute_branch_deletion(
     let Review {
         plan,
         local_commands,
+        repository,
+        push_url,
     } = review(request.request)?;
     if let Some(blocker) = plan.blockers.first() {
         return Err(format!("The branch deletion is blocked: {blocker}"));
@@ -321,11 +367,14 @@ pub fn execute_branch_deletion(
     let worktree = Path::new(&plan.worktree_path);
     let selected_remote = plan.remote.as_ref().filter(|_| plan.delete_remote);
     if let Some(remote) = selected_remote {
-        confirm_not_remote_default(worktree, remote)?;
+        let url = push_url
+            .as_deref()
+            .ok_or("The URL the remote deletion pushes to could not be identified.")?;
+        confirm_not_remote_default(worktree, remote, url)?;
     }
 
     let local = match &plan.local {
-        Some(local) => Some(delete_local(worktree, local, &local_commands)?),
+        Some(local) => Some(delete_local(&repository, worktree, local, &local_commands)?),
         None => None,
     };
 
@@ -399,7 +448,12 @@ pub fn execute_branch_deletion(
 
 /// Runs the reviewed local deletion. Only the first command deletes the branch;
 /// a failure after it is reported with the completed step, never as a failure.
+///
+/// The review can be seconds old by now, after asking the remote, and
+/// `update-ref` deletes a branch whatever uses it, so worktrees are checked
+/// once more right before deleting.
 fn delete_local(
+    repository: &RepositoryContext,
     worktree: &Path,
     local: &LocalBranchDeletion,
     commands: &[Vec<String>],
@@ -407,6 +461,12 @@ fn delete_local(
     let (deletion, cleanup) = commands
         .split_first()
         .ok_or_else(|| format!("No command was reviewed to delete {}.", local.name))?;
+    if let Some(usage) = branches_in_use(repository)?.get(&local.name) {
+        return Err(format!(
+            "Nothing was deleted. {}",
+            usage.blocker(&local.name)
+        ));
+    }
     let output = command::git_at(worktree, deletion).map_err(|error| error.to_string())?;
     let diagnostic = combined_output(&output.stdout, &output.stderr);
     if !output.status.success() {
@@ -483,6 +543,101 @@ fn local_deletion_commands(
     commands
 }
 
+/// Branches Git refuses to delete because a worktree uses them: checked out
+/// there, or being rebased or bisected there. `git worktree list` reports a
+/// worktree in the middle of a rebase or bisect as detached, so those are read
+/// from each worktree's administrative directory, as Git itself does.
+fn branches_in_use(repository: &RepositoryContext) -> Result<BTreeMap<String, BranchUse>, String> {
+    let seeds = list_worktrees(&repository.path)?;
+    let mut uses = BTreeMap::new();
+    for seed in &seeds {
+        if let Some(branch) = &seed.branch {
+            uses.insert(
+                branch.clone(),
+                BranchUse {
+                    worktree: seed.path.clone(),
+                    activity: Activity::CheckedOut,
+                },
+            );
+        }
+    }
+
+    let mut administrative = Vec::new();
+    if let Some(primary) = seeds.iter().find(|seed| seed.is_primary) {
+        administrative.push((repository.git_dir.clone(), primary.path.clone()));
+    }
+    match std::fs::read_dir(repository.git_dir.join("worktrees")) {
+        Ok(entries) => {
+            for entry in entries {
+                let directory = entry.map_err(|error| error.to_string())?.path();
+                // `gitdir` names the worktree's `.git` file.
+                let worktree = read_state(&directory.join("gitdir"))?
+                    .map(|gitdir| native_path(gitdir.trim()))
+                    .and_then(|gitdir| {
+                        Path::new(&gitdir)
+                            .parent()
+                            .map(|path| path.display().to_string())
+                    })
+                    .unwrap_or_else(|| directory.display().to_string());
+                administrative.push((directory, worktree));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+
+    for (directory, worktree) in administrative {
+        for (branch, activity) in branches_in_progress(&directory)? {
+            uses.entry(branch).or_insert_with(|| BranchUse {
+                worktree: worktree.clone(),
+                activity,
+            });
+        }
+    }
+    Ok(uses)
+}
+
+/// The branches that a rebase or bisect recorded in this worktree administrative
+/// directory will return to or update.
+fn branches_in_progress(directory: &Path) -> Result<Vec<(String, Activity)>, String> {
+    let mut found = Vec::new();
+    let mut rebased = vec![directory.join("rebase-merge").join("head-name")];
+    // `git am` also uses rebase-apply, and marks it as applying.
+    if !directory.join("rebase-apply").join("applying").exists() {
+        rebased.push(directory.join("rebase-apply").join("head-name"));
+    }
+    for file in rebased {
+        if let Some(head) = read_state(&file)? {
+            if let Some(branch) = head.trim().strip_prefix("refs/heads/") {
+                found.push((branch.to_string(), Activity::Rebasing));
+            }
+        }
+    }
+    // `rebase --update-refs` lists each ref it will move, followed by two object IDs.
+    if let Some(refs) = read_state(&directory.join("rebase-merge").join("update-refs"))? {
+        for reference in refs.lines().step_by(3) {
+            if let Some(branch) = reference.strip_prefix("refs/heads/") {
+                found.push((branch.to_string(), Activity::Rebasing));
+            }
+        }
+    }
+    if let Some(start) = read_state(&directory.join("BISECT_START"))? {
+        let branch = start.trim();
+        if !branch.is_empty() {
+            found.push((branch.to_string(), Activity::Bisecting));
+        }
+    }
+    Ok(found)
+}
+
+fn read_state(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Could not read {}: {error}", path.display())),
+    }
+}
+
 /// Whether the repository configuration has a `branch.<name>` section.
 fn has_branch_config(worktree: &Path, name: &str) -> Result<bool, String> {
     let output = command::git_at(
@@ -497,47 +652,46 @@ fn has_branch_config(worktree: &Path, name: &str) -> Result<bool, String> {
     }))
 }
 
-/// Asks every URL the remote deletion pushes to which branch its HEAD names,
-/// because the local `refs/remotes/<remote>/HEAD` can be missing or stale, and
-/// the push can go to `pushurl`s rather than the URL that was fetched. Refuses
-/// when any of them cannot answer, or answers without naming a branch.
-///
-/// This is a check, not a lock: a push cannot be made conditional on the
-/// remote's HEAD, so only the server can make this protection atomic.
-fn confirm_not_remote_default(
-    worktree: &Path,
-    remote: &RemoteBranchDeletion,
-) -> Result<(), String> {
+/// The one URL a deletion from `remote` pushes to, which can differ from the URL
+/// it fetches from. A remote with several push URLs is refused: Git pushes to
+/// each in turn, so the branch could be deleted from some while others refuse.
+fn single_push_url(worktree: &Path, remote: &str) -> Result<String, String> {
     let output = command::git_at(
         worktree,
-        [
-            "remote",
-            "get-url",
-            "--push",
-            "--all",
-            "--",
-            remote.remote.as_str(),
-        ],
+        ["remote", "get-url", "--push", "--all", "--", remote],
     )
     .map_err(|error| error.to_string())?;
-    let urls = String::from_utf8_lossy(&output.stdout);
-    let urls: Vec<&str> = urls.lines().filter(|url| !url.is_empty()).collect();
-    if !output.status.success() || urls.is_empty() {
+    if !output.status.success() {
         return Err(format!(
-            "Could not find where {} pushes, so nothing was deleted. {}",
-            remote.remote,
+            "Could not find where {remote} pushes. {}",
             combined_output(&output.stdout, &output.stderr)
         )
         .trim()
         .to_string());
     }
-    for url in urls {
-        confirm_not_default_at(worktree, remote, url)?;
+    let urls = String::from_utf8_lossy(&output.stdout);
+    match urls
+        .lines()
+        .filter(|url| !url.is_empty())
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [url] => Ok((*url).to_string()),
+        [] => Err(format!("{remote} has no URL to push to.")),
+        urls => Err(format!(
+            "{remote} pushes to {} URLs, and Git deletes the branch from each one separately, so some could lose it while others refuse. Delete it from each URL with Git instead.",
+            urls.len()
+        )),
     }
-    Ok(())
 }
 
-fn confirm_not_default_at(
+/// Asks the URL the remote deletion pushes to which branch its HEAD names,
+/// because the local `refs/remotes/<remote>/HEAD` can be missing or stale.
+/// Refuses when it cannot answer, or answers without naming a branch.
+///
+/// This is a check, not a lock: a push cannot be made conditional on the
+/// remote's HEAD, so only the server can make this protection atomic.
+fn confirm_not_remote_default(
     worktree: &Path,
     remote: &RemoteBranchDeletion,
     url: &str,
@@ -833,7 +987,10 @@ fn local_details(
         contained_in_merge_reference,
         default_target: default_target.map(|(target, _)| short_ref(target)),
         contained_in_default_target,
-        occupied_worktree_path: inspection.occupancy.get(name).cloned(),
+        occupied_worktree_path: inspection
+            .occupancy
+            .get(name)
+            .map(|usage| usage.worktree.clone()),
         is_default_branch: default_target
             .and_then(|(target, _)| target.strip_prefix("refs/remotes/origin/"))
             == Some(name),
@@ -861,7 +1018,7 @@ fn remote_details(
         .filter_map(|(name, _)| name.strip_prefix("refs/heads/"))
         .filter(|name| Some(*name) != local_deleted)
         .map(|name| match inspection.occupancy.get(name) {
-            Some(path) => format!("{name} (checked out at {path})"),
+            Some(usage) => format!("{name} ({} at {})", usage.activity(), usage.worktree),
             None => name.to_string(),
         })
         .collect();
@@ -1359,6 +1516,133 @@ mod tests {
             .any(|blocker| blocker.contains(path(&linked))));
         execute(&plan, None).expect_err("an occupied branch must not be deleted");
         assert!(fixture.has_ref("refs/heads/occupied"));
+    }
+
+    #[test]
+    fn blocks_a_branch_being_rebased_in_another_worktree() {
+        let fixture = Fixture::new();
+        let linked = fixture.root.join("linked");
+        git(
+            &fixture.repository,
+            &["worktree", "add", "-b", "rebasing", path(&linked)],
+        );
+        std::fs::write(linked.join("shared.txt"), "rebasing\n").expect("write file");
+        git(&linked, &["add", "shared.txt"]);
+        commit(&linked, "edits shared.txt on the branch");
+        std::fs::write(fixture.repository.join("shared.txt"), "main\n").expect("write file");
+        git(&fixture.repository, &["add", "shared.txt"]);
+        commit(&fixture.repository, "edits shared.txt on main");
+        let rebase = command::git_at(&linked, ["rebase", "main"]).expect("run rebase");
+        assert!(!rebase.status.success(), "the rebase stops on its conflict");
+
+        // The stopped rebase leaves the worktree detached, so only the rebase
+        // state shows that it still uses the branch.
+        let plan = fixture.plan("refs/heads/rebasing", true, false);
+        assert!(plan.requires_force);
+        let local = plan.local.as_ref().expect("local details");
+        assert_eq!(local.occupied_worktree_path.as_deref(), Some(path(&linked)));
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| blocker.contains("being rebased")),
+            "{:?}",
+            plan.blockers
+        );
+        execute(&plan, Some("rebasing")).expect_err("a branch being rebased must not be deleted");
+        assert!(fixture.has_ref("refs/heads/rebasing"));
+    }
+
+    #[test]
+    fn a_worktree_that_starts_using_the_branch_after_review_keeps_it() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["switch", "--create", "late"]);
+        commit(&fixture.repository, "only on late");
+        git(&fixture.repository, &["switch", "main"]);
+        let reviewed = review(fixture.request("refs/heads/late", true, false)).expect("review");
+        assert!(
+            reviewed.plan.blockers.is_empty(),
+            "{:?}",
+            reviewed.plan.blockers
+        );
+        assert!(reviewed.plan.requires_force);
+
+        let linked = fixture.root.join("late");
+        git(
+            &fixture.repository,
+            &["worktree", "add", path(&linked), "late"],
+        );
+        let local = reviewed.plan.local.as_ref().expect("local details");
+        let error = delete_local(
+            &reviewed.repository,
+            Path::new(&reviewed.plan.worktree_path),
+            local,
+            &reviewed.local_commands,
+        )
+        .expect_err("the branch is checked out by now");
+        assert!(error.contains("checked out"), "{error}");
+        assert!(fixture.has_ref("refs/heads/late"));
+    }
+
+    #[test]
+    fn reads_the_branches_a_rebase_or_bisect_will_return_to() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let directory = temp.path();
+        let oid = "a".repeat(40);
+        std::fs::create_dir_all(directory.join("rebase-merge")).expect("rebase-merge");
+        std::fs::write(
+            directory.join("rebase-merge").join("head-name"),
+            "refs/heads/rebased\n",
+        )
+        .expect("head-name");
+        std::fs::write(
+            directory.join("rebase-merge").join("update-refs"),
+            format!("refs/heads/stacked\n{oid}\n{oid}\nrefs/tags/v1\n{oid}\n{oid}\n"),
+        )
+        .expect("update-refs");
+        std::fs::create_dir_all(directory.join("rebase-apply")).expect("rebase-apply");
+        std::fs::write(
+            directory.join("rebase-apply").join("head-name"),
+            "refs/heads/applied\n",
+        )
+        .expect("head-name");
+        std::fs::write(directory.join("rebase-apply").join("applying"), "").expect("applying");
+        std::fs::write(directory.join("BISECT_START"), "bisected\n").expect("BISECT_START");
+
+        let branches: Vec<String> = branches_in_progress(directory)
+            .expect("read state")
+            .into_iter()
+            .map(|(branch, _)| branch)
+            .collect();
+        assert_eq!(branches, ["rebased", "stacked", "bisected"]);
+    }
+
+    #[test]
+    fn a_remote_that_pushes_to_several_urls_is_not_deleted_from() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "topic"]);
+        git(&fixture.repository, &["push", "origin", "topic"]);
+        let mirror = fixture.root.join("mirror.git");
+        git(
+            &fixture.root,
+            &["clone", "--bare", path(&fixture.remote), path(&mirror)],
+        );
+        for url in [path(&fixture.remote), path(&mirror)] {
+            git(
+                &fixture.repository,
+                &["config", "--add", "remote.origin.pushurl", url],
+            );
+        }
+        let plan = fixture.plan("refs/remotes/origin/topic", false, true);
+        assert!(plan.remote.is_none());
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| blocker.contains("pushes to 2 URLs")),
+            "{:?}",
+            plan.blockers
+        );
+        execute(&plan, None).expect_err("a deletion across several URLs is refused");
+        assert!(fixture.remote_has_branch("topic"));
     }
 
     #[test]
