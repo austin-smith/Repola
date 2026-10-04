@@ -665,7 +665,11 @@ function App() {
           deletion = await executeBranchDeletion(selectedMachineId, item.plan.plan, null);
           if (deletion.auditPath) setAuditPath(deletion.auditPath);
         }
-        items[index] = { ...item, done: true, deletion };
+        // A deletion interrupted after it started may have happened.
+        const unconfirmed = [deletion?.local, deletion?.remote].some((step) => step?.unconfirmed === true);
+        items[index] = unconfirmed && deletion
+          ? { ...item, deletion, unconfirmed, error: deletion.message }
+          : { ...item, done: true, deletion };
       } catch (cause) {
         items[index] = { ...item, error: toMessage(cause), unconfirmed: item.plan.kind === "deleteBranch" && deletionOutcomeUnknown(cause) };
       }

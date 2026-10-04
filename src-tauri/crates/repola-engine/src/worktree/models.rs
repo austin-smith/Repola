@@ -1238,6 +1238,8 @@ pub struct BranchDeletionStep {
     pub target: String,
     pub deleted_oid: String,
     pub succeeded: bool,
+    /// The step was interrupted after it started, so it may have happened.
+    pub unconfirmed: bool,
     pub output: String,
     /// Something left undone by a step that still succeeded.
     pub warning: Option<String>,

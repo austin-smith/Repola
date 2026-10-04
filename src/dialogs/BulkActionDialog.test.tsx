@@ -162,6 +162,7 @@ describe("BulkActionDialog", () => {
       target: "feature",
       deletedOid: "a".repeat(40),
       succeeded: true,
+      unconfirmed: false,
       output: "",
       warning,
       finishCommands,
@@ -190,5 +191,30 @@ describe("BulkActionDialog", () => {
     expect(within(rows[1]).getByText("Done with warnings")).toBeInTheDocument();
     expect(within(rows[1]).getByText(/To finish: git config --local --remove-section branch\.feature/)).toBeInTheDocument();
     expect(within(rows[1]).getByText(/To restore: git branch -- feature aaaa/)).toBeInTheDocument();
+  });
+
+  it("marks a branch deletion interrupted after it started as unconfirmed, with how to restore it", () => {
+    const deletion: BranchDeletionResult = {
+      message: "Repola could not confirm whether local branch feature was deleted.",
+      local: {
+        target: "feature",
+        deletedOid: "a".repeat(40),
+        succeeded: false,
+        unconfirmed: true,
+        output: "git was cancelled. The deletion had started, so feature may have been deleted, and its configuration was kept.",
+        warning: null,
+        finishCommands: [],
+        recoveryCommands: ["git branch -- feature aaaa"],
+      },
+      remote: null,
+      auditPath: null,
+      auditWarning: null,
+    };
+    renderDialog("done", [{ ...ready("alpha"), deletion, unconfirmed: true, error: deletion.message }]);
+
+    expect(screen.getByText("0 completed · 0 not completed · 1 unconfirmed")).toBeInTheDocument();
+    const row = screen.getAllByRole("listitem")[0];
+    expect(within(row).getByText("Unconfirmed")).toBeInTheDocument();
+    expect(within(row).getByText(/To restore: git branch -- feature aaaa/)).toBeInTheDocument();
   });
 });

@@ -232,7 +232,7 @@ describe("RepositoryToolbar", () => {
     };
     const result: BranchDeletionResult = {
       message: "Deleted local branch old-work.",
-      local: { target: "old-work", deletedOid: "abcdef1234567890", succeeded: true, output: "", warning: null, finishCommands: [], recoveryCommands: ["git -C /repos/repola branch -- old-work abcdef1234567890"] },
+      local: { target: "old-work", deletedOid: "abcdef1234567890", succeeded: true, unconfirmed: false, output: "", warning: null, finishCommands: [], recoveryCommands: ["git -C /repos/repola branch -- old-work abcdef1234567890"] },
       remote: null,
       auditPath: "/logs/actions.jsonl",
       auditWarning: null,

@@ -1555,7 +1555,7 @@ impl AuditEntry {
                     .join("; ");
                 (
                     steps.iter().all(|step| step.succeeded),
-                    true,
+                    !steps.iter().any(|step| step.unconfirmed),
                     std::iter::once(result.message.clone())
                         // Why a step failed, in Git's words.
                         .chain(
@@ -1920,6 +1920,7 @@ mod audit_tests {
                 target: "feature".into(),
                 deleted_oid: "a".repeat(40),
                 succeeded: true,
+                unconfirmed: false,
                 output: String::new(),
                 warning: Some("feature was deleted, but its configuration was not removed.".into()),
                 finish_commands: vec![
@@ -1934,6 +1935,7 @@ mod audit_tests {
                 target: "origin/feature".into(),
                 deleted_oid: "a".repeat(40),
                 succeeded: false,
+                unconfirmed: false,
                 output: "! (delete):refs/heads/feature [rejected] (stale info)".into(),
                 warning: None,
                 finish_commands: Vec::new(),

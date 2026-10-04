@@ -149,6 +149,7 @@ describe("deletionNotice", () => {
     target,
     deletedOid: "a".repeat(40),
     succeeded,
+    unconfirmed: false,
     output: succeeded ? "Deleted branch feature (was aaaa)." : "! [remote rejected] (stale info)",
     warning,
     finishCommands,
@@ -184,6 +185,19 @@ describe("deletionNotice", () => {
       type: "warning",
       title: "Deleted feature.",
       description: "! [remote rejected] (stale info) To restore: git branch -- feature aaaa Audit warning: disk full",
+    });
+  });
+
+  it("warns that an interrupted step may have deleted the branch, and how to restore it", () => {
+    const interrupted = {
+      ...step("origin/feature", ["git push -- origin aaaa:refs/heads/feature"], false),
+      unconfirmed: true,
+      output: "git was cancelled. The push had started, so origin may have deleted refs/heads/feature.",
+    };
+    expect(deletionNotice(result({ message: "Repola could not confirm whether remote branch origin/feature was deleted.", remote: interrupted }))).toEqual({
+      type: "warning",
+      title: "Repola could not confirm whether remote branch origin/feature was deleted.",
+      description: "git was cancelled. The push had started, so origin may have deleted refs/heads/feature. To restore: git push -- origin aaaa:refs/heads/feature",
     });
   });
 

@@ -110,7 +110,7 @@ function planFor(request: BranchDeletionRequest, overrides: Partial<BranchDeleti
 
 const result: BranchDeletionResult = {
   message: "Deleted local branch feature.",
-  local: { target: "feature", deletedOid: "a".repeat(40), succeeded: true, output: "", warning: null, finishCommands: [], recoveryCommands: ["git -C /repos/repola branch -- feature aaaa"] },
+  local: { target: "feature", deletedOid: "a".repeat(40), succeeded: true, unconfirmed: false, output: "", warning: null, finishCommands: [], recoveryCommands: ["git -C /repos/repola branch -- feature aaaa"] },
   remote: null,
   auditPath: null,
   auditWarning: null,

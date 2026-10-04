@@ -498,8 +498,10 @@ pub fn execute_branch_deletion(
         None => None,
     };
 
+    // A local deletion that may not have happened stops before the remote.
+    let local_unconfirmed = local.as_ref().is_some_and(|local| local.unconfirmed);
     let mut already_gone = false;
-    let remote = match selected_remote {
+    let remote = match selected_remote.filter(|_| !local_unconfirmed) {
         Some(remote) => {
             let deletion = delete_remote(worktree, remote, push_url.as_deref());
             let refspec = format!("{}:{}", remote.expected_oid, remote.remote_ref);
@@ -509,8 +511,11 @@ pub fn execute_branch_deletion(
                     ["push", "--", remote.remote.as_str(), &refspec],
                 )]
             };
+            let unconfirmed = matches!(deletion.outcome, RemoteOutcome::Unconfirmed);
             let (succeeded, warning, recovery_commands) = match &deletion.outcome {
                 RemoteOutcome::Deleted => (true, None, push_back()),
+                // Restoring a branch that still exists is refused, so it is safe to offer.
+                RemoteOutcome::Unconfirmed => (false, None, push_back()),
                 RemoteOutcome::AlreadyGone { tracking_kept } => {
                     already_gone = true;
                     match tracking_kept {
@@ -538,7 +543,7 @@ pub fn execute_branch_deletion(
                 }
                 RemoteOutcome::Failed => (false, None, Vec::new()),
             };
-            if !succeeded && local.is_none() {
+            if !succeeded && !unconfirmed && local.is_none() {
                 return Err(if deletion.output.is_empty() {
                     format!(
                         "Git did not delete {} and returned no diagnostic output.",
@@ -552,6 +557,7 @@ pub fn execute_branch_deletion(
                 target: remote.display_name.clone(),
                 deleted_oid: remote.expected_oid.clone(),
                 succeeded,
+                unconfirmed,
                 output: deletion.output,
                 warning,
                 finish_commands: Vec::new(),
@@ -561,8 +567,23 @@ pub fn execute_branch_deletion(
         None => None,
     };
 
+    let local_outcome = |local: &BranchDeletionStep| {
+        if local.unconfirmed {
+            format!(
+                "Repola could not confirm whether local branch {} was deleted.",
+                local.target
+            )
+        } else {
+            format!("Deleted local branch {}.", local.target)
+        }
+    };
     let remote_outcome = |remote: &BranchDeletionStep| {
-        if already_gone {
+        if remote.unconfirmed {
+            format!(
+                "Repola could not confirm whether remote branch {} was deleted.",
+                remote.target
+            )
+        } else if already_gone {
             format!("Remote branch {} was already deleted.", remote.target)
         } else if remote.succeeded {
             format!("Deleted remote branch {}.", remote.target)
@@ -570,19 +591,24 @@ pub fn execute_branch_deletion(
             format!("Remote branch {} was not deleted.", remote.target)
         }
     };
+    let skipped = selected_remote
+        .filter(|_| local_unconfirmed)
+        .map(|remote| format!("Remote branch {} was not deleted.", remote.display_name));
     let message = match (&local, &remote) {
-        (Some(local), Some(remote)) if remote.succeeded && !already_gone => format!(
-            "Deleted local branch {} and remote branch {}.",
-            local.target, remote.target
-        ),
-        (Some(local), Some(remote)) => format!(
-            "Deleted local branch {}. {}",
-            local.target,
-            remote_outcome(remote)
-        ),
-        (Some(local), None) => format!("Deleted local branch {}.", local.target),
-        (None, Some(remote)) => remote_outcome(remote),
-        (None, None) => "No branch was deleted.".into(),
+        (Some(local), Some(remote)) if local.succeeded && remote.succeeded && !already_gone => {
+            format!(
+                "Deleted local branch {} and remote branch {}.",
+                local.target, remote.target
+            )
+        }
+        _ => local
+            .as_ref()
+            .map(local_outcome)
+            .into_iter()
+            .chain(remote.as_ref().map(remote_outcome))
+            .chain(skipped)
+            .reduce(|message, next| format!("{message} {next}"))
+            .unwrap_or_else(|| "No branch was deleted.".into()),
     };
     Ok(BranchDeletionResult {
         message,
@@ -617,6 +643,9 @@ struct RemoteDeletion {
 
 enum RemoteOutcome {
     Deleted,
+    /// The push was interrupted after it started, so the remote may have
+    /// deleted the branch.
+    Unconfirmed,
     /// The remote no longer had the branch. Its remote-tracking ref was
     /// removed as a deleting push removes it, unless it had changed, in which
     /// case this says why it was kept.
@@ -660,6 +689,15 @@ fn delete_remote(
     }
     let output = match command::git_at(worktree, remote_deletion_args(remote)) {
         Ok(output) => output,
+        Err(error) if interrupted(&error) => {
+            return RemoteDeletion {
+                outcome: RemoteOutcome::Unconfirmed,
+                output: format!(
+                    "{error}. The push had started, so {} may have deleted {}.",
+                    remote.remote, remote.remote_ref
+                ),
+            }
+        }
         Err(error) => return failed(error.to_string()),
     };
     let diagnostic = combined_output(&output.stdout, &output.stderr);
@@ -747,6 +785,15 @@ fn remote_has(worktree: &Path, remote: &str, reference: &str) -> Result<bool, St
     Err(combined_output(&output.stdout, &output.stderr))
 }
 
+/// Whether a command stopped by cancellation or its deadline, which leaves
+/// whatever it was doing possibly done.
+fn interrupted(error: &command::CommandError) -> bool {
+    matches!(
+        error,
+        command::CommandError::Cancelled { .. } | command::CommandError::Timeout { .. }
+    )
+}
+
 /// The commit `reference` points to on the remote at `url`, as fetching sees it,
 /// or `None` when it is not shown.
 fn remote_tip(worktree: &Path, url: &str, reference: &str) -> Result<Option<String>, String> {
@@ -806,7 +853,30 @@ fn delete_local(
     // Read before the cleanup removes it, so the recovery can restore it.
     let configuration = branch_configuration(worktree, &local.name)?;
 
-    let output = command::git_at(worktree, deletion).map_err(|error| error.to_string())?;
+    let recovery = git_command_line(
+        worktree,
+        ["branch", "--", local.name.as_str(), local.tip.as_str()],
+    );
+    let output = match command::git_at(worktree, deletion) {
+        Ok(output) => output,
+        // Restoring a branch that still exists is refused, so it is safe to offer.
+        Err(error) if interrupted(&error) => {
+            return Ok(BranchDeletionStep {
+                target: local.name.clone(),
+                deleted_oid: local.tip.clone(),
+                succeeded: false,
+                unconfirmed: true,
+                output: format!(
+                    "{error}. The deletion had started, so {} may have been deleted, and its configuration was kept.",
+                    local.name
+                ),
+                warning: None,
+                finish_commands: Vec::new(),
+                recovery_commands: vec![recovery],
+            });
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let diagnostic = combined_output(&output.stdout, &output.stderr);
     if !output.status.success() {
         return Err(if diagnostic.is_empty() {
@@ -835,10 +905,7 @@ fn delete_local(
     }
     let configuration_removed = finish_commands.is_empty();
 
-    let mut recovery_commands = vec![git_command_line(
-        worktree,
-        ["branch", "--", local.name.as_str(), local.tip.as_str()],
-    )];
+    let mut recovery_commands = vec![recovery];
     if configuration_removed {
         recovery_commands.extend(configuration.iter().map(|(key, value)| {
             git_command_line(
@@ -851,6 +918,7 @@ fn delete_local(
         target: local.name.clone(),
         deleted_oid: local.tip.clone(),
         succeeded: true,
+        unconfirmed: false,
         output: diagnostic,
         warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
         finish_commands,
@@ -3259,6 +3327,91 @@ mod tests {
         assert!(error.contains("is now at"), "{error}");
         assert!(fixture.has_ref("refs/remotes/origin/rewritten"));
         assert!(fixture.remote_has_branch("rewritten"));
+    }
+
+    /// Installs a `hook` that marks `marker` once it starts, then waits.
+    fn blocking_hook(repository: &Path, hook: &str, marker: &Path) {
+        let hooks = repository.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).expect("hooks directory");
+        let script = hooks.join(hook);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n: > '{}'\nsleep 5\n",
+                marker.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .expect("write hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("make the hook executable");
+        }
+    }
+
+    /// Runs `run` as an operation that is cancelled once `marker` appears.
+    fn cancelled_when<T>(marker: &Path, run: impl FnOnce() -> T) -> T {
+        let token = crate::operation::OperationToken::new();
+        let cancel = token.clone();
+        let marker = marker.to_path_buf();
+        let watcher = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !marker.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            cancel.cancel();
+        });
+        let result = crate::operation::with_operation(token, run);
+        watcher.join().expect("watcher");
+        result
+    }
+
+    #[test]
+    fn a_push_interrupted_after_it_started_is_reported_as_unconfirmed() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "slow"]);
+        git(&fixture.repository, &["push", "origin", "slow"]);
+        let plan = fixture.plan("refs/remotes/origin/slow", false, true);
+        let marker = fixture.root.join("push-started");
+        blocking_hook(&fixture.repository, "pre-push", &marker);
+
+        let result = cancelled_when(&marker, || execute(&plan, None))
+            .expect("an interrupted push is not a refusal");
+        assert_eq!(
+            result.message,
+            "Repola could not confirm whether remote branch origin/slow was deleted."
+        );
+        let remote = result.remote.as_ref().expect("remote step");
+        assert!(remote.unconfirmed && !remote.succeeded);
+        assert_eq!(remote.recovery_commands.len(), 1);
+        // The hook held the push back, so the remote kept the branch here.
+        assert!(fixture.remote_has_branch("slow"));
+    }
+
+    #[test]
+    fn an_interrupted_local_deletion_is_unconfirmed_and_leaves_the_remote_alone() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["switch", "--create", "slow"]);
+        git(
+            &fixture.repository,
+            &["push", "--set-upstream", "origin", "slow"],
+        );
+        git(&fixture.repository, &["switch", "main"]);
+        let plan = fixture.plan("refs/heads/slow", true, true);
+        let marker = fixture.root.join("deletion-started");
+        blocking_hook(&fixture.repository, "reference-transaction", &marker);
+
+        let result = cancelled_when(&marker, || execute(&plan, Some("slow")))
+            .expect("an interrupted deletion is not a refusal");
+        assert_eq!(
+            result.message,
+            "Repola could not confirm whether local branch slow was deleted. Remote branch origin/slow was not deleted."
+        );
+        let local = result.local.as_ref().expect("local step");
+        assert!(local.unconfirmed && !local.succeeded);
+        assert!(result.remote.is_none());
+        assert!(fixture.remote_has_branch("slow"));
     }
 
     #[test]

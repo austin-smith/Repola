@@ -105,7 +105,7 @@ export function BulkActionDialog({
                 </div>
                 <code className="font-mono text-xs break-all text-muted-foreground">{item.subtitle}</code>
                 {item.error && <p className="text-xs wrap-anywhere text-destructive">{item.error}</p>}
-                {item.done && item.deletion ? <DeletionOutcome deletion={item.deletion} /> : null}
+                {item.deletion ? <DeletionOutcome deletion={item.deletion} /> : null}
                 {!item.error && item.command !== null && (
                   <code className="border-l-2 border-foreground bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap break-all">
                     {item.command}

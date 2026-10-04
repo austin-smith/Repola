@@ -685,6 +685,8 @@ export interface BranchDeletionStep {
   target: string;
   deletedOid: string;
   succeeded: boolean;
+  /** The step was interrupted after it started, so it may have happened. */
+  unconfirmed: boolean;
   output: string;
   /** Something left undone by a step that still succeeded. */
   warning: string | null;
