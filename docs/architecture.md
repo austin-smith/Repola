@@ -57,14 +57,7 @@ The desktop process owns application settings, machine profiles, operation coord
 
 ## Recovery points
 
-Every discard, and every restore that overwrites content, first saves what it will change as a recovery point inside the repository, so recovery works the same for local and SSH working copies and never depends on a desktop trash.
-
-- A recovery point is a Git tree named by `refs/repola/discarded/<UTC time>-<random>` in the repository's common Git directory, shared by all of its worktrees. The tree holds `summary.json`, `manifest.json` (each path's exact index entries, including conflict stages, and its working-tree entry), `worktree/<path>` (the bytes on disk, hashed without clean filters, plus file mode or link target), and `index/<stage>/<path>`.
-- The reference names a tree, not a commit, so commit walks such as `git log --all` skip it and writing it needs no identity, signing, or hooks. References are created with a zero old value, so an existing recovery point is never overwritten.
-- Engine queries that list refs are scoped to `refs/heads`, `refs/remotes`, or `refs/tags`, so recovery points never appear as branches, tags, or history.
-- A discard plans read-only and returns a fingerprint of HEAD, any in-progress operation, and every touched path's index entries and working-tree content. Execution recomputes it while writing the blobs, refuses on any difference, stores the recovery point, and only then changes the working copy, with literal pathspecs over exactly the planned paths. Removing an untracked file also removes the parent directories it leaves empty, never the worktree root and never through a link. A new file already deleted from disk is only unstaged. Neither a discard nor a restore runs over a directory that has taken a file's place, because Git would replace it together with its contents. Submodules and nested repositories cannot be saved and are left untouched.
-- Restores are planned and fingerprinted the same way. They verify the manifest against the tree, refuse paths with `..` or `.git` components or a parent that is a link or file, write bytes atomically, and honor `core.symlinks` and the platform's executable bit.
-- Recovery points stay until the user deletes them. Deletion is one `update-ref --stdin` transaction that checks every reviewed object ID. `git push --mirror` (or any refspec that matches `refs/repola/*`) would publish them to a remote, so they can carry discarded content off the machine.
+Every discard, and every restore that overwrites content, first saves what it changes as a recovery point: a Git tree named by `refs/repola/discarded/<id>` in the repository's common Git directory, so recovery works the same over SSH and never depends on a desktop trash. Recovery points stay until the user deletes them and never appear as branches, tags, or history, but `git push --mirror` (or any refspec matching `refs/repola/*`) would publish them to a remote.
 
 ## Persistence and migration
 
