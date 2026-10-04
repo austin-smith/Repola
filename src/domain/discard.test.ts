@@ -70,18 +70,18 @@ describe("discard rules", () => {
   it("describes each effect in terms of what happens to the file", () => {
     const entry = (overrides: Partial<DiscardPlanEntry>): DiscardPlanEntry => ({
       path: { display: "b.txt", token: "622e747874" },
-      previousPath: null,
-      kind: "modified",
       effect: "restoreCommitted",
+      onDisk: true,
+      tracked: true,
       ...overrides,
     });
     expect(discardEffectLabel(entry({}))).toBe("Restore the committed version");
-    expect(discardEffectLabel(entry({ kind: "deleted" }))).toBe("Restore the deleted file");
-    expect(discardEffectLabel(entry({ kind: "renamed", previousPath: { display: "a.txt", token: "" } }))).toBe("Restore a.txt and remove this name");
+    expect(discardEffectLabel(entry({ onDisk: false }))).toBe("Restore the deleted file");
     expect(discardEffectLabel(entry({ effect: "restoreStaged" }))).toBe("Replace unstaged edits with the staged version");
-    expect(discardEffectLabel(entry({ effect: "remove", kind: "untracked" }))).toBe("Delete the untracked file");
-    expect(discardEffectLabel(entry({ effect: "remove", kind: "added" }))).toBe("Remove the new file");
-    expect(discardEffectLabel(entry({ effect: "unstage", kind: "deleted" }))).toBe("Unstage the new file, which is already deleted");
+    expect(discardEffectLabel(entry({ effect: "restoreStaged", onDisk: false }))).toBe("Restore the staged version of the deleted file");
+    expect(discardEffectLabel(entry({ effect: "remove", tracked: false }))).toBe("Delete the untracked file");
+    expect(discardEffectLabel(entry({ effect: "remove" }))).toBe("Remove the new file");
+    expect(discardEffectLabel(entry({ effect: "unstage", onDisk: false }))).toBe("Unstage the new file, which is already deleted");
   });
 
   it("warns only above the large recovery point threshold", () => {
@@ -101,9 +101,15 @@ describe("recovery points", () => {
       { path: { display: "a", token: "61" }, worktree: "unchanged", indexChanges: false },
       { path: { display: "b", token: "62" }, worktree: "unchanged", indexChanges: true },
       { path: { display: "c", token: "63" }, worktree: "create", indexChanges: false },
+      { path: { display: "d", token: "64" }, worktree: "replace", indexChanges: true },
     ];
-    expect(restoreChanges(entries).map((entry) => entry.path.display)).toEqual(["b", "c"]);
-    expect(entries.map(restoreEffectLabel)).toEqual(["Already matches", "Restore the saved staged state", "Recreate the saved file"]);
+    expect(restoreChanges(entries).map((entry) => entry.path.display)).toEqual(["b", "c", "d"]);
+    expect(entries.map(restoreEffectLabel)).toEqual([
+      "Already matches",
+      "Restore the saved staged state",
+      "Recreate the saved file",
+      "Replace the current content and the saved staged state",
+    ]);
   });
 
   it("separates this worktree's recovery points from its siblings' and keeps their order", () => {

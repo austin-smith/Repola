@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import DiscardedChangesDialog from "./DiscardedChangesDialog";
-import type { RecoveryPoint, RecoveryRestorePlan, RecoveryRestoreResult, WorkingCopySnapshot } from "../ipc/types";
+import type { RecoveryPoint, RecoveryRestorePlan, RecoveryRestoreResult } from "../ipc/types";
 
 const ipc = vi.hoisted(() => ({
   loadRecoveryPoints: vi.fn(),
@@ -34,22 +34,18 @@ const newest = point({});
 const sibling = point({ id: "refs/repola/discarded/20261002T000000Z-bbb", oid: "2".repeat(40), summary: "Discarded changes to b.txt", worktreePath: "/repo-feature" });
 const older = point({ id: "refs/repola/discarded/20261001T000000Z-ccc", oid: "3".repeat(40), kind: "discardAll", summary: "Discarded all changes (30 files)", pathCount: 30 });
 
-const snapshot: WorkingCopySnapshot = {
-  repositoryPath: "/repo", worktreePath: "/repo", head: "abc", branch: "main", upstream: null,
-  upstreamHead: null, remote: null, ahead: 0, behind: 0, changes: [], operation: null,
-};
-
 const restorePlan: RecoveryRestorePlan = {
   point: newest,
   entries: [
     { path: { display: "a.txt", token: "612e747874" }, worktree: "replace", indexChanges: false },
     { path: { display: "same.txt", token: "73616d652e747874" }, worktree: "unchanged", indexChanges: false },
   ],
+  omitted: 0,
   fingerprint: "restore-fingerprint",
 };
 
 function renderDialog(initialPointId: string | null = null) {
-  const props = { onBusyChange: vi.fn(), onSnapshot: vi.fn(), onClose: vi.fn() };
+  const props = { onBusyChange: vi.fn(), onClose: vi.fn() };
   render(
     <DiscardedChangesDialog
       machineId="build-box"
@@ -90,10 +86,13 @@ describe("DiscardedChangesDialog", () => {
 
   it("reviews a restore with a per-path preview and restores against the plan's fingerprint", async () => {
     const replaced = point({ id: "refs/repola/discarded/20261003T150000Z-ddd", oid: "4".repeat(40), kind: "restore", summary: "Replaced while restoring" });
-    ipc.restoreRecoveryPoint.mockResolvedValue({ snapshot, replaced } satisfies RecoveryRestoreResult);
-    const { onSnapshot, onBusyChange } = renderDialog();
+    ipc.restoreRecoveryPoint.mockResolvedValue({ replaced } satisfies RecoveryRestoreResult);
+    ipc.loadRecoveryPoints
+      .mockResolvedValueOnce({ points: [newest, sibling, older], omitted: 0 })
+      .mockResolvedValueOnce({ points: [replaced, newest, sibling, older], omitted: 0 });
+    const { onBusyChange } = renderDialog();
     fireEvent.click(await screen.findByRole("button", { name: "Review Restore…" }));
-    expect(await screen.findByText(/changes 1 path\. Whatever it replaces is saved as a new recovery point first\./)).toBeInTheDocument();
+    expect(await screen.findByText(/changes 1 listed path\. Whatever it replaces is saved as a new recovery point first\./)).toBeInTheDocument();
     expect(screen.getByText("Replace the current content")).toBeInTheDocument();
     expect(screen.queryByText("same.txt")).not.toBeInTheDocument();
     expect(await screen.findByTestId("patch-diff")).toHaveTextContent("+saved");
@@ -101,9 +100,18 @@ describe("DiscardedChangesDialog", () => {
 
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Restore 1 Path" })));
     expect(ipc.restoreRecoveryPoint).toHaveBeenCalledWith("build-box", "/repo", "/repo", restorePlan);
-    expect(onSnapshot).toHaveBeenCalledWith(snapshot);
     expect(onBusyChange.mock.calls).toEqual([[true], [false]]);
+    // The list loads again, now with the point holding what the restore replaced.
     expect(await screen.findByText("Replaced while restoring")).toBeInTheDocument();
+    expect(ipc.loadRecoveryPoints).toHaveBeenCalledTimes(2);
+  });
+
+  it("says how many saved paths a restore covers beyond those it lists", async () => {
+    ipc.planRecoveryRestore.mockResolvedValue({ ...restorePlan, omitted: 2 });
+    renderDialog();
+    fireEvent.click(await screen.findByRole("button", { name: "Review Restore…" }));
+    expect(await screen.findByText(/2 more saved paths are too many to list here; the restore covers them too\./)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Restore" })).toBeEnabled();
   });
 
   it("reviews the restore again after a refusal, without the earlier preview", async () => {
@@ -125,7 +133,7 @@ describe("DiscardedChangesDialog", () => {
     ipc.planRecoveryRestore
       .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
       .mockResolvedValueOnce(olderPlan);
-    ipc.restoreRecoveryPoint.mockResolvedValue({ snapshot, replaced: null } satisfies RecoveryRestoreResult);
+    ipc.restoreRecoveryPoint.mockResolvedValue({ replaced: null } satisfies RecoveryRestoreResult);
     renderDialog();
     fireEvent.click(await screen.findByRole("button", { name: "Review Restore…" }));
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
@@ -141,6 +149,9 @@ describe("DiscardedChangesDialog", () => {
 
   it("deletes only the reviewed selection", async () => {
     ipc.deleteRecoveryPoints.mockResolvedValue(undefined);
+    ipc.loadRecoveryPoints
+      .mockResolvedValueOnce({ points: [newest, sibling, older], omitted: 0 })
+      .mockResolvedValueOnce({ points: [sibling], omitted: 0 });
     renderDialog();
     const first = await screen.findByRole("checkbox", { name: "Select “Discarded changes to a.txt” for deletion" });
     expect(screen.getByRole("button", { name: "Delete…" })).toBeDisabled();
@@ -159,7 +170,8 @@ describe("DiscardedChangesDialog", () => {
     ]);
     const list = screen.getByRole("region", { name: "Recovery points" });
     expect(within(list).getAllByRole("button")).toHaveLength(1);
-    expect(ipc.loadRecoveryPoints).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(ipc.loadRecoveryPoints).toHaveBeenCalledTimes(2));
+    expect(within(list).getAllByRole("button")).toHaveLength(1);
   });
 
   it("says how many older points were left out and lists them once a deletion makes room", async () => {

@@ -352,16 +352,19 @@ export type DiscardTarget =
 
 export type DiscardEffect = "restoreCommitted" | "restoreStaged" | "remove" | "unstage";
 
+/** One path a discard changes. A rename is two entries: its new name and its original one. */
 export interface DiscardPlanEntry {
   path: GitPath;
-  previousPath: GitPath | null;
-  kind: FileChangeKind;
   effect: DiscardEffect;
+  /** A file is at the path now. */
+  onDisk: boolean;
+  /** The index has an entry for the path now. */
+  tracked: boolean;
 }
 
-export type KeptChangeReason = "submodule" | "nestedRepository";
+export type KeptChangeReason = "submodule" | "nestedRepository" | "fileFolderConflict";
 
-/** A change a discard leaves alone because its content cannot be saved in a recovery point. */
+/** A change a discard leaves alone because it cannot save everything discarding it would replace. */
 export interface KeptChange {
   path: GitPath;
   reason: KeptChangeReason;
@@ -377,7 +380,6 @@ export interface DiscardPlan {
 }
 
 export interface DiscardResult {
-  snapshot: WorkingCopySnapshot;
   recoveryPoint: RecoveryPoint;
 }
 
@@ -422,12 +424,14 @@ export interface RecoveryRestoreEntry {
 
 export interface RecoveryRestorePlan {
   point: RecoveryPoint;
+  /** As many entries as fit in one response. */
   entries: RecoveryRestoreEntry[];
+  /** Saved paths the restore covers beyond `entries`. */
+  omitted: number;
   fingerprint: string;
 }
 
 export interface RecoveryRestoreResult {
-  snapshot: WorkingCopySnapshot;
   /** The recovery point holding what the restore replaced, when there was anything. */
   replaced: RecoveryPoint | null;
 }

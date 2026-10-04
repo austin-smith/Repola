@@ -70,7 +70,7 @@ import {
   unwatchWorktree,
   watchWorktree,
 } from "../ipc/worktrees";
-import type { CommitSigning, ConflictResolutionKind, DiscardResult, FileChange, FileDiff, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../ipc/types";
+import type { CommitSigning, ConflictResolutionKind, DiscardPlan, DiscardResult, FileChange, FileDiff, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../ipc/types";
 import { ChangeKindFilter, ChangeKindFilterTrigger, ChangeKindIcon } from "./ChangeKindFilter";
 import { parseCommitPeople, parseCommitTrailers } from "./commit-form";
 import { useWorkingCopy } from "./context";
@@ -78,6 +78,15 @@ import { sectionHeadingClass, signingItems } from "./labels";
 import { LazyDialog } from "./LazyDialog";
 import { ConflictResolutionDialog, DiffDialog, DiscardDialog, DiscardedChangesDialog, InlineFileDiff } from "./lazy";
 import { operationGuidance, operationLabel, operationSupportsSkip } from "./operations";
+
+/** Asks the workbench showing a working copy to open one of its recovery points. */
+const SHOW_RECOVERY_POINT = "repola:show-recovery-point";
+
+interface ShowRecoveryPoint {
+  machineId: string;
+  worktreePath: string;
+  pointId: string;
+}
 
 export function ChangesWorkbench() {
   const { machineId, machineKind, machineOs, repository, worktree } = useWorkingCopy();
@@ -118,8 +127,9 @@ export function ChangesWorkbench() {
   const [changeSelection, setChangeSelection] = useState(emptyChangeSelection);
   const [commitSelections, setCommitSelections] = useState<CommitSelectionMap>(() => new Map());
   const changesListRef = useRef<HTMLDivElement>(null);
-  // A discard or restore is running in one of the dialogs.
+  // A discard, or a restore or deletion of recovery points, is running.
   const [discardBusy, setDiscardBusy] = useState(false);
+  const [recoveryBusy, setRecoveryBusy] = useState(false);
   const [commitBusy, setCommitBusy] = useState(false);
   const [syncBusy, setSyncBusy] = useState(false);
   const [operationBusy, setOperationBusy] = useState(false);
@@ -154,6 +164,9 @@ export function ChangesWorkbench() {
     setChangeSelection(emptyChangeSelection);
     setCommitSelections(new Map());
     setError(null);
+    // Reviews belong to the working copy they were made for.
+    setPendingDiscard(null);
+    setRecoveryOpen(null);
     void fetchWorkingCopy(machineId, repository.path, worktree.path, controller.signal)
       .then((next) => {
         setSnapshot(next);
@@ -176,11 +189,10 @@ export function ChangesWorkbench() {
     }
   }, [machineId, repository.path, worktree.id, worktree.path]);
 
-  // Mutations replace the snapshot with their own result, so a disk-triggered reload
-  // while one is running would only race it.
-  const mutating = discardBusy || commitBusy || syncBusy || operationBusy;
+  // A reload while a mutation runs would only race it, so none runs then; once
+  // the mutation ends, successful or not, the working copy loads again.
+  const mutating = discardBusy || recoveryBusy || commitBusy || syncBusy || operationBusy;
   const mutatingRef = useRef(mutating);
-  useEffect(() => { mutatingRef.current = mutating; }, [mutating]);
   const reloadController = useRef<AbortController | null>(null);
   const pendingReload = useRef<Promise<void> | null>(null);
   const reloadSnapshot = useCallback(() => {
@@ -206,7 +218,8 @@ export function ChangesWorkbench() {
             generating.abort();
             setGenerationCancelling(true);
           }
-          setError(toMessage(cause));
+          // A failed mutation's own error says more than the reload after it.
+          setError((current) => current ?? toMessage(cause));
         }
       })
       .finally(() => {
@@ -217,6 +230,26 @@ export function ChangesWorkbench() {
       });
   }, [machineId, repository.path, setSnapshot, worktree.path]);
   useEffect(() => () => reloadController.current?.abort(), []);
+  const wasMutating = useRef(false);
+  useEffect(() => {
+    mutatingRef.current = mutating;
+    if (mutating) reloadController.current?.abort();
+    else if (wasMutating.current) reloadSnapshot();
+    wasMutating.current = mutating;
+  }, [mutating, reloadSnapshot]);
+  // A toast's "Show" outlives the workbench that raised it, so it asks through
+  // an event any workbench for the same working copy can answer.
+  useEffect(() => {
+    const onShow = (event: Event) => {
+      const detail = (event as CustomEvent<ShowRecoveryPoint>).detail;
+      // Like the menu item, it waits until nothing else is changing files.
+      if (detail.machineId === machineId && detail.worktreePath === worktree.path && !mutatingRef.current) {
+        setRecoveryOpen({ pointId: detail.pointId });
+      }
+    };
+    window.addEventListener(SHOW_RECOVERY_POINT, onShow);
+    return () => window.removeEventListener(SHOW_RECOVERY_POINT, onShow);
+  }, [machineId, worktree.path]);
 
   // Refresh when files change on disk (local machines) and whenever the window regains focus,
   // so edits and Git commands made outside Repola show up without a manual refresh.
@@ -482,15 +515,19 @@ export function ChangesWorkbench() {
     }
   };
 
-  const completeDiscard = (result: DiscardResult) => {
-    setSnapshot(result.snapshot);
+  const completeDiscard = (result: DiscardResult, plan: DiscardPlan) => {
     setPendingDiscard(null);
     const point = result.recoveryPoint;
+    const kept = plan.kept.length;
+    const show: ShowRecoveryPoint = { machineId, worktreePath: worktree.path, pointId: point.id };
     toast.add({
       type: "success",
-      title: point.kind === "discardAll" ? "All changes discarded" : "Changes discarded",
-      description: `Saved as a recovery point ${recoveryLocation(machineKind)}.`,
-      actionProps: { children: "Show", onClick: () => setRecoveryOpen({ pointId: point.id }) },
+      title: point.kind === "discardAll" && kept === 0 ? "All changes discarded" : "Changes discarded",
+      description: `Saved as a recovery point ${recoveryLocation(machineKind)}.${kept > 0 ? ` ${kept} change${kept === 1 ? " was" : "s were"} left alone.` : ""}`,
+      actionProps: {
+        children: "Show",
+        onClick: () => window.dispatchEvent(new CustomEvent(SHOW_RECOVERY_POINT, { detail: show })),
+      },
     });
   };
 
@@ -559,14 +596,14 @@ export function ChangesWorkbench() {
                     <ArchiveIcon aria-hidden="true" />
                     Stashes
                   </DropdownMenuItem>
-                  <DropdownMenuItem disabled={!snapshot || commitBusy || discardBusy} onClick={() => setRecoveryOpen({ pointId: null })}>
+                  <DropdownMenuItem disabled={!snapshot || mutating} onClick={() => setRecoveryOpen({ pointId: null })}>
                     <ArchiveRestoreIcon aria-hidden="true" />
                     Discarded changes…
                   </DropdownMenuItem>
                 </DropdownMenuGroup>
                 <DropdownMenuSeparator />
                 <DropdownMenuGroup>
-                  <DropdownMenuItem variant="destructive" disabled={!snapshot || visibleChanges.length === 0 || commitBusy || discardBusy || snapshot.operation !== null} onClick={() => setPendingDiscard({ change: null })}>
+                  <DropdownMenuItem variant="destructive" disabled={!snapshot || visibleChanges.length === 0 || mutating || generateBusy || snapshot.operation !== null} onClick={() => setPendingDiscard({ change: null })}>
                     <Trash2Icon aria-hidden="true" />
                     Discard all changes…
                   </DropdownMenuItem>
@@ -714,7 +751,7 @@ export function ChangesWorkbench() {
               <ContextMenuContent className="min-w-52">
                 <ContextMenuItem
                   variant="destructive"
-                  disabled={discardBusy || commitBusy || generateBusy || snapshot?.operation !== null || fileDiscardBlocker(change) !== null}
+                  disabled={mutating || generateBusy || snapshot?.operation !== null || fileDiscardBlocker(change) !== null}
                   title={fileDiscardBlocker(change) ?? undefined}
                   onClick={() => setPendingDiscard({ change })}
                 >
@@ -916,8 +953,7 @@ export function ChangesWorkbench() {
             repositoryPath={repository.path}
             worktreePath={worktree.path}
             initialPointId={recoveryOpen.pointId}
-            onBusyChange={setDiscardBusy}
-            onSnapshot={setSnapshot}
+            onBusyChange={setRecoveryBusy}
             onClose={() => setRecoveryOpen(null)}
           />
         </LazyDialog>

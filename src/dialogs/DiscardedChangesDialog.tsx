@@ -27,7 +27,6 @@ import type {
   RecoveryFileDiff,
   RecoveryPoint,
   RecoveryRestorePlan,
-  WorkingCopySnapshot,
 } from "../ipc/types";
 import {
   deleteRecoveryPoints,
@@ -44,9 +43,8 @@ interface DiscardedChangesDialogProps {
   worktreePath: string;
   /** The recovery point to show first, such as the one a discard just created. */
   initialPointId?: string | null;
-  /** Reports while a restore or deletion runs, so the owner can hold back refreshes that would race it. */
+  /** Reports while a restore or deletion runs; the owner reloads the working copy once it ends. */
   onBusyChange: (busy: boolean) => void;
-  onSnapshot: (snapshot: WorkingCopySnapshot) => void;
   onClose: () => void;
 }
 
@@ -67,14 +65,25 @@ export default function DiscardedChangesDialog({
   worktreePath,
   initialPointId = null,
   onBusyChange,
-  onSnapshot,
   onClose,
 }: DiscardedChangesDialogProps) {
   const [points, setPoints] = useState<RecoveryPoint[] | null>(null);
   // Older points left out because the list would not fit in one response.
   const [omitted, setOmitted] = useState(0);
+  // Bumped to load the list again after a restore or deletion changed it.
   const [listing, setListing] = useState(0);
+  const [listError, setListError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // An outcome that arrives after the dialog closed is still reported.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  const report = (message: string) => {
+    if (mounted.current) setError(message);
+    else toast.add({ type: "error", title: "Discarded Changes", description: message });
+  };
   const [activeId, setActiveId] = useState<string | null>(initialPointId);
   const [checked, setChecked] = useState<ReadonlySet<string>>(() => new Set());
   const [view, setView] = useState<View>({ kind: "list" });
@@ -88,11 +97,13 @@ export default function DiscardedChangesDialog({
     const controller = new AbortController();
     void loadRecoveryPoints(machineId, repositoryPath, worktreePath, controller.signal)
       .then((next) => {
+        if (controller.signal.aborted) return;
         setPoints(next.points);
         setOmitted(next.omitted);
+        setListError(null);
         setActiveId((current) => (current && next.points.some((point) => point.id === current) ? current : next.points[0]?.id ?? null));
       })
-      .catch((cause: unknown) => { if (!controller.signal.aborted) setError(toMessage(cause)); });
+      .catch((cause: unknown) => { if (!controller.signal.aborted) setListError(toMessage(cause)); });
     return () => controller.abort();
   }, [listing, machineId, repositoryPath, worktreePath]);
 
@@ -127,12 +138,9 @@ export default function DiscardedChangesDialog({
     setError(null);
     try {
       const result = await restoreRecoveryPoint(machineId, repositoryPath, worktreePath, plan);
-      onSnapshot(result.snapshot);
       const replaced = result.replaced;
-      if (replaced) {
-        setPoints((current) => [replaced, ...(current ?? [])]);
-      }
       setView({ kind: "list" });
+      setListing((current) => current + 1);
       toast.add({
         type: "success",
         title: "Discarded changes restored",
@@ -143,7 +151,7 @@ export default function DiscardedChangesDialog({
     } catch (cause) {
       // Show the failure against a fresh review of the working copy as it is now.
       reviewRestore(plan.point);
-      setError(toMessage(cause));
+      report(toMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -165,10 +173,10 @@ export default function DiscardedChangesDialog({
       setChecked(new Set());
       setActiveId((current) => (current && remaining.some((point) => point.id === current) ? current : remaining[0]?.id ?? null));
       setView({ kind: "list" });
-      // Older points the list left out may fit now.
-      if (omitted > 0) setListing((current) => current + 1);
+      // The list loads again, so older points it left out can take their place.
+      setListing((current) => current + 1);
     } catch (cause) {
-      setError(toMessage(cause));
+      report(toMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -209,10 +217,11 @@ export default function DiscardedChangesDialog({
         <DialogHeader>
           <DialogTitle>Discarded Changes</DialogTitle>
           <DialogDescription>
-            Before discarding or overwriting anything, Repola saves it as a recovery point {recoveryLocation(machineKind)}. Recovery points stay until you delete them.
+            When you discard changes, Repola first saves them as a recovery point {recoveryLocation(machineKind)}, and a restore saves whatever it replaces the same way. Recovery points stay until you delete them.
           </DialogDescription>
         </DialogHeader>
         {error ? <ActionableGitError message={error} /> : null}
+        {view.kind === "list" && listError ? <ActionableGitError message={listError} /> : null}
         {view.kind === "delete" ? (
           <DeleteReview points={view.points} busy={busy} onBack={() => setView({ kind: "list" })} onConfirm={() => void remove(view.points)} />
         ) : view.kind === "restore" ? (
@@ -232,7 +241,7 @@ export default function DiscardedChangesDialog({
           <>
             <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,2fr)_minmax(0,3fr)] border">
               <section aria-label="Recovery points" className="min-h-0 overflow-y-auto border-r">
-                {points === null && !error ? <div className="grid h-32 place-items-center"><Spinner className="size-5" /></div> : null}
+                {points === null && !listError ? <div className="grid h-32 place-items-center"><Spinner className="size-5" /></div> : null}
                 {points?.length === 0 ? <p className="p-6 text-center text-sm text-muted-foreground">Nothing has been discarded in this repository yet.</p> : null}
                 {here.map(renderPoint)}
                 {elsewhere.length > 0 ? (
@@ -367,9 +376,10 @@ function RestoreReview({
       {plan ? (
         <>
           <p className="text-sm">
-            {changes.length === 0
+            {changes.length === 0 && plan.omitted === 0
               ? "This working copy already matches the recovery point."
-              : `Restoring “${plan.point.summary}” changes ${changes.length} path${changes.length === 1 ? "" : "s"}. Whatever it replaces is saved as a new recovery point first.`}
+              : `Restoring “${plan.point.summary}” changes ${changes.length} listed path${changes.length === 1 ? "" : "s"}. Whatever it replaces is saved as a new recovery point first.`}
+            {plan.omitted > 0 ? ` ${plan.omitted} more saved path${plan.omitted === 1 ? " is" : "s are"} too many to list here; the restore covers ${plan.omitted === 1 ? "it" : "them"} too.` : null}
           </p>
           <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,2fr)_minmax(0,3fr)] border">
             <section aria-label="Paths to restore" className="min-h-0 overflow-y-auto border-r">
@@ -409,9 +419,9 @@ function RestoreReview({
           <ArrowLeftIcon data-icon="inline-start" aria-hidden="true" />
           Back
         </Button>
-        <Button disabled={busy || !plan || changes.length === 0} onClick={() => { if (plan) onConfirm(plan); }}>
+        <Button disabled={busy || !plan || (changes.length === 0 && plan.omitted === 0)} onClick={() => { if (plan) onConfirm(plan); }}>
           {busy ? <Spinner data-icon="inline-start" /> : <ArchiveRestoreIcon data-icon="inline-start" aria-hidden="true" />}
-          {busy ? "Restoring…" : `Restore ${changes.length} Path${changes.length === 1 ? "" : "s"}`}
+          {busy ? "Restoring…" : plan && plan.omitted > 0 ? "Restore" : `Restore ${changes.length} Path${changes.length === 1 ? "" : "s"}`}
         </Button>
       </DialogFooter>
     </>

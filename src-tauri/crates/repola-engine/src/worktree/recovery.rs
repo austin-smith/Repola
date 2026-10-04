@@ -34,7 +34,7 @@ use super::models::{
 };
 use super::working_copy::{
     decode_path_token_bytes, hex, literal_pathspec, null_device, os_string_from_path_bytes,
-    truncate_file_patch, working_copy_snapshot,
+    working_copy_snapshot,
 };
 
 const RECOVERY_REF_NAMESPACE: &str = "refs/repola/discarded";
@@ -42,25 +42,30 @@ const MANIFEST_VERSION: u32 = 1;
 /// Paths listed in a summary for display; the manifest holds all of them.
 const SUMMARY_SAMPLE_PATHS: usize = 20;
 const MAX_SUMMARY_BYTES: usize = 64 * 1024;
+pub(super) const CHANGED_WHILE_SAVING: &str =
+    "The working copy changed while Repola was saving it. Nothing was changed; review it again.";
 /// Summaries read per Git invocation: at most 16 MiB, half the capture limit.
 const SUMMARIES_PER_READ: usize = 256;
 /// Listed points per response: half of what one SSH protocol frame carries.
 const MAX_LISTED_BYTES: usize = 8 * 1024 * 1024;
+/// Content hashed per Git process, well within the per-command time limit even
+/// when every byte is written to the object store.
+const HASH_CHUNK_BYTES: u64 = 1024 * 1024 * 1024;
+/// Up to this many paths, Git is asked about each one; beyond it, reading the
+/// whole index or tree once is faster than matching every entry against
+/// every path.
+const PATHSPEC_LIMIT: usize = 512;
 const MAX_RECOVERY_ID_BYTES: usize = 128;
 /// Paths per Git invocation stay well inside the Windows command-line limit.
 /// No single path may exceed it, since a path is never split across chunks;
 /// UTF-8 is never shorter than the UTF-16 Windows counts, so one that fits in
 /// bytes fits there too.
 const ARGUMENT_BUDGET_BYTES: usize = 16 * 1024;
+/// A restore preview's patch, once encoded, stays within half of one SSH
+/// protocol frame.
+const MAX_PREVIEW_PATCH_BYTES: usize = 8 * 1024 * 1024;
 /// Either side of a restore preview larger than this is not diffed.
 const MAX_PREVIEW_SIDE_BYTES: u64 = 8 * 1024 * 1024;
-
-/// Git's default for `core.symlinks` on this platform: Git for Windows
-/// checks symbolic links out as plain files unless configured otherwise.
-#[cfg(windows)]
-const DEFAULT_CORE_SYMLINKS: bool = false;
-#[cfg(not(windows))]
-const DEFAULT_CORE_SYMLINKS: bool = true;
 
 /// The observed state of one path: its index entries (every stage when it is
 /// conflicted) and what is on disk at that path.
@@ -76,6 +81,28 @@ pub(super) struct PathState {
     /// appears after a review invalidates it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub directory: bool,
+    /// How many of the path's parent folders exist, counted from the top. A
+    /// restore removes only the folders below these, so folders that existed
+    /// before, even empty ones, stay.
+    #[serde(default)]
+    pub parents: usize,
+    /// A parent of the path is a file or a link. Writing the path would
+    /// replace it, and it is not saved, so nothing is written there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blocked: bool,
+    /// How many paths the index holds beneath the path, as if it were a folder.
+    /// Writing the path's own entry would drop them.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub index_beneath: usize,
+    /// The index holds one of the path's parents as an entry of its own, as
+    /// if it were a file; this is how many components that parent has.
+    /// Writing the path's entry would drop it. The index can hold at most one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_parent: Option<usize>,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 impl PathState {
@@ -118,6 +145,10 @@ pub(super) struct WorktreeEntry {
     /// target), hashed without Git's clean filters.
     pub oid: String,
     pub size: u64,
+    /// The file's permission bits, so a restore does not widen access to a
+    /// private file. Unix only; links have none of their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,40 +408,71 @@ pub(super) fn observe_paths(
     if config_bool(worktree, "core.ignorecase", false)? {
         refuse_case_collisions(paths, &validated)?;
     }
-    let mut index = index_entries(worktree, head, &validated)?;
+    let IndexListing {
+        entries: mut index,
+        beneath,
+    } = index_entries(worktree, head, &validated)?;
+    let above = indexed_parents(worktree, &validated)?;
 
     enum Source {
         File(OsString),
         Link(Vec<u8>),
     }
+    struct Observed {
+        index: Vec<IndexEntry>,
+        entry: Option<(WorktreeEntryKind, u64, Option<u32>, Source)>,
+        directory: bool,
+        parents: usize,
+        blocked: bool,
+    }
     let mut observed = Vec::with_capacity(paths.len());
     for (path, valid) in paths.iter().zip(&validated) {
-        let entries = index.remove(&valid.bytes).unwrap_or_default();
-        let Some(location) = inspect_path(worktree, valid)? else {
-            observed.push((entries, None, false));
-            continue;
+        let (parents, blocked) = parent_chain(worktree, valid)?;
+        let mut item = Observed {
+            index: index.remove(&valid.bytes).unwrap_or_default(),
+            entry: None,
+            directory: false,
+            parents,
+            blocked,
+        };
+        let location = match inspect_path(worktree, valid)? {
+            Some(location) if !blocked => location,
+            _ => {
+                observed.push(item);
+                continue;
+            }
         };
         let metadata = match fs::symlink_metadata(&location) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                observed.push((entries, None, false));
+                observed.push(item);
                 continue;
             }
             Err(error) => return Err(format!("{} could not be inspected: {error}", path.display)),
         };
         let file_type = metadata.file_type();
         if file_type.is_dir() {
-            observed.push((entries, None, true));
+            item.directory = true;
+            observed.push(item);
             continue;
         }
-        let entry = if file_type.is_symlink() {
+        // Windows refuses to remove or replace a read-only file, so nothing
+        // is saved or changed until the attribute is cleared.
+        #[cfg(windows)]
+        if metadata.permissions().readonly() {
+            return Err(format!(
+                "{} is read-only. Clear its read-only attribute, then try again.",
+                path.display
+            ));
+        }
+        item.entry = Some(if file_type.is_symlink() {
             let target = fs::read_link(&location)
                 .map_err(|error| format!("{} could not be read: {error}", path.display))?;
             let target = link_target_bytes(target, &path.display)?;
             let size = target.len() as u64;
-            (WorktreeEntryKind::Symlink, size, Source::Link(target))
+            (WorktreeEntryKind::Symlink, size, None, Source::Link(target))
         } else if file_type.is_file() {
-            let kind = if is_executable(&metadata, &entries) {
+            let kind = if is_executable(&metadata, &item.index) {
                 WorktreeEntryKind::Executable
             } else {
                 WorktreeEntryKind::File
@@ -418,6 +480,7 @@ pub(super) fn observe_paths(
             (
                 kind,
                 metadata.len(),
+                permission_bits(&metadata),
                 Source::File(valid.relative().into_os_string()),
             )
         } else {
@@ -425,40 +488,127 @@ pub(super) fn observe_paths(
                 "{} is neither a file nor a directory in the working copy, so Repola cannot save it.",
                 path.display
             ));
-        };
-        observed.push((entries, Some(entry), false));
+        });
+        observed.push(item);
     }
 
-    let files: Vec<OsString> = observed
+    let files: Vec<(OsString, u64)> = observed
         .iter()
-        .filter_map(|(_, entry, _)| match entry {
-            Some((_, _, Source::File(path))) => Some(path.clone()),
+        .filter_map(|item| match &item.entry {
+            Some((_, size, _, Source::File(path))) => Some((path.clone(), *size)),
             _ => None,
         })
         .collect();
     let mut file_oids = hash_files(worktree, files, store)?.into_iter();
     let mut states = Vec::with_capacity(observed.len());
-    for (path, (index, entry, directory)) in paths.iter().zip(observed) {
-        let worktree_entry = match entry {
+    for ((path, valid), item) in paths.iter().zip(&validated).zip(observed) {
+        let worktree_entry = match item.entry {
             None => None,
-            Some((kind, size, source)) => {
+            Some((kind, size, permissions, source)) => {
                 let oid = match source {
                     Source::File(_) => file_oids
                         .next()
                         .ok_or_else(|| "Git did not hash every working-tree file.".to_string())?,
                     Source::Link(target) => hash_bytes(worktree, &target, store)?,
                 };
-                Some(WorktreeEntry { kind, oid, size })
+                Some(WorktreeEntry {
+                    kind,
+                    oid,
+                    size,
+                    permissions,
+                })
             }
         };
         states.push(PathState {
             path: path.clone(),
-            index,
+            index: item.index,
             worktree: worktree_entry,
-            directory,
+            directory: item.directory,
+            parents: item.parents,
+            blocked: item.blocked,
+            index_beneath: beneath.get(&valid.bytes).copied().unwrap_or(0),
+            indexed_parent: parent_paths(&valid.bytes)
+                .find(|parent| above.contains(*parent))
+                .map(|parent| parent.split(|byte| *byte == b'/').count()),
         });
     }
     Ok(states)
+}
+
+/// Every proper parent of `path`: `a` and `a/b` for `a/b/c`.
+fn parent_paths(path: &[u8]) -> impl Iterator<Item = &[u8]> {
+    path.iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'/')
+        .map(move |(index, _)| &path[..index])
+}
+
+/// The parents of `paths` that the index holds as entries of their own, at
+/// any stage. Such a parent has nothing beneath it in the index, so listing
+/// everything under each path's top folder includes it; the listing reads no
+/// objects and goes to a file, however much lies beneath.
+fn indexed_parents(worktree: &Path, paths: &[WorktreePath]) -> Result<HashSet<Vec<u8>>, String> {
+    let parents: HashSet<&[u8]> = paths
+        .iter()
+        .flat_map(|path| parent_paths(&path.bytes))
+        .collect();
+    let tops: HashSet<&[u8]> = parents
+        .iter()
+        .map(|parent| leading_components(parent, 1))
+        .collect();
+    let mut indexed = HashSet::new();
+    let pathspecs = tops
+        .into_iter()
+        .map(|top| os_string_from_path_bytes(top.to_vec()).map(literal_pathspec))
+        .collect::<Result<Vec<_>, _>>()?;
+    for chunk in argument_chunks(pathspecs) {
+        let mut args = ["ls-files", "-z", "--"].map(OsString::from).to_vec();
+        args.extend(chunk);
+        let file = git_to_temporary_file(worktree, args, "read the index entries")?;
+        for_each_record(file, |path| {
+            if parents.contains(path) {
+                indexed.insert(path.to_vec());
+            }
+            Ok(())
+        })?;
+    }
+    Ok(indexed)
+}
+
+/// How many of `path`'s parent folders exist as real folders, counted from
+/// the top, and whether the first that does not is a file or a link rather
+/// than missing.
+fn parent_chain(worktree: &Path, path: &WorktreePath) -> Result<(usize, bool), String> {
+    let parents = &path.components[..path.components.len().saturating_sub(1)];
+    let mut current = worktree.to_path_buf();
+    for (depth, component) in parents.iter().enumerate() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return Ok((depth, true)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((depth, false))
+            }
+            Err(error) => {
+                return Err(format!(
+                    "{} could not be inspected: {error}",
+                    current.display()
+                ))
+            }
+        }
+    }
+    Ok((parents.len(), false))
+}
+
+#[cfg(unix)]
+fn permission_bits(metadata: &fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(metadata.permissions().mode() & 0o7777)
+}
+
+#[cfg(windows)]
+fn permission_bits(_metadata: &fs::Metadata) -> Option<u32> {
+    None
 }
 
 #[cfg(unix)]
@@ -492,109 +642,208 @@ fn link_target_bytes(target: PathBuf, display: &str) -> Result<Vec<u8>, String> 
         .map_err(|_| format!("The link target of {display} is not valid Unicode."))
 }
 
-/// Observes only the index entries of `paths`, for changes that leave their
-/// working tree untouched. Whatever occupies such a path on disk is not part
-/// of the change, so it is neither fingerprinted nor saved.
-pub(super) fn observe_index(
-    worktree: &Path,
-    head: Option<&str>,
-    paths: &[GitPath],
-) -> Result<Vec<PathState>, String> {
-    let validated = paths
-        .iter()
-        .map(WorktreePath::new)
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut index = index_entries(worktree, head, &validated)?;
-    Ok(paths
-        .iter()
-        .zip(&validated)
-        .map(|(path, valid)| PathState {
-            path: path.clone(),
-            index: index.remove(&valid.bytes).unwrap_or_default(),
-            worktree: None,
-            directory: false,
-        })
-        .collect())
+/// The index entries of some paths, and which of those paths have entries
+/// beneath them.
+struct IndexListing {
+    entries: HashMap<Vec<u8>, Vec<IndexEntry>>,
+    beneath: HashMap<Vec<u8>, usize>,
 }
 
 fn index_entries(
     worktree: &Path,
     head: Option<&str>,
     paths: &[WorktreePath],
-) -> Result<HashMap<Vec<u8>, Vec<IndexEntry>>, String> {
+) -> Result<IndexListing, String> {
     let base = match head {
         Some(head) => head.to_string(),
         None => empty_tree(worktree)?,
     };
     let wanted: HashSet<&[u8]> = paths.iter().map(|path| path.bytes.as_slice()).collect();
-    let arguments = paths
-        .iter()
-        .map(|path| os_string_from_path_bytes(path.bytes.clone()).map(literal_pathspec))
-        .collect::<Result<Vec<_>, _>>()?;
     let mut entries: HashMap<Vec<u8>, Vec<IndexEntry>> = HashMap::new();
-    for chunk in argument_chunks(arguments) {
-        let intent_to_add = intent_to_add_paths(worktree, &base, &chunk)?;
-        let mut args = vec![
-            OsString::from("ls-files"),
-            OsString::from("--stage"),
-            // Prefixes each entry with a tag that carries its flags: `S` for
-            // skip-worktree, and lowercase for assume-unchanged.
-            OsString::from("-v"),
-            OsString::from("-z"),
-            OsString::from("--"),
-        ];
-        args.extend(chunk);
-        let output = git_stdout(worktree, args, "read the index entries")?;
-        for record in output
-            .split(|byte| *byte == 0)
-            .filter(|record| !record.is_empty())
-        {
-            let (fields, path) = split_once(record, b'\t')
-                .ok_or_else(|| "Git returned a malformed index entry.".to_string())?;
-            if !wanted.contains(path) {
-                continue;
+    let mut beneath: HashMap<Vec<u8>, usize> = HashMap::new();
+    // Conflicted paths list one entry per stage; each path counts once.
+    let mut counted: HashSet<Vec<u8>> = HashSet::new();
+    let mut record = |record: &[u8], intent_to_add: &HashSet<Vec<u8>>| -> Result<(), String> {
+        let (fields, path) = split_once(record, b'\t')
+            .ok_or_else(|| "Git returned a malformed index entry.".to_string())?;
+        // Even an entry that is wanted itself can lie beneath another.
+        if counted.insert(path.to_vec()) {
+            for parent in parent_paths(path).filter(|parent| wanted.contains(parent)) {
+                *beneath.entry(parent.to_vec()).or_default() += 1;
             }
-            let fields = String::from_utf8_lossy(fields);
-            let mut fields = fields.split(' ');
-            let (Some(tag), Some(mode), Some(oid), Some(stage), None) = (
-                fields.next(),
-                fields.next(),
-                fields.next(),
-                fields.next(),
-                fields.next(),
-            ) else {
-                return Err("Git returned a malformed index entry.".into());
-            };
-            let stage = stage
-                .parse()
-                .map_err(|_| "Git returned a malformed index stage.".to_string())?;
-            entries.entry(path.to_vec()).or_default().push(IndexEntry {
+        }
+        if !wanted.contains(path) {
+            return Ok(());
+        }
+        let fields = String::from_utf8_lossy(fields);
+        let mut fields = fields.split(' ');
+        let (Some(tag), Some(mode), Some(oid), Some(stage), None) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            return Err("Git returned a malformed index entry.".into());
+        };
+        let stage = stage
+            .parse()
+            .map_err(|_| "Git returned a malformed index stage.".to_string())?;
+        entries.entry(path.to_vec()).or_default().push(IndexEntry {
+            mode: mode.to_string(),
+            oid: oid.to_string(),
+            stage,
+            intent_to_add: stage == 0 && intent_to_add.contains(path),
+            assume_unchanged: tag.chars().all(|tag| tag.is_ascii_lowercase()),
+            skip_worktree: tag.eq_ignore_ascii_case("S"),
+        });
+        Ok(())
+    };
+    // `-v` prefixes each entry with a tag that carries its flags: `S` for
+    // skip-worktree, and lowercase for assume-unchanged.
+    let listing = ["ls-files", "--stage", "-v", "-z"].map(OsString::from);
+    if paths.len() > PATHSPEC_LIMIT {
+        let intent_to_add = intent_to_add_paths(worktree, &base, &[])?;
+        let mut args = listing.to_vec();
+        args.push(OsString::from("--"));
+        let file = git_to_temporary_file(worktree, args, "read the index entries")?;
+        for_each_record(file, |item| record(item, &intent_to_add))?;
+    } else {
+        for chunk in argument_chunks(literal_pathspecs(paths)?) {
+            let intent_to_add = intent_to_add_paths(worktree, &base, &chunk)?;
+            let mut args = listing.to_vec();
+            args.push(OsString::from("--"));
+            args.extend(chunk);
+            let output = git_stdout(worktree, args, "read the index entries")?;
+            for item in output
+                .split(|byte| *byte == 0)
+                .filter(|item| !item.is_empty())
+            {
+                record(item, &intent_to_add)?;
+            }
+        }
+    }
+    Ok(IndexListing { entries, beneath })
+}
+
+/// What the last commit holds at a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HeadEntry {
+    pub mode: String,
+    /// `blob`, `tree`, or `commit` (a submodule).
+    pub kind: String,
+    pub oid: String,
+}
+
+/// HEAD's entries at `paths`; a path HEAD lacks is absent from the map.
+pub(super) fn head_entries(
+    worktree: &Path,
+    head: &str,
+    paths: &[GitPath],
+) -> Result<HashMap<Vec<u8>, HeadEntry>, String> {
+    let validated = paths
+        .iter()
+        .map(WorktreePath::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    let wanted: HashSet<&[u8]> = validated.iter().map(|path| path.bytes.as_slice()).collect();
+    let mut entries = HashMap::new();
+    let mut record = |record: &[u8]| -> Result<(), String> {
+        let (fields, path) = split_once(record, b'\t')
+            .ok_or_else(|| "Git returned a malformed tree entry.".to_string())?;
+        if !wanted.contains(path) {
+            return Ok(());
+        }
+        let fields = String::from_utf8_lossy(fields);
+        let mut fields = fields.split(' ');
+        let (Some(mode), Some(kind), Some(oid), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err("Git returned a malformed tree entry.".into());
+        };
+        entries.insert(
+            path.to_vec(),
+            HeadEntry {
                 mode: mode.to_string(),
+                kind: kind.to_string(),
                 oid: oid.to_string(),
-                stage,
-                intent_to_add: stage == 0 && intent_to_add.contains(path),
-                assume_unchanged: tag.chars().all(|tag| tag.is_ascii_lowercase()),
-                skip_worktree: tag.eq_ignore_ascii_case("S"),
-            });
+            },
+        );
+        Ok(())
+    };
+    if validated.len() > PATHSPEC_LIMIT {
+        let file = git_to_temporary_file(
+            worktree,
+            ["ls-tree", "-r", "-t", "-z", "--full-tree", head],
+            "read the last commit",
+        )?;
+        for_each_record(file, record)?;
+    } else {
+        for chunk in argument_chunks(literal_pathspecs(&validated)?) {
+            let mut args = ["ls-tree", "-z", "--full-tree", head, "--"]
+                .map(OsString::from)
+                .to_vec();
+            args.extend(chunk);
+            let output = git_stdout(worktree, args, "read the last commit")?;
+            for item in output
+                .split(|byte| *byte == 0)
+                .filter(|item| !item.is_empty())
+            {
+                record(item)?;
+            }
         }
     }
     Ok(entries)
 }
 
-/// The paths among `pathspecs` whose index entry was recorded with `git add
-/// --intent-to-add`, which `ls-files` does not report. Comparing the index with
-/// `base` lists such an entry only when asked to show it, whether or not its
-/// file is still on disk.
+fn literal_pathspecs(paths: &[WorktreePath]) -> Result<Vec<OsString>, String> {
+    paths
+        .iter()
+        .map(|path| os_string_from_path_bytes(path.bytes.clone()).map(literal_pathspec))
+        .collect()
+}
+
+/// Calls `each` for every NUL-terminated record in `file`.
+fn for_each_record(
+    file: fs::File,
+    mut each: impl FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    use std::io::BufRead;
+    let mut reader = BufReader::new(file);
+    let mut item = Vec::new();
+    loop {
+        item.clear();
+        let read = reader
+            .read_until(0, &mut item)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Ok(());
+        }
+        if item.last() == Some(&0) {
+            item.pop();
+        }
+        if !item.is_empty() {
+            each(&item)?;
+        }
+    }
+}
+
+/// The paths among `pathspecs` (every index entry when there are none) whose
+/// index entry was recorded with `git add --intent-to-add`, which `ls-files`
+/// does not report.
 fn intent_to_add_paths(
     worktree: &Path,
     base: &str,
     pathspecs: &[OsString],
 ) -> Result<HashSet<Vec<u8>>, String> {
-    let listed = |visibility: &str| -> Result<HashSet<Vec<u8>>, String> {
+    // Git compares an intent-to-add entry as an empty file in one mode and as
+    // absent in the other, so its status differs between them; every other
+    // entry compares the same way in both.
+    let listed = |visibility: &str| -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
         let mut args = [
             "diff-index",
             "--cached",
-            "--name-only",
+            "--name-status",
+            "--no-renames",
             "-z",
             visibility,
             base,
@@ -603,16 +852,31 @@ fn intent_to_add_paths(
         .map(OsString::from)
         .to_vec();
         args.extend(pathspecs.iter().cloned());
-        let output = git_stdout(worktree, args, "read the intent-to-add entries")?;
-        Ok(output
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-            .map(<[u8]>::to_vec)
-            .collect())
+        let file = git_to_temporary_file(worktree, args, "read the intent-to-add entries")?;
+        let mut statuses = HashMap::new();
+        let mut status: Option<Vec<u8>> = None;
+        for_each_record(file, |item| {
+            match status.take() {
+                None => status = Some(item.to_vec()),
+                Some(code) => {
+                    statuses.insert(item.to_vec(), code);
+                }
+            }
+            Ok(())
+        })?;
+        if status.is_some() {
+            return Err("Git returned a malformed index comparison.".into());
+        }
+        Ok(statuses)
     };
     let visible = listed("--ita-visible-in-index")?;
     let hidden = listed("--ita-invisible-in-index")?;
-    Ok(visible.difference(&hidden).cloned().collect())
+    Ok(visible
+        .keys()
+        .chain(hidden.keys())
+        .filter(|path| visible.get(*path) != hidden.get(*path))
+        .cloned()
+        .collect())
 }
 
 /// The empty tree's object ID in this repository's hash format, which Git
@@ -625,9 +889,29 @@ fn empty_tree(worktree: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&oid).trim().to_string())
 }
 
-fn hash_files(worktree: &Path, files: Vec<OsString>, store: bool) -> Result<Vec<String>, String> {
+/// Hashes `files` (paths with their sizes), a bounded amount of content per
+/// Git process so none runs into the per-command time limit.
+fn hash_files(
+    worktree: &Path,
+    files: Vec<(OsString, u64)>,
+    store: bool,
+) -> Result<Vec<String>, String> {
     let mut oids = Vec::with_capacity(files.len());
-    for chunk in argument_chunks(files) {
+    let mut chunks: Vec<Vec<OsString>> = Vec::new();
+    let mut bytes = 0;
+    for (file, size) in files {
+        match chunks.last_mut() {
+            Some(chunk) if bytes + size <= HASH_CHUNK_BYTES => {
+                bytes += size;
+                chunk.push(file);
+            }
+            _ => {
+                bytes = size;
+                chunks.push(vec![file]);
+            }
+        }
+    }
+    for chunk in chunks.into_iter().flat_map(argument_chunks) {
         let expected = chunk.len();
         let mut args = vec![OsString::from("hash-object")];
         if store {
@@ -684,15 +968,23 @@ fn argument_chunks(arguments: Vec<OsString>) -> Vec<Vec<OsString>> {
     chunks
 }
 
-/// Saves `states` as a new recovery point. The reference is created only if
-/// it does not exist yet, so no recovery point can ever be overwritten.
-pub(super) fn store_recovery_point(
+/// A recovery point whose content and tree are stored, but which no reference
+/// names yet.
+pub(super) struct PreparedPoint {
+    tree: String,
+    stamp: String,
+    record: Summary,
+}
+
+/// Stores the tree a recovery point of `states` needs. Their content must
+/// already be stored (see `store_contents`); writing the tree checks it is.
+pub(super) fn prepare_recovery_point(
     worktree: &Path,
     kind: RecoveryPointKind,
     summary: String,
     head: Option<&str>,
     states: &[PathState],
-) -> Result<RecoveryPoint, String> {
+) -> Result<PreparedPoint, String> {
     let (stamp, created_at) = utc_timestamps(SystemTime::now());
     let mut record = Summary {
         version: MANIFEST_VERSION,
@@ -780,11 +1072,91 @@ pub(super) fn store_recovery_point(
     if !is_object_id(&tree) {
         return Err("Git returned a malformed recovery-point tree.".into());
     }
+    Ok(PreparedPoint {
+        tree,
+        stamp,
+        record,
+    })
+}
 
+/// Names a prepared recovery point. The reference is created only if it does
+/// not exist yet, so no recovery point can ever be overwritten.
+pub(super) fn create_recovery_point(
+    worktree: &Path,
+    prepared: PreparedPoint,
+) -> Result<RecoveryPoint, String> {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
-    let id = format!("{RECOVERY_REF_NAMESPACE}/{stamp}-{}", &suffix[..12]);
-    create_reference(worktree, &id, &tree)?;
-    Ok(point_from_summary(id, tree, record))
+    let id = format!(
+        "{RECOVERY_REF_NAMESPACE}/{}-{}",
+        prepared.stamp,
+        &suffix[..12]
+    );
+    create_reference(worktree, &id, &prepared.tree)?;
+    Ok(point_from_summary(id, prepared.tree, prepared.record))
+}
+
+/// Writes the working-tree content `states` observed to the object store,
+/// refusing if any of it changed since, and checks that every stored object
+/// has the size observed on disk.
+pub(super) fn store_contents(worktree: &Path, states: &[PathState]) -> Result<(), String> {
+    let changed = || CHANGED_WHILE_SAVING.to_string();
+    let mut files = Vec::new();
+    let mut expected = Vec::new();
+    for state in states {
+        let Some(entry) = &state.worktree else {
+            continue;
+        };
+        let valid = WorktreePath::new(&state.path)?;
+        if entry.kind == WorktreeEntryKind::Symlink {
+            let location = inspect_path(worktree, &valid)?.ok_or_else(changed)?;
+            let target = fs::read_link(&location).map_err(|_| changed())?;
+            let target = link_target_bytes(target, &state.path.display)?;
+            if hash_bytes(worktree, &target, true)? != entry.oid {
+                return Err(changed());
+            }
+        } else {
+            files.push((valid.relative().into_os_string(), entry.size));
+            expected.push(entry.oid.as_str());
+        }
+    }
+    let stored = hash_files(worktree, files, true)?;
+    if stored
+        .iter()
+        .map(String::as_str)
+        .ne(expected.iter().copied())
+    {
+        return Err(changed());
+    }
+    let objects: Vec<(&str, u64)> = states
+        .iter()
+        .filter_map(|state| state.worktree.as_ref())
+        .map(|entry| (entry.oid.as_str(), entry.size))
+        .collect();
+    for chunk in objects.chunks(SUMMARIES_PER_READ) {
+        let input: String = chunk.iter().map(|(oid, _)| format!("{oid}\n")).collect();
+        let output = command::git_at_with_input(
+            worktree,
+            ["cat-file", "--batch-check=%(objectname) %(objectsize)"],
+            input.as_bytes(),
+        )
+        .map_err(|error| error.to_string())?;
+        let listed = successful_stdout(output, "check the saved content")?;
+        let sizes: Vec<String> = String::from_utf8_lossy(&listed)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let intact = sizes.len() == chunk.len()
+            && sizes
+                .iter()
+                .zip(chunk)
+                .all(|(line, (oid, size))| *line == format!("{oid} {size}"));
+        if !intact {
+            return Err(
+                "Git did not store the saved content intact, so nothing was changed.".into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Creates `id` pointing at `tree`. The all-zero old value makes the update
@@ -799,7 +1171,7 @@ fn create_reference(worktree: &Path, id: &str, tree: &str) -> Result<(), String>
     .map(|_| ())
 }
 
-fn push_index_info(input: &mut Vec<u8>, mode: &str, oid: &str, path: &[u8]) {
+pub(super) fn push_index_info(input: &mut Vec<u8>, mode: &str, oid: &str, path: &[u8]) {
     input.extend_from_slice(format!("{mode} {oid}\t").as_bytes());
     input.extend_from_slice(path);
     input.push(0);
@@ -1113,8 +1485,8 @@ pub fn plan_recovery_restore(request: RecoveryPointRequest) -> Result<RecoveryRe
     let (point, saved) = load_point(worktree, &request.point)?;
     let paths: Vec<GitPath> = saved.iter().map(|state| state.path.clone()).collect();
     let current = observe_paths(worktree, snapshot.head.as_deref(), &paths, false)?;
-    refuse_replacing_directories(&saved, &current)?;
-    let entries = saved
+    refuse_unsafe_restore(worktree, &saved, &current)?;
+    let mut entries: Vec<RecoveryRestoreEntry> = saved
         .iter()
         .zip(&current)
         .map(|(saved, current)| RecoveryRestoreEntry {
@@ -1123,27 +1495,157 @@ pub fn plan_recovery_restore(request: RecoveryPointRequest) -> Result<RecoveryRe
             index_changes: saved.index != current.index,
         })
         .collect();
+    // Only as many entries as one response carries; the rest are counted.
+    let mut budget = MAX_LISTED_BYTES;
+    let mut fits = 0;
+    for entry in &entries {
+        let size = serde_json::to_vec(entry)
+            .map_err(|error| error.to_string())?
+            .len();
+        if size > budget {
+            break;
+        }
+        budget -= size;
+        fits += 1;
+    }
+    let omitted = entries.split_off(fits).len() as u64;
     Ok(RecoveryRestorePlan {
+        fingerprint: fingerprint(
+            snapshot.head.as_deref(),
+            snapshot.operation,
+            &current,
+            &request.point,
+        )?,
         point,
         entries,
-        fingerprint: fingerprint(snapshot.head.as_deref(), snapshot.operation, &current, &())?,
+        omitted,
     })
 }
 
-/// A restore never replaces a directory with a saved file; the directory's
-/// contents are changes of their own, so the user moves it aside first.
-fn refuse_replacing_directories(saved: &[PathState], current: &[PathState]) -> Result<(), String> {
-    match saved
-        .iter()
-        .zip(current)
-        .find(|(saved, current)| saved.worktree.is_some() && current.directory)
-    {
-        Some((saved, _)) => Err(format!(
-            "{} is now a directory in the working copy, so Repola will not replace it. Move it aside and review the restore again.",
-            saved.path.display
-        )),
-        None => Ok(()),
+/// What one discard or restore removes before it writes anything.
+#[derive(Default)]
+pub(super) struct Removals<'a> {
+    /// Files removed from disk.
+    pub files: HashSet<&'a [u8]>,
+    /// Paths whose index entries are removed.
+    pub entries: HashSet<&'a [u8]>,
+}
+
+impl Removals<'_> {
+    /// Whether a folder at `path` holds nothing but files removed first, so
+    /// it is empty by the time a file is written in its place.
+    pub(super) fn empties_folder(&self, worktree: &Path, path: &GitPath) -> Result<bool, String> {
+        let bytes = decode_path_token_bytes(&path.token)?;
+        let removed = self
+            .files
+            .iter()
+            .filter(|removed| {
+                removed.len() > bytes.len()
+                    && removed.starts_with(&bytes)
+                    && removed[bytes.len()] == b'/'
+            })
+            .count();
+        Ok(files_beneath(worktree, path)? == removed)
     }
+
+    /// Whether writing `path` would replace something not removed first: a
+    /// file or link in the way of one of its folders on disk, or index entries
+    /// its own entry would displace.
+    pub(super) fn crossed_by(
+        &self,
+        path: &[u8],
+        state: &PathState,
+        writes_disk: bool,
+        writes_index: bool,
+    ) -> bool {
+        let removed_beneath = self
+            .entries
+            .iter()
+            .filter(|removed| {
+                removed.len() > path.len()
+                    && removed.starts_with(path)
+                    && removed[path.len()] == b'/'
+            })
+            .count();
+        writes_disk
+            && state.blocked
+            && !self
+                .files
+                .contains(leading_components(path, state.parents + 1))
+            || writes_index
+                && (state.indexed_parent.is_some_and(|components| {
+                    !self.entries.contains(leading_components(path, components))
+                }) || removed_beneath != state.index_beneath)
+    }
+}
+
+/// The first `count` components of a slash-separated path: `a/b` for `a/b/c`
+/// and 2.
+pub(super) fn leading_components(path: &[u8], count: usize) -> &[u8] {
+    let end = path
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'/')
+        .nth(count.saturating_sub(1))
+        .map_or(path.len(), |(index, _)| index);
+    &path[..end]
+}
+
+pub(super) fn file_folder_conflict(display: &str) -> String {
+    format!(
+        "{display} is a file in one place and a folder in another (in the last commit, the staging area, or on disk), so Repola will not change it. Sort it out with Git first."
+    )
+}
+
+/// What restoring `saved` over `current` writes: the file on disk, including
+/// the empty stand-in a deleted intent-to-add entry needs while it is
+/// recorded, and the index entries.
+fn restore_writes(saved: &PathState, current: &PathState) -> (bool, bool) {
+    let writes_disk = saved.worktree.is_some() && saved.worktree != current.worktree
+        || saved.worktree.is_none()
+            && saved.index != current.index
+            && saved.index.iter().any(|entry| entry.intent_to_add);
+    let writes_index = !saved.index.is_empty() && saved.index != current.index;
+    (writes_disk, writes_index)
+}
+
+/// A restore never writes where it would replace something it has not
+/// saved: a folder with something in it, or a file or index entries in the
+/// way that the restore does not itself remove first.
+fn refuse_unsafe_restore(
+    worktree: &Path,
+    saved: &[PathState],
+    current: &[PathState],
+) -> Result<(), String> {
+    let paths = saved
+        .iter()
+        .map(|state| decode_path_token_bytes(&state.path.token))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut removals = Removals::default();
+    for ((saved, current), path) in saved.iter().zip(current).zip(&paths) {
+        if saved.worktree.is_none() && current.worktree.is_some() {
+            removals.files.insert(path);
+        }
+        if saved.index.is_empty() && !current.index.is_empty() {
+            removals.entries.insert(path);
+        }
+    }
+    for ((saved, current), path) in saved.iter().zip(current).zip(&paths) {
+        if !current.differs_from(saved) {
+            continue;
+        }
+        let (writes_disk, writes_index) = restore_writes(saved, current);
+        if writes_disk && current.directory && !removals.empties_folder(worktree, &saved.path)? {
+            return Err(format!(
+                "{} is now a directory in the working copy, so Repola will not replace it. Move it aside and review the restore again.",
+                saved.path.display
+            ));
+        }
+        if removals.crossed_by(path, current, writes_disk, writes_index) {
+            return Err(file_folder_conflict(&saved.path.display));
+        }
+    }
+    Ok(())
 }
 
 fn restore_effect(saved: Option<&WorktreeEntry>, current: Option<&WorktreeEntry>) -> RestoreEffect {
@@ -1174,15 +1676,14 @@ pub fn restore_recovery_point(
     let worktree = PathBuf::from(&snapshot.worktree_path);
     let (point, saved) = load_point(&worktree, &request.point)?;
     let paths: Vec<GitPath> = saved.iter().map(|state| state.path.clone()).collect();
-    let current = observe_paths(&worktree, snapshot.head.as_deref(), &paths, true)?;
-    if fingerprint(snapshot.head.as_deref(), snapshot.operation, &current, &())?
-        != request.fingerprint
-    {
+    let head = snapshot.head.as_deref();
+    let current = observe_paths(&worktree, head, &paths, false)?;
+    if fingerprint(head, snapshot.operation, &current, &request.point)? != request.fingerprint {
         return Err(
             "The working copy changed after this restore was reviewed. Review it again.".into(),
         );
     }
-    refuse_replacing_directories(&saved, &current)?;
+    refuse_unsafe_restore(&worktree, &saved, &current)?;
     let changed: Vec<(&PathState, &PathState)> = saved
         .iter()
         .zip(&current)
@@ -1195,17 +1696,38 @@ pub fn restore_recovery_point(
         .iter()
         .map(|(_, current)| (*current).clone())
         .collect();
-    let replaced = if replaced_states.iter().any(PathState::has_content) {
-        Some(store_recovery_point(
+    let prepared = if replaced_states.iter().any(PathState::has_content) {
+        store_contents(&worktree, &replaced_states)?;
+        Some(prepare_recovery_point(
             &worktree,
             RecoveryPointKind::Restore,
             format!("Replaced while restoring “{}”", point.summary),
-            snapshot.head.as_deref(),
+            head,
             &replaced_states,
         )?)
     } else {
         None
     };
+    // The last look before writing, at HEAD and the in-progress operation as
+    // well as the paths: only creating the reference and the restore itself
+    // follow.
+    let latest = working_copy_snapshot(WorkingCopyRequest {
+        repository_path: snapshot.repository_path.clone(),
+        worktree_path: snapshot.worktree_path.clone(),
+    })?;
+    let latest_paths = observe_paths(&worktree, latest.head.as_deref(), &paths, false)?;
+    if fingerprint(
+        latest.head.as_deref(),
+        latest.operation,
+        &latest_paths,
+        &request.point,
+    )? != request.fingerprint
+    {
+        return Err(CHANGED_WHILE_SAVING.into());
+    }
+    let replaced = prepared
+        .map(|prepared| create_recovery_point(&worktree, prepared))
+        .transpose()?;
 
     apply_restore(&worktree, &point, &changed).map_err(|error| match &replaced {
         Some(replaced) => format!(
@@ -1214,11 +1736,7 @@ pub fn restore_recovery_point(
         ),
         None => error,
     })?;
-    let snapshot = working_copy_snapshot(WorkingCopyRequest {
-        repository_path: snapshot.repository_path,
-        worktree_path: snapshot.worktree_path,
-    })?;
-    Ok(RecoveryRestoreResult { snapshot, replaced })
+    Ok(RecoveryRestoreResult { replaced })
 }
 
 fn apply_restore(
@@ -1226,13 +1744,27 @@ fn apply_restore(
     point: &RecoveryPoint,
     changed: &[(&PathState, &PathState)],
 ) -> Result<(), String> {
-    let symlinks = core_symlinks(worktree)?;
+    // Everything in the way goes first: removed files, then empty folders
+    // where files go back, before any file or index entry is written.
     for (saved, current) in changed {
-        if saved.worktree != current.worktree {
-            restore_worktree_entry(worktree, &saved.path, saved.worktree.as_ref(), symlinks)?;
+        if saved.worktree.is_none() && current.worktree.is_some() {
+            restore_worktree_entry(worktree, saved)?;
+        }
+    }
+    for (saved, current) in changed {
+        if restore_writes(saved, current).0 && current.directory {
+            remove_empty_directory(worktree, &saved.path)?;
+        }
+    }
+    for (saved, current) in changed {
+        if saved.worktree.is_some() && saved.worktree != current.worktree {
+            restore_worktree_entry(worktree, saved)?;
         }
     }
     let absent = "0".repeat(point.oid.len());
+    // Every changed path's entries are removed before any saved entry is
+    // added back, so none of them displaces another.
+    let mut removals = Vec::new();
     let mut input = Vec::new();
     let mut intents = Vec::new();
     let mut placeholders = Vec::new();
@@ -1241,9 +1773,8 @@ fn apply_restore(
             continue;
         }
         let path = decode_path_token_bytes(&saved.path.token)?;
-        // A zero mode removes every stage of the path before the saved
-        // entries are added back.
-        push_index_info(&mut input, "0", &absent, &path);
+        // A zero mode removes every stage of the path.
+        push_index_info(&mut removals, "0", &absent, &path);
         for entry in &saved.index {
             if entry.intent_to_add {
                 intents.extend_from_slice(b":(literal)");
@@ -1261,16 +1792,25 @@ fn apply_restore(
             input.push(0);
         }
     }
-    if !input.is_empty() {
+    removals.extend(input);
+    if !removals.is_empty() {
         let output =
-            command::git_at_with_input(worktree, ["update-index", "-z", "--index-info"], &input)
+            command::git_at_with_input(worktree, ["update-index", "-z", "--index-info"], &removals)
                 .map_err(|error| error.to_string())?;
         successful_stdout(output, "restore the saved index entries")?;
     }
     if !intents.is_empty() {
         restore_intents(worktree, &intents, &placeholders)?;
     }
-    restore_index_flags(worktree, changed)
+    restore_index_flags(worktree, changed)?;
+    // Entries written without stat data would otherwise look modified to
+    // commands that do not refresh the index first.
+    git_stdout(
+        worktree,
+        ["update-index", "-q", "--unmerged", "--refresh"],
+        "refresh the index",
+    )
+    .map(drop)
 }
 
 /// Records intent-to-add entries the way they were made, since plumbing cannot
@@ -1328,10 +1868,6 @@ fn restore_intents(
     recorded
 }
 
-fn core_symlinks(worktree: &Path) -> Result<bool, String> {
-    config_bool(worktree, "core.symlinks", DEFAULT_CORE_SYMLINKS)
-}
-
 fn config_bool(worktree: &Path, key: &str, default: bool) -> Result<bool, String> {
     let output = command::git_at(worktree, ["config", "--type=bool", "--get", key])
         .map_err(|error| error.to_string())?;
@@ -1342,15 +1878,15 @@ fn config_bool(worktree: &Path, key: &str, default: bool) -> Result<bool, String
     }
 }
 
-fn restore_worktree_entry(
-    worktree: &Path,
-    path: &GitPath,
-    entry: Option<&WorktreeEntry>,
-    symlinks: bool,
-) -> Result<(), String> {
+fn restore_worktree_entry(worktree: &Path, saved: &PathState) -> Result<(), String> {
+    let path = &saved.path;
     let valid = WorktreePath::new(path)?;
-    let Some(entry) = entry else {
-        return remove_worktree_entry(worktree, path);
+    let Some(entry) = &saved.worktree else {
+        // Folders that existed when the content was saved stay, even empty.
+        if remove_worktree_file(worktree, &valid, path)? {
+            remove_empty_parents(worktree, &valid, saved.parents);
+        }
+        return Ok(());
     };
     let target = prepare_path(worktree, &valid, &path.display, &mut Vec::new())?;
     if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.file_type().is_dir()) {
@@ -1359,7 +1895,9 @@ fn restore_worktree_entry(
             path.display
         ));
     }
-    if entry.kind == WorktreeEntryKind::Symlink && symlinks {
+    if entry.kind == WorktreeEntryKind::Symlink {
+        // Only a real link on disk is saved as one, so it comes back as one
+        // whatever `core.symlinks` says.
         let link = git_stdout(
             worktree,
             ["cat-file", "blob", &entry.oid],
@@ -1367,16 +1905,59 @@ fn restore_worktree_entry(
         )?;
         replace_with_symlink(&target, &link, &path.display)
     } else {
-        // With `core.symlinks=false` Git checks a link out as a plain file
-        // holding its target; a restore does the same.
-        replace_with_blob(
-            worktree,
-            &entry.oid,
-            &target,
-            entry.kind == WorktreeEntryKind::Executable,
-            &path.display,
-        )
+        replace_with_blob(worktree, entry, &target, &path.display)
     }
+}
+
+/// Removes the folder at `path` once removals have emptied it, refusing if it
+/// still holds anything. Removing its last file may already have removed it.
+pub(super) fn remove_empty_directory(worktree: &Path, path: &GitPath) -> Result<(), String> {
+    let valid = WorktreePath::new(path)?;
+    let Some(location) = inspect_path(worktree, &valid)? else {
+        return Ok(());
+    };
+    match fs::symlink_metadata(&location) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        _ => {
+            return Err(format!(
+                "{} is no longer an empty folder, so Repola will not replace it.",
+                path.display
+            ))
+        }
+    }
+    if fs::remove_dir(&location).is_err() {
+        return Err(format!(
+            "{} is no longer an empty folder, so Repola will not replace it.",
+            path.display
+        ));
+    }
+    Ok(())
+}
+
+/// How many files and links lie anywhere beneath the folder at `path`,
+/// without following links.
+fn files_beneath(worktree: &Path, path: &GitPath) -> Result<usize, String> {
+    let valid = WorktreePath::new(path)?;
+    let Some(location) = inspect_path(worktree, &valid)? else {
+        return Ok(0);
+    };
+    let mut count = 0;
+    let mut folders = vec![location];
+    while let Some(folder) = folders.pop() {
+        let entries = fs::read_dir(&folder)
+            .map_err(|error| format!("{} could not be read: {error}", folder.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            if kind.is_dir() {
+                folders.push(entry.path());
+            } else {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 
 /// Removes the file or symbolic link at `path`, never a directory and never
@@ -1384,7 +1965,7 @@ fn restore_worktree_entry(
 pub(super) fn remove_worktree_entry(worktree: &Path, path: &GitPath) -> Result<(), String> {
     let valid = WorktreePath::new(path)?;
     if remove_worktree_file(worktree, &valid, path)? {
-        remove_empty_parents(worktree, &valid);
+        remove_empty_parents(worktree, &valid, 0);
     }
     Ok(())
 }
@@ -1403,8 +1984,8 @@ fn remove_worktree_file(
             "{} is a directory, so Repola will not remove it.",
             path.display
         )),
-        Ok(_) => {
-            fs::remove_file(&target)
+        Ok(metadata) => {
+            remove_file_or_link(&target, &metadata)
                 .map_err(|error| format!("{} could not be removed: {error}", path.display))?;
             Ok(true)
         }
@@ -1419,9 +2000,9 @@ fn remove_worktree_file(
 /// on the way down, and the walk stops at the first directory that is not
 /// empty or cannot be removed, so no content and nothing reached through a
 /// link is ever deleted.
-fn remove_empty_parents(worktree: &Path, path: &WorktreePath) {
+fn remove_empty_parents(worktree: &Path, path: &WorktreePath, keep: usize) {
     let parents = &path.components[..path.components.len().saturating_sub(1)];
-    for depth in (1..=parents.len()).rev() {
+    for depth in (keep + 1..=parents.len()).rev() {
         let Ok(Some(directory)) = real_directory(worktree, &parents[..depth]) else {
             return;
         };
@@ -1429,6 +2010,35 @@ fn remove_empty_parents(worktree: &Path, path: &WorktreePath) {
             return;
         }
     }
+}
+
+/// Moves `source` over `target`, which may be a file or a link to either.
+fn replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if let Ok(metadata) = fs::symlink_metadata(target) {
+        // Windows will not rename over a link to a folder; it is saved before
+        // a restore replaces it.
+        if metadata.file_type().is_symlink() {
+            remove_file_or_link(target, &metadata)?;
+        }
+    }
+    fs::rename(source, target)
+}
+
+/// Removes a file or a link, whether it links to a file or a folder.
+#[cfg(windows)]
+fn remove_file_or_link(target: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
+    use std::os::windows::fs::FileTypeExt;
+    if metadata.file_type().is_symlink_dir() {
+        return fs::remove_dir(target);
+    }
+    fs::remove_file(target)
+}
+
+/// Removes a file or a link; Unix removes either the same way.
+#[cfg(not(windows))]
+fn remove_file_or_link(target: &Path, _metadata: &fs::Metadata) -> std::io::Result<()> {
+    fs::remove_file(target)
 }
 
 fn sibling_temporary(target: &Path) -> Result<PathBuf, String> {
@@ -1440,14 +2050,13 @@ fn sibling_temporary(target: &Path) -> Result<PathBuf, String> {
 
 fn replace_with_blob(
     worktree: &Path,
-    oid: &str,
+    entry: &WorktreeEntry,
     target: &Path,
-    executable: bool,
     display: &str,
 ) -> Result<(), String> {
     let temporary = sibling_temporary(target)?;
-    let written = write_blob(worktree, oid, &temporary, executable)
-        .and_then(|()| fs::rename(&temporary, target).map_err(|error| error.to_string()));
+    let written = write_blob(worktree, entry, &temporary)
+        .and_then(|()| replace(&temporary, target).map_err(|error| error.to_string()));
     if let Err(error) = written {
         let _ = fs::remove_file(&temporary);
         return Err(format!("{display} could not be restored: {error}"));
@@ -1455,12 +2064,13 @@ fn replace_with_blob(
     Ok(())
 }
 
-fn write_blob(
-    worktree: &Path,
-    oid: &str,
-    destination: &Path,
-    executable: bool,
-) -> Result<(), String> {
+fn write_blob(worktree: &Path, entry: &WorktreeEntry, destination: &Path) -> Result<(), String> {
+    let file = write_object(worktree, &entry.oid, destination)?;
+    set_permissions(&file, entry).map_err(|error| error.to_string())
+}
+
+/// Writes the blob `oid` to a new file at `destination`.
+fn write_object(worktree: &Path, oid: &str, destination: &Path) -> Result<fs::File, String> {
     let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1471,32 +2081,35 @@ fn write_blob(
         .map_err(|error| error.to_string())?;
     successful_stdout(output, "read the saved file")?;
     file.sync_all().map_err(|error| error.to_string())?;
-    if executable {
-        mark_executable(&file).map_err(|error| error.to_string())?;
-    }
-    Ok(())
+    Ok(file)
 }
 
 #[cfg(unix)]
-fn mark_executable(file: &fs::File) -> std::io::Result<()> {
+fn set_permissions(file: &fs::File, entry: &WorktreeEntry) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut permissions = file.metadata()?.permissions();
-    let mode = permissions.mode();
-    // Grant execute wherever read is granted, as Git does on checkout.
-    permissions.set_mode(mode | ((mode & 0o444) >> 2));
+    let mode = match entry.permissions {
+        Some(saved) => saved,
+        // Grant execute wherever read is granted, as Git does on checkout.
+        None if entry.kind == WorktreeEntryKind::Executable => {
+            permissions.mode() | ((permissions.mode() & 0o444) >> 2)
+        }
+        None => return Ok(()),
+    };
+    permissions.set_mode(mode);
     file.set_permissions(permissions)
 }
 
 #[cfg(windows)]
-fn mark_executable(_file: &fs::File) -> std::io::Result<()> {
-    // Windows has no executable bit to restore.
+fn set_permissions(_file: &fs::File, _entry: &WorktreeEntry) -> std::io::Result<()> {
+    // Windows has no permission bits to restore.
     Ok(())
 }
 
 fn replace_with_symlink(target: &Path, link: &[u8], display: &str) -> Result<(), String> {
     let temporary = sibling_temporary(target)?;
     let created = create_symlink(link, &temporary)
-        .and_then(|()| fs::rename(&temporary, target))
+        .and_then(|()| replace(&temporary, target))
         .map_err(|error| error.to_string());
     if let Err(error) = created {
         let _ = fs::remove_file(&temporary);
@@ -1623,12 +2236,15 @@ pub fn recovery_file_diff(request: RecoveryFileDiffRequest) -> Result<RecoveryFi
                 return Ok(too_large);
             }
             let copy = temporary.path().join("saved");
-            write_blob(worktree, &entry.oid, &copy, false)?;
+            write_object(worktree, &entry.oid, &copy)?;
             copy.into_os_string()
         }
     };
-    let diff = |extra: &str| -> Result<Vec<u8>, String> {
-        let output = command::git_at(
+    // Written to a file: a patch can be several times the size of its sides.
+    let diff = |extra: &str| -> Result<fs::File, String> {
+        let mut file = tempfile::tempfile().map_err(|error| error.to_string())?;
+        let sink = file.try_clone().map_err(|error| error.to_string())?;
+        let output = command::git_at_to_file(
             worktree,
             [
                 OsString::from("diff"),
@@ -1641,22 +2257,43 @@ pub fn recovery_file_diff(request: RecoveryFileDiffRequest) -> Result<RecoveryFi
                 current.clone(),
                 saved_side.clone(),
             ],
+            sink,
         )
         .map_err(|error| error.to_string())?;
-        if output.status.success() || output.status.code() == Some(1) {
-            Ok(output.stdout)
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        if !(output.status.success() || output.status.code() == Some(1)) {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
+        file.rewind().map_err(|error| error.to_string())?;
+        Ok(file)
     };
-    let binary = diff("--numstat")?
+    let mut numstat = Vec::new();
+    diff("--numstat")?
+        .read_to_end(&mut numstat)
+        .map_err(|error| error.to_string())?;
+    let binary = numstat
         .split(|byte| *byte == b'\n')
         .any(|line| line.starts_with(b"-\t-\t"));
-    let (patch, truncated) = truncate_file_patch(&diff("--patch")?);
+    let file = diff("--patch")?;
+    if file.metadata().map_err(|error| error.to_string())?.len() > MAX_PREVIEW_PATCH_BYTES as u64 {
+        return Ok(too_large);
+    }
+    let mut patch = Vec::new();
+    BufReader::new(file)
+        .read_to_end(&mut patch)
+        .map_err(|error| error.to_string())?;
+    let patch = relabel_patch(&String::from_utf8_lossy(&patch), &state.path.display);
+    // Bytes that are not text grow when encoded for the response.
+    if serde_json::to_vec(&patch)
+        .map_err(|error| error.to_string())?
+        .len()
+        > MAX_PREVIEW_PATCH_BYTES
+    {
+        return Ok(too_large);
+    }
     Ok(RecoveryFileDiff {
-        patch: relabel_patch(&patch, &state.path.display),
+        patch,
         binary,
-        truncated,
+        truncated: false,
     })
 }
 
@@ -1891,9 +2528,26 @@ mod tests {
                 kind,
                 oid: hash_bytes(path, bytes, true).expect("blob"),
                 size: bytes.len() as u64,
+                permissions: None,
             }),
             directory: false,
+            parents: 0,
+            blocked: false,
+            index_beneath: 0,
+            indexed_parent: None,
         }
+    }
+
+    /// Saves states whose content the test already stored.
+    fn store_recovery_point(
+        path: &Path,
+        kind: RecoveryPointKind,
+        summary: String,
+        head: Option<&str>,
+        states: &[PathState],
+    ) -> Result<RecoveryPoint, String> {
+        let prepared = prepare_recovery_point(path, kind, summary, head, states)?;
+        create_recovery_point(path, prepared)
     }
 
     fn store(path: &Path, states: &[PathState]) -> RecoveryPoint {
@@ -2094,8 +2748,13 @@ mod tests {
                     kind: WorktreeEntryKind::File,
                     oid: blob.clone(),
                     size: 8,
+                    permissions: None,
                 }),
                 directory: false,
+                parents: 0,
+                blocked: false,
+                index_beneath: 0,
+                indexed_parent: None,
             };
             let point = craft(
                 &path,
@@ -2135,8 +2794,13 @@ mod tests {
                 kind: WorktreeEntryKind::File,
                 oid: saved,
                 size: 6,
+                permissions: None,
             }),
             directory: false,
+            parents: 0,
+            blocked: false,
+            index_beneath: 0,
+            indexed_parent: None,
         };
         let point = craft(
             &path,
@@ -2159,12 +2823,17 @@ mod tests {
         );
         fs::write(path.join("blocker"), "a file, not a directory\n").expect("blocker");
         let point = reference(&store(&path, &[state]));
-        assert_eq!(
-            plan(&path, &point).expect("plan").entries[0].worktree,
-            RestoreEffect::Create
+        // Refused when reviewed, before anything is written.
+        let error = plan(&path, &point).expect_err("parent is a file");
+        assert!(
+            error.contains("a file in one place and a folder"),
+            "{error}"
         );
         let error = restore(&path, &point).expect_err("parent is a file");
-        assert!(error.contains("is not a directory"), "{error}");
+        assert!(
+            error.contains("a file in one place and a folder"),
+            "{error}"
+        );
         assert_eq!(
             fs::read(path.join("blocker")).expect("blocker"),
             b"a file, not a directory\n"
@@ -2177,36 +2846,32 @@ mod tests {
             let state = saved_file(&path, "link/file.txt", WorktreeEntryKind::File, b"saved\n");
             let point = reference(&store(&path, &[state]));
             let error = restore(&path, &point).expect_err("parent is a link");
-            assert!(error.contains("is not a directory"), "{error}");
+            assert!(
+                error.contains("a file in one place and a folder"),
+                "{error}"
+            );
             assert_eq!(fs::read_dir(outside.path()).expect("outside").count(), 0);
         }
         drop(directory);
     }
 
+    // Creating links needs privileges Windows runners do not grant.
+    #[cfg(unix)]
     #[test]
-    fn symbolic_links_restore_the_way_git_checks_them_out() {
+    fn saved_links_come_back_as_links_whatever_core_symlinks_says() {
         let (_directory, path) = repository();
-        let link = || saved_file(&path, "alias", WorktreeEntryKind::Symlink, b"base.txt");
-
-        git(&path, &["config", "core.symlinks", "false"]);
-        let point = reference(&store(&path, &[link()]));
-        restore(&path, &point).expect("restore without symlinks");
-        let metadata = fs::symlink_metadata(path.join("alias")).expect("alias");
-        assert!(metadata.file_type().is_file());
-        assert_eq!(fs::read(path.join("alias")).expect("alias"), b"base.txt");
-        fs::remove_file(path.join("alias")).expect("remove");
-
-        // Creating links needs privileges Windows runners do not grant, so
-        // the link-creating side is exercised where links always work.
-        #[cfg(unix)]
-        {
-            git(&path, &["config", "core.symlinks", "true"]);
-            let point = reference(&store(&path, &[link()]));
-            restore(&path, &point).expect("restore with symlinks");
+        // Only a real link on disk is saved as one, so `core.symlinks`, which
+        // decides how Git checks out tracked links, does not apply.
+        for setting in ["false", "true"] {
+            git(&path, &["config", "core.symlinks", setting]);
+            let link = saved_file(&path, "alias", WorktreeEntryKind::Symlink, b"base.txt");
+            restore(&path, &reference(&store(&path, &[link]))).expect("restore");
             assert_eq!(
                 fs::read_link(path.join("alias")).expect("link"),
-                Path::new("base.txt")
+                Path::new("base.txt"),
+                "core.symlinks={setting}"
             );
+            fs::remove_file(path.join("alias")).expect("remove");
         }
     }
 
@@ -2480,6 +3145,59 @@ mod tests {
         let error =
             observe_paths(&path, None, &[git_path(long.as_bytes())], false).expect_err("too long");
         assert!(error.contains("too long a path"), "{error}");
+    }
+
+    #[test]
+    fn content_is_saved_only_as_it_was_observed() {
+        let (_directory, path) = repository();
+        fs::write(path.join("a.txt"), b"observed\n").expect("write");
+        let observed = observe_paths(&path, None, &[git_path(b"a.txt")], false).expect("observe");
+        fs::write(path.join("a.txt"), b"edited after\n").expect("edit");
+        assert_eq!(
+            store_contents(&path, &observed).expect_err("changed"),
+            CHANGED_WHILE_SAVING
+        );
+
+        // Stored content must also have the size observed on disk.
+        fs::write(path.join("a.txt"), b"observed\n").expect("write");
+        let mut wrong = observed.clone();
+        if let Some(entry) = wrong[0].worktree.as_mut() {
+            entry.size += 1;
+        }
+        let error = store_contents(&path, &wrong).expect_err("size");
+        assert!(error.contains("intact"), "{error}");
+        store_contents(&path, &observed).expect("store");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("observed", path.join("link")).expect("link");
+            let observed =
+                observe_paths(&path, None, &[git_path(b"link")], false).expect("observe");
+            fs::remove_file(path.join("link")).expect("remove");
+            std::os::unix::fs::symlink("retargeted", path.join("link")).expect("link");
+            assert_eq!(
+                store_contents(&path, &observed).expect_err("changed"),
+                CHANGED_WHILE_SAVING
+            );
+        }
+    }
+
+    #[test]
+    fn a_preview_too_large_once_encoded_is_left_out() {
+        let (_directory, path) = repository();
+        // Bytes that are not text each become a three-byte character.
+        let bytes = [&[0xff_u8; 63][..], b"\n"].concat().repeat(48 * 1024);
+        let state = saved_file(&path, "noise.txt", WorktreeEntryKind::File, &bytes);
+        let point = reference(&store(&path, &[state]));
+        let diff = recovery_file_diff(RecoveryFileDiffRequest {
+            repository_path: request(&path).repository_path,
+            worktree_path: request(&path).worktree_path,
+            point,
+            path: git_path(b"noise.txt"),
+        })
+        .expect("preview");
+        assert!(diff.truncated);
+        assert!(diff.patch.is_empty());
     }
 
     #[test]

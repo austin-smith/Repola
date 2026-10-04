@@ -1,13 +1,15 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import DiscardDialog from "./DiscardDialog";
-import type { DiscardPlan, DiscardResult, FileChange, RecoveryPoint, WorkingCopySnapshot } from "../ipc/types";
+import type { DiscardPlan, DiscardResult, FileChange, RecoveryPoint } from "../ipc/types";
 
 const ipc = vi.hoisted(() => ({
   planDiscard: vi.fn(),
   discardChanges: vi.fn(),
 }));
 vi.mock("../ipc/worktrees", () => ipc);
+const toast = vi.hoisted(() => ({ add: vi.fn() }));
+vi.mock("@/components/ui/toast", () => ({ toast }));
 
 const change: FileChange = {
   id: "src/a.ts",
@@ -32,8 +34,8 @@ function plan(overrides: Partial<DiscardPlan> = {}): DiscardPlan {
   return {
     target: { kind: "all" },
     entries: [
-      { path: change.path, previousPath: null, kind: "modified", effect: "restoreCommitted" },
-      { path: { display: "notes.txt", token: "6e6f7465732e747874" }, previousPath: null, kind: "untracked", effect: "remove" },
+      { path: change.path, effect: "restoreCommitted", onDisk: true, tracked: true },
+      { path: { display: "notes.txt", token: "6e6f7465732e747874" }, effect: "remove", onDisk: true, tracked: false },
     ],
     kept: [],
     backupBytes: 2048,
@@ -55,11 +57,6 @@ const point: RecoveryPoint = {
   storedBytes: 2048,
 };
 
-const snapshot: WorkingCopySnapshot = {
-  repositoryPath: "/repo", worktreePath: "/repo", head: "abc", branch: "main", upstream: null,
-  upstreamHead: null, remote: null, ahead: 0, behind: 0, changes: [], operation: null,
-};
-
 function renderDialog(target: FileChange | null = null) {
   const props = {
     onBusyChange: vi.fn(),
@@ -77,7 +74,7 @@ describe("DiscardDialog", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     ipc.planDiscard.mockResolvedValue(plan());
-    ipc.discardChanges.mockResolvedValue({ snapshot, recoveryPoint: point } satisfies DiscardResult);
+    ipc.discardChanges.mockResolvedValue({ recoveryPoint: point } satisfies DiscardResult);
   });
 
   it("shows exactly what the plan discards and executes against its fingerprint", async () => {
@@ -94,7 +91,7 @@ describe("DiscardDialog", () => {
     await act(async () => fireEvent.click(confirm));
     expect(ipc.discardChanges).toHaveBeenCalledWith("local", "/repo", "/repo", plan());
     expect(onBusyChange.mock.calls).toEqual([[true], [false]]);
-    expect(onDiscarded).toHaveBeenCalledWith({ snapshot, recoveryPoint: point });
+    expect(onDiscarded).toHaveBeenCalledWith({ recoveryPoint: point }, plan());
   });
 
   it("lists what it leaves alone and warns when the recovery point is large", async () => {
@@ -127,6 +124,21 @@ describe("DiscardDialog", () => {
     expect(await screen.findByText(/changed after this discard was reviewed/)).toBeInTheDocument();
     await waitFor(() => expect(ipc.planDiscard).toHaveBeenCalledTimes(2));
     expect(onDiscarded).not.toHaveBeenCalled();
+  });
+
+  it("still reports a failure that arrives after the dialog closed", async () => {
+    let fail!: (cause: Error) => void;
+    ipc.discardChanges.mockImplementation(() => new Promise((_, reject) => { fail = reject; }));
+    renderDialog();
+    const confirm = await screen.findByRole("button", { name: "Discard Everything" });
+    await waitFor(() => expect(confirm).toBeEnabled());
+    await act(async () => fireEvent.click(confirm));
+    cleanup();
+    await act(async () => fail(new Error("Everything this discard was changing is saved in recovery point refs/repola/discarded/x.")));
+    expect(toast.add).toHaveBeenCalledWith(expect.objectContaining({
+      type: "error",
+      description: expect.stringContaining("refs/repola/discarded/x"),
+    }));
   });
 
   it("keeps the action disabled when planning fails", async () => {

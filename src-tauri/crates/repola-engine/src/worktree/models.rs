@@ -737,23 +737,28 @@ pub struct DiscardPlan {
 #[serde(rename_all = "camelCase")]
 pub struct DiscardPlanEntry {
     pub path: GitPath,
-    pub previous_path: Option<GitPath>,
-    pub kind: FileChangeKind,
     pub effect: DiscardEffect,
+    /// A file is at the path now.
+    pub on_disk: bool,
+    /// The index has an entry for the path now.
+    pub tracked: bool,
 }
 
+/// What a discard does to one path, decided from what the last commit, the
+/// index, and the disk hold there. A rename is two paths: its new name and
+/// its original one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DiscardEffect {
-    /// Staged and unstaged changes are replaced by the committed version; a
-    /// rename's original path is restored and its new path removed.
+    /// The index entry and the file return to the last commit's version.
     RestoreCommitted,
-    /// Unstaged edits are replaced by the staged version.
+    /// The file returns to the staged version.
     RestoreStaged,
-    /// The file is not in the current commit and is removed.
+    /// The last commit lacks the path, so its index entry, if any, and its
+    /// file are removed.
     Remove,
-    /// The file is not in the current commit and is already gone from disk,
-    /// so only its index entry is removed; the working tree is not touched.
+    /// The last commit lacks the path and its file is already gone, so only
+    /// its index entry is removed.
     Unstage,
 }
 
@@ -771,6 +776,9 @@ pub struct KeptChange {
 pub enum KeptChangeReason {
     Submodule,
     NestedRepository,
+    /// The path is a file in one place and a folder in another, so restoring
+    /// it would replace something the discard does not save.
+    FileFolderConflict,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -785,7 +793,6 @@ pub struct DiscardRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscardResult {
-    pub snapshot: WorkingCopySnapshot,
     pub recovery_point: RecoveryPoint,
 }
 
@@ -866,7 +873,10 @@ pub struct RecoveryRestoreEntry {
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryRestorePlan {
     pub point: RecoveryPoint,
+    /// As many entries as fit in one response.
     pub entries: Vec<RecoveryRestoreEntry>,
+    /// Saved paths the restore covers beyond `entries`.
+    pub omitted: u64,
     /// The current state of every saved path; the restore refuses unless it
     /// observes the same state.
     pub fingerprint: String,
@@ -884,7 +894,6 @@ pub struct RecoveryRestoreRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryRestoreResult {
-    pub snapshot: WorkingCopySnapshot,
     /// The recovery point holding the content the restore replaced, when
     /// there was any.
     pub replaced: Option<RecoveryPoint>,

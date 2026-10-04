@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArchiveRestoreIcon, Trash2Icon } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
+import { toast } from "@/components/ui/toast";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { toMessage } from "@/lib/errors";
 import { ActionableGitError } from "../components/ActionableGitError";
@@ -25,10 +26,11 @@ interface DiscardDialogProps {
   worktreePath: string;
   /** The file to discard, or null to discard every change. */
   change: FileChange | null;
-  /** Reports while the discard runs, so the owner can hold back refreshes that would race it. */
+  /** Reports while the discard runs; the owner reloads the working copy once it ends. */
   onBusyChange: (busy: boolean) => void;
   onClose: () => void;
-  onDiscarded: (result: DiscardResult) => void;
+  /** Called with the result and the plan it carried out. */
+  onDiscarded: (result: DiscardResult, plan: DiscardPlan) => void;
 }
 
 /**
@@ -39,6 +41,12 @@ interface DiscardDialogProps {
 export default function DiscardDialog({ machineId, machineKind, repositoryPath, worktreePath, change, onBusyChange, onClose, onDiscarded }: DiscardDialogProps) {
   const [scope, setScope] = useState<DiscardScope>(() => (change ? defaultDiscardScope(change) : "all"));
   const [error, setError] = useState<string | null>(null);
+  // A failure that arrives after the dialog closed is still reported.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   const [busy, setBusy] = useState(false);
   // Bumped after a failed discard so the review reflects the working copy as it is now.
   const [review, setReview] = useState(0);
@@ -65,9 +73,13 @@ export default function DiscardDialog({ machineId, machineKind, repositoryPath, 
     try {
       const result = await discardChanges(machineId, repositoryPath, worktreePath, plan);
       onBusyChange(false);
-      onDiscarded(result);
+      onDiscarded(result, plan);
     } catch (cause) {
       onBusyChange(false);
+      if (!mounted.current) {
+        toast.add({ type: "error", title: "Discard failed", description: toMessage(cause) });
+        return;
+      }
       setError(toMessage(cause));
       setReview((current) => current + 1);
     } finally {
@@ -94,7 +106,12 @@ export default function DiscardDialog({ machineId, machineKind, repositoryPath, 
         {change?.staged && change.unstaged ? (
           <ToggleGroup
             value={[scope]}
-            onValueChange={(value) => { if (value[0] === "unstaged" || value[0] === "all") setScope(value[0]); }}
+            onValueChange={(value) => {
+              if (value[0] === "unstaged" || value[0] === "all") {
+                setScope(value[0]);
+                setError(null);
+              }
+            }}
             disabled={busy}
             className="grid grid-cols-2"
           >
@@ -118,7 +135,7 @@ export default function DiscardDialog({ machineId, machineKind, repositoryPath, 
               <Alert>
                 <AlertTitle>Left unchanged ({plan.kept.length})</AlertTitle>
                 <AlertDescription>
-                  <p>Repola cannot save these first, so it does not discard them.</p>
+                  <p>Repola leaves these alone, for the reason given with each.</p>
                   <ul className="mt-1.5 flex flex-col gap-1">
                     {plan.kept.map((kept) => (
                       <li key={kept.path.token}><code className="font-mono">{kept.path.display}</code> · {keptReasonLabel(kept.reason)}</li>

@@ -42,22 +42,25 @@ export function defaultDiscardScope(change: FileChange): DiscardScope {
 export function discardEffectLabel(entry: DiscardPlanEntry): string {
   switch (entry.effect) {
     case "remove":
-      return entry.kind === "untracked" ? "Delete the untracked file" : "Remove the new file";
+      return entry.tracked ? "Remove the new file" : "Delete the untracked file";
     case "unstage":
       return "Unstage the new file, which is already deleted";
     case "restoreStaged":
-      return "Replace unstaged edits with the staged version";
+      return entry.onDisk ? "Replace unstaged edits with the staged version" : "Restore the staged version of the deleted file";
     case "restoreCommitted":
-      if (entry.kind === "renamed" && entry.previousPath) return `Restore ${entry.previousPath.display} and remove this name`;
-      if (entry.kind === "deleted") return "Restore the deleted file";
-      return "Restore the committed version";
+      return entry.onDisk ? "Restore the committed version" : "Restore the deleted file";
   }
 }
 
 export function keptReasonLabel(reason: KeptChangeReason): string {
-  return reason === "submodule"
-    ? "Submodule: commit, stash, or reset it inside the submodule."
-    : "Nested repository: move or delete it yourself if you no longer need it.";
+  switch (reason) {
+    case "submodule":
+      return "Submodule: commit, stash, or reset it inside the submodule.";
+    case "nestedRepository":
+      return "Nested repository: move or delete it yourself if you no longer need it.";
+    case "fileFolderConflict":
+      return "A file in one place and a folder in another: sort it out with Git first.";
+  }
 }
 
 export function recoveryPointKindLabel(kind: RecoveryPointKind): string {
@@ -72,13 +75,14 @@ export function recoveryPointKindLabel(kind: RecoveryPointKind): string {
 }
 
 export function restoreEffectLabel(entry: RecoveryRestoreEntry): string {
+  const staged = entry.indexChanges ? " and the saved staged state" : "";
   switch (entry.worktree) {
     case "create":
-      return "Recreate the saved file";
+      return `Recreate the saved file${staged}`;
     case "replace":
-      return "Replace the current content";
+      return `Replace the current content${staged}`;
     case "remove":
-      return "Remove the current file";
+      return entry.indexChanges ? "Remove the current file and restore the saved staged state" : "Remove the current file";
     case "unchanged":
       return entry.indexChanges ? "Restore the saved staged state" : "Already matches";
   }
