@@ -19,6 +19,7 @@ Configure these repository secrets and variables:
 | Updater | Variable `REPOLA_SIGNING_PUBLIC_KEY`; secrets `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` |
 | Apple signing | Secrets `APPLE_CERT_P12_BASE64` (base64 `.p12` including its private key), `APPLE_CERT_PASSWORD` (export password) |
 | Apple notarization | Secrets `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID`, `APPLE_API_PRIVATE_KEY_BASE64` (base64 `.p8` contents) |
+| Windows signing | Variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_TRUSTED_SIGNING_ENDPOINT`, `AZURE_TRUSTED_SIGNING_ACCOUNT_NAME`, `AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME` |
 
 Generate the updater key with `pnpm tauri signer generate -w <private-key-path>` and a nonempty password. Store the exact one-line `.pub` contents in the public-key variable and the private-key contents in its secret.
 
