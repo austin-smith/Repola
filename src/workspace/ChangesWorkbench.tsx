@@ -6,10 +6,6 @@ import {
   ExternalLinkIcon,
   FolderOpenIcon,
   FileDiffIcon,
-  FileMinusIcon,
-  FilePenLineIcon,
-  FilePlusIcon,
-  FileSymlinkIcon,
   GitCommitIcon,
   RefreshCwIcon,
   SearchIcon,
@@ -40,7 +36,8 @@ import { cn } from "@/lib/utils";
 import { toMessage } from "@/lib/errors";
 import { ActionableGitError } from "../components/ActionableGitError";
 import { StashDialog } from "../dialogs/StashDialog";
-import { arrowKeyChangeTarget, emptyChangeSelection, isSelectAllChangesShortcut, isToggleSelectedChangesShortcut, selectAllChanges, singleChangeSelection, updateChangeSelection } from "../domain/change-selection";
+import { activeChangeKinds, countChangeKinds, filterByChangeKind, type ChangeKindFilterKind } from "../domain/change-kind-filter";
+import { arrowKeyChangeTarget, emptyChangeSelection, isSelectAllChangesShortcut, isToggleSelectedChangesShortcut, restrictChangeSelection, selectAllChanges, singleChangeSelection, updateChangeSelection, type ChangeSelection } from "../domain/change-selection";
 import {
   commitSelectionFor,
   commitSelectionRequest,
@@ -74,21 +71,13 @@ import {
   watchWorktree,
 } from "../ipc/worktrees";
 import type { CommitSigning, ConflictResolutionKind, DiscardScope, FileChange, FileDiff, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../ipc/types";
+import { ChangeKindFilter, ChangeKindIcon } from "./ChangeKindFilter";
 import { parseCommitPeople, parseCommitTrailers } from "./commit-form";
 import { useWorkingCopy } from "./context";
 import { sectionHeadingClass, signingItems } from "./labels";
 import { LazyDialog } from "./LazyDialog";
 import { ConflictResolutionDialog, DiffDialog, InlineFileDiff } from "./lazy";
 import { operationGuidance, operationLabel, operationSupportsSkip } from "./operations";
-
-function changeStatusIcon(change: FileChange) {
-  const code = change.indexStatus !== "." ? change.indexStatus : change.worktreeStatus;
-  if (change.conflicted) return <AlertTriangleIcon className="size-3.5 shrink-0 text-destructive" role="img" aria-label="Conflicted" />;
-  if (change.untracked || code === "A" || code === "?") return <FilePlusIcon className="size-3.5 shrink-0 text-success" role="img" aria-label="Added" />;
-  if (code === "D") return <FileMinusIcon className="size-3.5 shrink-0 text-destructive" role="img" aria-label="Deleted" />;
-  if (code === "R" || code === "C") return <FileSymlinkIcon className="size-3.5 shrink-0 text-brand" role="img" aria-label="Renamed" />;
-  return <FilePenLineIcon className="size-3.5 shrink-0 text-warning" role="img" aria-label="Modified" />;
-}
 
 export function ChangesWorkbench() {
   const { machineId, machineKind, machineOs, repository, worktree } = useWorkingCopy();
@@ -149,6 +138,7 @@ export function ChangesWorkbench() {
   const [diffOpen, setDiffOpen] = useState(false);
   const [stashOpen, setStashOpen] = useState(false);
   const [changeFilter, setChangeFilter] = useState("");
+  const [kindFilter, setKindFilter] = useState<ChangeKindFilterKind[]>([]);
   const [pendingResolution, setPendingResolution] = useState<{
     kind: ConflictResolutionKind;
     change: WorkingCopySnapshot["changes"][number];
@@ -265,16 +255,25 @@ export function ChangesWorkbench() {
   }, [machineKind, worktree.id]);
 
   const visibleChanges = useMemo(() => snapshot?.changes.filter((change) => !change.ignored) ?? [], [snapshot]);
+  const kindCounts = useMemo(() => countChangeKinds(visibleChanges), [visibleChanges]);
+  const activeKinds = useMemo(() => activeChangeKinds(kindFilter, kindCounts), [kindFilter, kindCounts]);
   const normalizedFilter = changeFilter.trim().toLowerCase();
-  const listedChanges = useMemo(() => (
-    normalizedFilter === "" ? visibleChanges : visibleChanges.filter((change) => change.path.display.toLowerCase().includes(normalizedFilter))
-  ), [visibleChanges, normalizedFilter]);
+  const listedChanges = useMemo(() => filterByChangeKind(
+    normalizedFilter === "" ? visibleChanges : visibleChanges.filter((change) => change.path.display.toLowerCase().includes(normalizedFilter)),
+    activeKinds,
+  ), [visibleChanges, normalizedFilter, activeKinds]);
   const listedChangeIds = useMemo(() => listedChanges.map((change) => change.id), [listedChanges]);
-  const selectedChange = visibleChanges.find((change) => change.id === changeSelection.activeId) ?? null;
+  // Filters only hide rows; the selection that previews and acts is always the
+  // listed part of it, so a hidden file is never the target of an action.
+  const listedSelection = useMemo(() => restrictChangeSelection(listedChangeIds, changeSelection), [listedChangeIds, changeSelection]);
+  const updateListedSelection = (update: (current: ChangeSelection) => ChangeSelection) => {
+    setChangeSelection((current) => update(restrictChangeSelection(listedChangeIds, current)));
+  };
+  const selectedChange = visibleChanges.find((change) => change.id === listedSelection.activeId) ?? null;
   // Only the diff body is expensive to build, so it alone follows the selection
   // at transition priority. The list highlight, the header, and every action
   // target stay on the urgent path so they always agree with the selection.
-  const deferredActiveId = useDeferredValue(changeSelection.activeId);
+  const deferredActiveId = useDeferredValue(listedSelection.activeId);
   const diffChange = visibleChanges.find((change) => change.id === deferredActiveId) ?? null;
   // Held as state rather than a ref so the diff pane can bind its virtualized
   // rows to the element as soon as it exists.
@@ -301,7 +300,7 @@ export function ChangesWorkbench() {
     const onSelectAll = (event: Event) => {
       event.preventDefault();
       changesListRef.current?.focus({ preventScroll: true });
-      setChangeSelection((current) => selectAllChanges(listedChangeIds, current));
+      setChangeSelection((current) => selectAllChanges(listedChangeIds, restrictChangeSelection(listedChangeIds, current)));
     };
     document.addEventListener(SELECT_ALL_EVENT, onSelectAll);
     return () => document.removeEventListener(SELECT_ALL_EVENT, onSelectAll);
@@ -315,7 +314,7 @@ export function ChangesWorkbench() {
   const toggleSelectedCommitInclusion = () => {
     if (busyPath !== null || commitBusy || generateBusy) return;
     const selectedChanges = visibleChanges.filter((change) => (
-      changeSelection.selectedIds.has(change.id) && !change.conflicted
+      listedSelection.selectedIds.has(change.id) && !change.conflicted
     ));
     if (selectedChanges.length === 0) return;
     const include = selectedChanges.some((change) => (
@@ -601,8 +600,8 @@ export function ChangesWorkbench() {
             <Button variant="destructive" size="sm" className="ml-2" disabled={syncBusy || snapshot.operation !== null} onClick={() => setPendingForcePush(true)}>Force…</Button>
           ) : null}
         </div>
-        <div className="shrink-0 border-b px-3 py-2">
-          <InputGroup className="h-7">
+        <div className="flex shrink-0 items-center gap-2 border-b px-3 py-2">
+          <InputGroup className="h-7 flex-1">
             <InputGroupAddon><SearchIcon aria-hidden="true" /></InputGroupAddon>
             <InputGroupInput
               value={changeFilter}
@@ -612,6 +611,7 @@ export function ChangesWorkbench() {
               className="text-[0.8rem]"
             />
           </InputGroup>
+          {kindCounts.length > 1 ? <ChangeKindFilter counts={kindCounts} value={activeKinds} onValueChange={setKindFilter} /> : null}
         </div>
         {snapshot?.operation ? (
           <div className="border-b bg-warning/10 px-4 py-3">
@@ -648,10 +648,10 @@ export function ChangesWorkbench() {
           tabIndex={-1}
           aria-keyshortcuts="Meta+A Control+A Space ArrowUp ArrowDown Home End"
           onKeyDown={(event) => {
-            const arrowTarget = arrowKeyChangeTarget(listedChangeIds, changeSelection, event);
+            const arrowTarget = arrowKeyChangeTarget(listedChangeIds, listedSelection, event);
             if (arrowTarget !== null) {
               event.preventDefault();
-              setChangeSelection((current) => updateChangeSelection(listedChangeIds, current, arrowTarget, { additive: false, range: event.shiftKey }));
+              updateListedSelection((current) => updateChangeSelection(listedChangeIds, current, arrowTarget, { additive: false, range: event.shiftKey }));
               const row = event.currentTarget.querySelector<HTMLElement>(`[data-change-id="${CSS.escape(arrowTarget)}"]`);
               row?.focus({ preventScroll: true });
               row?.scrollIntoView({ block: "nearest" });
@@ -659,7 +659,7 @@ export function ChangesWorkbench() {
             }
             if (isSelectAllChangesShortcut(event)) {
               event.preventDefault();
-              setChangeSelection((current) => selectAllChanges(listedChangeIds, current));
+              updateListedSelection((current) => selectAllChanges(listedChangeIds, current));
               return;
             }
             if (!isToggleSelectedChangesShortcut(event)) return;
@@ -671,10 +671,10 @@ export function ChangesWorkbench() {
           {listedChanges.map((change) => (
             <ContextMenu key={change.id}>
               <ContextMenuTrigger
-                className={cn("repola-windowed-row group/change flex min-h-7 [--windowed-row-size:28px] items-center hover:bg-accent/50", changeSelection.selectedIds.has(change.id) && "bg-accent hover:bg-accent")}
+                className={cn("repola-windowed-row group/change flex min-h-7 [--windowed-row-size:28px] items-center hover:bg-accent/50", listedSelection.selectedIds.has(change.id) && "bg-accent hover:bg-accent")}
                 onContextMenu={() => {
                   // Right-clicking a row outside the selection acts on that row alone.
-                  if (!changeSelection.selectedIds.has(change.id)) setChangeSelection(singleChangeSelection(change.id));
+                  if (!listedSelection.selectedIds.has(change.id)) setChangeSelection(singleChangeSelection(change.id));
                 }}
               >
               <span className="grid w-9 shrink-0 place-items-center">
@@ -694,13 +694,13 @@ export function ChangesWorkbench() {
                 type="button"
                 className="flex min-w-0 flex-1 items-center gap-2 self-stretch pr-2.5 text-left"
                 data-change-id={change.id}
-                aria-pressed={changeSelection.selectedIds.has(change.id)}
+                aria-pressed={listedSelection.selectedIds.has(change.id)}
                 onClick={(event) => {
                   // WebKit on macOS does not consistently move keyboard focus to a
                   // button activated with the mouse. Keep the row as the active
                   // command target so Edit > Select All and Cmd+A reach this list.
                   event.currentTarget.focus({ preventScroll: true });
-                  setChangeSelection((current) => updateChangeSelection(
+                  updateListedSelection((current) => updateChangeSelection(
                     listedChangeIds,
                     current,
                     change.id,
@@ -721,7 +721,7 @@ export function ChangesWorkbench() {
                     <TooltipContent>{[change.headMode, change.indexMode, change.worktreeMode].filter(Boolean).join(" → ")}</TooltipContent>
                   </Tooltip>
                 ) : null}
-                {changeStatusIcon(change)}
+                <ChangeKindIcon kind={change.kind} />
               </button>
               </ContextMenuTrigger>
               <ContextMenuContent className="min-w-52">
@@ -755,7 +755,9 @@ export function ChangesWorkbench() {
             </ContextMenu>
           ))}
           {visibleChanges.length > 0 && listedChanges.length === 0 ? (
-            <p className="px-4 py-6 text-center text-sm text-muted-foreground">No changed files match “{changeFilter.trim()}”.</p>
+            <p className="px-4 py-6 text-center text-sm text-muted-foreground">
+              {activeKinds.length > 0 ? "No changed files of the selected types match" : "No changed files match"} “{changeFilter.trim()}”.
+            </p>
           ) : null}
           {visibleChanges.length === 0 ? (
             <Empty className="h-full py-12">

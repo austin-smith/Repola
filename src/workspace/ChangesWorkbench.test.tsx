@@ -216,3 +216,88 @@ describe("commit-message generation", () => {
     expect(screen.getByText("Could not refresh working copy")).toBeInTheDocument();
   });
 });
+
+describe("change type filter", () => {
+  const change = snapshot.changes[0];
+  const mixed: WorkingCopySnapshot = {
+    ...snapshot,
+    changes: [
+      { ...change, id: "src/app.ts", path: { display: "src/app.ts", token: "src/app.ts" } },
+      { ...change, id: "new.txt", path: { display: "new.txt", token: "new.txt" }, kind: "untracked", indexStatus: "?", worktreeStatus: "?", untracked: true },
+      { ...change, id: "old.txt", path: { display: "old.txt", token: "old.txt" }, kind: "deleted", worktreeStatus: "D" },
+    ],
+  };
+  const listedIds = (container: HTMLElement) => (
+    [...container.querySelectorAll("[data-change-id]")].map((row) => row.getAttribute("data-change-id"))
+  );
+  // Every IPC mock resolves immediately, so flushing the render settles the
+  // workbench without polling against the clock.
+  const renderWorkbench = async () => {
+    let view!: ReturnType<typeof render>;
+    await act(async () => { view = render(<ChangesWorkbench />); });
+    return view;
+  };
+
+  afterEach(cleanup);
+  beforeEach(() => {
+    vi.clearAllMocks();
+    ipc.fetchWorkingCopy.mockResolvedValue(mixed);
+    ipc.watchWorktree.mockResolvedValue(undefined);
+    ipc.unwatchWorktree.mockResolvedValue(undefined);
+    ipc.onWorktreeChanged.mockResolvedValue(() => undefined);
+  });
+
+  it("offers no type filter when every change has the same type", async () => {
+    ipc.fetchWorkingCopy.mockResolvedValue(snapshot);
+    await renderWorkbench();
+    expect(screen.getByText("file", { selector: "strong" })).toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "Filter by change type" })).not.toBeInTheDocument();
+  });
+
+  it("lists only the pressed types, previews a listed file, and keeps hidden files in the commit", async () => {
+    const { container } = await renderWorkbench();
+    const added = screen.getByRole("button", { name: "Added (1)" });
+    expect(screen.getByRole("button", { name: "Modified (1)" })).toBeInTheDocument();
+    expect(screen.getByText("src/app.ts", { selector: "strong" })).toBeInTheDocument();
+
+    fireEvent.click(added);
+    expect(listedIds(container)).toEqual(["new.txt"]);
+    expect(screen.getByText("new.txt", { selector: "strong" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Commit 3 files to main" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Deleted (1)" }));
+    expect(listedIds(container)).toEqual(["new.txt", "old.txt"]);
+
+    fireEvent.click(added);
+    fireEvent.click(screen.getByRole("button", { name: "Deleted (1)" }));
+    expect(listedIds(container)).toEqual(["src/app.ts", "new.txt", "old.txt"]);
+  });
+
+  it("never acts on selected files the filter hides", async () => {
+    const { container } = await renderWorkbench();
+    const list = container.querySelector<HTMLElement>("[aria-keyshortcuts]");
+    if (!list) throw new Error("changes list missing");
+    fireEvent.keyDown(list, { key: "a", metaKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "Added (1)" }));
+    fireEvent.keyDown(list, { key: " " });
+    expect(listedIds(container)).toEqual(["new.txt"]);
+    expect(screen.getByRole("button", { name: "Commit 2 files to main" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Added (1)" }));
+    expect(screen.getByRole("checkbox", { name: "Exclude src/app.ts from commit" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Exclude old.txt from commit" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Include new.txt in commit" })).not.toBeChecked();
+  });
+
+  it("stops filtering by a type once a refresh removes its last file", async () => {
+    let notify!: (event: { machineId: string }) => void;
+    ipc.onWorktreeChanged.mockImplementation(async (listener) => { notify = listener; return () => undefined; });
+    const { container } = await renderWorkbench();
+    fireEvent.click(screen.getByRole("button", { name: "Deleted (1)" }));
+    expect(listedIds(container)).toEqual(["old.txt"]);
+
+    ipc.fetchWorkingCopy.mockResolvedValue({ ...mixed, changes: mixed.changes.filter((entry) => entry.kind !== "deleted") });
+    await act(async () => notify({ machineId: "local" }));
+    expect(listedIds(container)).toEqual(["src/app.ts", "new.txt"]);
+    expect(screen.queryByRole("button", { name: /^Deleted/ })).not.toBeInTheDocument();
+  });
+});
