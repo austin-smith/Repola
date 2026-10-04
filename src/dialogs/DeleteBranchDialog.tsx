@@ -107,18 +107,20 @@ export default function DeleteBranchDialog({
     if (!plan || !canExecuteDeletion(plan, typed) || busy) return;
     setBusy(true);
     setExecuteError(null);
+    let result: BranchDeletionResult;
     try {
-      const result = await executeBranchDeletion(machineId, plan, plan.confirmation === "typeBranchName" ? typed : null);
-      await onDeleted(result);
-      onClose();
+      result = await executeBranchDeletion(machineId, plan, plan.confirmation === "typeBranchName" ? typed : null);
     } catch (cause) {
       // Whatever made execution refuse is reviewed again before another attempt.
       setExecuteError(toMessage(cause));
       setTyped("");
       setRevision((value) => value + 1);
-    } finally {
       setBusy(false);
+      return;
     }
+    // The deletion has happened, so nothing the caller does next may report it as refused.
+    onClose();
+    await onDeleted(result);
   };
 
   const localBranches = branches.filter((branch) => !branch.remote);

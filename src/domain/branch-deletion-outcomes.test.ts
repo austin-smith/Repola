@@ -67,11 +67,12 @@ describe("batch branch deletion", () => {
 });
 
 describe("deletionNotice", () => {
-  const step = (target: string, recoveryCommand: string | null, succeeded = true) => ({
+  const step = (target: string, recoveryCommand: string | null, succeeded = true, warning: string | null = null) => ({
     target,
     deletedOid: "a".repeat(40),
     succeeded,
-    output: succeeded ? "" : "! [remote rejected] (stale info)",
+    output: succeeded ? "Deleted branch feature (was aaaa)." : "! [remote rejected] (stale info)",
+    warning,
     recoveryCommand,
   });
   const result = (overrides: Partial<BranchDeletionResult>): BranchDeletionResult => ({
@@ -95,10 +96,24 @@ describe("deletionNotice", () => {
     });
   });
 
-  it("warns with Git's output when the remote step failed", () => {
+  it("keeps the local recovery when the remote step failed", () => {
     expect(deletionNotice(result({
       local: step("feature", "git branch -- feature aaaa"),
       remote: step("origin/feature", null, false),
-    }))).toEqual({ type: "warning", title: "Deleted feature.", description: "! [remote rejected] (stale info)" });
+      auditWarning: "disk full",
+    }))).toEqual({
+      type: "warning",
+      title: "Deleted feature.",
+      description: "! [remote rejected] (stale info) To restore: git branch -- feature aaaa Audit warning: disk full",
+    });
+  });
+
+  it("warns about anything a successful step left undone", () => {
+    const leftover = "feature was deleted, but its configuration was not removed.";
+    expect(deletionNotice(result({ local: step("feature", "git branch -- feature aaaa", true, leftover) }))).toEqual({
+      type: "warning",
+      title: "Deleted feature.",
+      description: `${leftover} To restore: git branch -- feature aaaa`,
+    });
   });
 });

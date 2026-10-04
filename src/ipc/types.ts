@@ -644,6 +644,8 @@ export interface BranchDeletionStep {
   deletedOid: string;
   succeeded: boolean;
   output: string;
+  /** Something left undone by a step that still succeeded. */
+  warning: string | null;
   recoveryCommand: string | null;
 }
 

@@ -99,7 +99,7 @@ function planFor(request: BranchDeletionRequest, overrides: Partial<BranchDeleti
 
 const result: BranchDeletionResult = {
   message: "Deleted local branch feature.",
-  local: { target: "feature", deletedOid: "a".repeat(40), succeeded: true, output: "", recoveryCommand: "git -C /repos/repola branch -- feature aaaa" },
+  local: { target: "feature", deletedOid: "a".repeat(40), succeeded: true, output: "", warning: null, recoveryCommand: "git -C /repos/repola branch -- feature aaaa" },
   remote: null,
   auditPath: null,
   auditWarning: null,
@@ -211,6 +211,18 @@ describe("DeleteBranchDialog", () => {
     expect(screen.getByText(/Checked out in this worktree/)).toBeInTheDocument();
     expect(screen.getByText("Choose the local branch, the remote branch, or both.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Delete Branch" })).toBeDisabled();
+  });
+
+  it("reports a completed deletion however long the caller takes to follow up", async () => {
+    const onDeleted = vi.fn(() => new Promise<void>(() => undefined));
+    const { onClose } = renderDialog(onDeleted);
+    await screen.findByText(/branch -d -- feature/);
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete Branch" }));
+
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(onDeleted).toHaveBeenCalledWith(result);
+    expect(screen.queryByText("The branch was not deleted")).not.toBeInTheDocument();
   });
 
   it("shows a refused execution and reviews the branch again", async () => {

@@ -18,17 +18,18 @@ export interface DeletionNotice {
   description?: string;
 }
 
-/** Reports a finished deletion: how to restore what was deleted, or why the remote step failed. */
+/**
+ * Reports a finished deletion: why a step failed or left something undone, how to restore what
+ * was deleted, and whether the audit log missed it.
+ */
 export function deletionNotice(result: BranchDeletionResult): DeletionNotice {
-  if (result.remote !== null && !result.remote.succeeded) {
-    return { type: "warning", title: result.message, description: result.remote.output };
-  }
-  const recovery = [result.local, result.remote]
-    .flatMap((step) => (step?.recoveryCommand ? [step.recoveryCommand] : []))
-    .join("; ");
+  const steps = [result.local, result.remote].flatMap((step) => (step ? [step] : []));
+  const problems = steps.flatMap((step) => [step.succeeded ? "" : step.output, step.warning ?? ""]).filter(Boolean);
+  const recovery = steps.flatMap((step) => (step.recoveryCommand ? [step.recoveryCommand] : [])).join("; ");
   const description = [
+    ...problems,
     recovery && `To restore: ${recovery}`,
     result.auditWarning && `Audit warning: ${result.auditWarning}`,
   ].filter(Boolean).join(" ");
-  return { type: "success", title: result.message, description: description || undefined };
+  return { type: problems.length > 0 ? "warning" : "success", title: result.message, description: description || undefined };
 }

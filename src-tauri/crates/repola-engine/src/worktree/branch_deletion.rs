@@ -357,6 +357,7 @@ pub fn execute_branch_deletion(
                 deleted_oid: remote.expected_oid.clone(),
                 succeeded,
                 output: diagnostic,
+                warning: None,
                 recovery_command: succeeded.then(|| {
                     let refspec = format!("{}:{}", remote.expected_oid, remote.remote_ref);
                     git_command_line(worktree, ["push", "--", remote.remote.as_str(), &refspec])
@@ -399,7 +400,7 @@ fn delete_local(
         .split_first()
         .ok_or_else(|| format!("No command was reviewed to delete {}.", local.name))?;
     let output = command::git_at(worktree, deletion).map_err(|error| error.to_string())?;
-    let mut diagnostic = combined_output(&output.stdout, &output.stderr);
+    let diagnostic = combined_output(&output.stdout, &output.stderr);
     if !output.status.success() {
         return Err(if diagnostic.is_empty() {
             format!(
@@ -410,23 +411,28 @@ fn delete_local(
             diagnostic
         });
     }
-    for args in cleanup {
-        let failure = match command::git_at(worktree, args) {
-            Ok(output) if output.status.success() => None,
-            Ok(output) => Some(combined_output(&output.stdout, &output.stderr)),
-            Err(error) => Some(error.to_string()),
-        };
-        if let Some(failure) = failure {
-            diagnostic.push_str(&format!(
-                "\nThe branch was deleted, but its configuration could not be removed: {failure}"
-            ));
-        }
-    }
+    let warnings: Vec<String> = cleanup
+        .iter()
+        .filter_map(|args| {
+            let failure = match command::git_at(worktree, args) {
+                Ok(output) if output.status.success() => return None,
+                Ok(output) => combined_output(&output.stdout, &output.stderr),
+                Err(error) => error.to_string(),
+            };
+            Some(format!(
+                "{} was deleted, but its configuration was not removed ({}). A new branch with this name would inherit it. To remove it: {}",
+                local.name,
+                failure.trim(),
+                git_command_line(worktree, args)
+            ))
+        })
+        .collect();
     Ok(BranchDeletionStep {
         target: local.name.clone(),
         deleted_oid: local.tip.clone(),
         succeeded: true,
-        output: diagnostic.trim().to_string(),
+        output: diagnostic,
+        warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
         recovery_command: Some(git_command_line(
             worktree,
             ["branch", "--", local.name.as_str(), local.tip.as_str()],
@@ -486,6 +492,9 @@ fn has_branch_config(worktree: &Path, name: &str) -> Result<bool, String> {
 /// Asks the remote which branch its HEAD names, because the local
 /// `refs/remotes/<remote>/HEAD` can be missing or stale. Refuses when the remote
 /// cannot answer, or answers without naming a branch.
+///
+/// This is a check, not a lock: a push cannot be made conditional on the
+/// remote's HEAD, so only the server can make this protection atomic.
 fn confirm_not_remote_default(
     worktree: &Path,
     remote: &RemoteBranchDeletion,
@@ -1232,6 +1241,43 @@ mod tests {
         assert!(
             !has_branch_config(worktree, "forced").expect("read configuration"),
             "the branch's upstream configuration goes with it, as with branch -D"
+        );
+    }
+
+    #[test]
+    fn a_forced_deletion_reports_configuration_it_could_not_remove() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["switch", "--create", "stuck"]);
+        git(
+            &fixture.repository,
+            &["push", "--set-upstream", "origin", "stuck"],
+        );
+        commit(&fixture.repository, "not on the upstream");
+        git(&fixture.repository, &["switch", "main"]);
+        let plan = fixture.plan("refs/heads/stuck", true, false);
+        assert!(plan.requires_force);
+
+        // Git refuses to write its configuration while another writer holds the lock.
+        let lock = fixture.repository.join(".git").join("config.lock");
+        std::fs::write(&lock, "").expect("hold the configuration lock");
+        let result = execute(&plan, Some("stuck")).expect("the branch itself is deleted");
+        std::fs::remove_file(&lock).expect("release the configuration lock");
+
+        let step = result.local.expect("local step");
+        assert!(step.succeeded);
+        assert!(!fixture.has_ref("refs/heads/stuck"));
+        let warning = step
+            .warning
+            .expect("the leftover configuration is reported");
+        assert!(
+            warning.contains(&git_command_line(
+                Path::new(&plan.worktree_path),
+                ["config", "--local", "--remove-section", "branch.stuck"]
+            )),
+            "{warning}"
+        );
+        assert!(
+            has_branch_config(Path::new(&plan.worktree_path), "stuck").expect("read configuration")
         );
     }
 

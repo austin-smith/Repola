@@ -1163,6 +1163,8 @@ pub struct BranchDeletionStep {
     pub deleted_oid: String,
     pub succeeded: bool,
     pub output: String,
+    /// Something left undone by a step that still succeeded.
+    pub warning: Option<String>,
     pub recovery_command: Option<String>,
 }
 

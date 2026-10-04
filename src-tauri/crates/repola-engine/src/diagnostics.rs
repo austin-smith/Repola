@@ -31,6 +31,7 @@ pub(crate) fn redact_agent_result(mut result: AgentResult) -> AgentResult {
                 .flatten()
             {
                 step.output = redact(&step.output);
+                step.warning = step.warning.as_deref().map(redact);
             }
         }
         _ => {}

@@ -1308,13 +1308,16 @@ async fn execute_branch_deletion(
     operations.finish(&operation_id);
     let outcome = outcome.map_err(|error| format!("Branch deletion failed: {error}"))?;
     let (succeeded, message) = match &outcome {
-        Ok(result) => (
-            [&result.local, &result.remote]
-                .into_iter()
-                .flatten()
-                .all(|step| step.succeeded),
-            result.message.clone(),
-        ),
+        Ok(result) => {
+            let steps = [&result.local, &result.remote].into_iter().flatten();
+            (
+                steps.clone().all(|step| step.succeeded),
+                std::iter::once(result.message.as_str())
+                    .chain(steps.filter_map(|step| step.warning.as_deref()))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        }
         Err(error) => (false, error.clone()),
     };
     let audit = append_audit_entry(
