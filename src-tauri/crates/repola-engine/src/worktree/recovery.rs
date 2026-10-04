@@ -630,7 +630,7 @@ pub(super) fn store_recovery_point(
     states: &[PathState],
 ) -> Result<RecoveryPoint, String> {
     let (stamp, created_at) = utc_timestamps(SystemTime::now());
-    let record = Summary {
+    let mut record = Summary {
         version: MANIFEST_VERSION,
         kind,
         summary,
@@ -638,13 +638,21 @@ pub(super) fn store_recovery_point(
         worktree_path: worktree.to_string_lossy().into_owned(),
         head: head.map(str::to_string),
         path_count: states.len() as u64,
-        paths: states
-            .iter()
-            .take(SUMMARY_SAMPLE_PATHS)
-            .map(|state| state.path.clone())
-            .collect(),
+        paths: Vec::new(),
         stored_bytes: stored_bytes(states),
     };
+    // Sample only as many paths as keep the summary readable by `list`.
+    for state in states.iter().take(SUMMARY_SAMPLE_PATHS) {
+        record.paths.push(state.path.clone());
+        if serde_json::to_vec(&record)
+            .map_err(|error| error.to_string())?
+            .len()
+            > MAX_SUMMARY_BYTES
+        {
+            record.paths.pop();
+            break;
+        }
+    }
     let manifest = Manifest {
         version: MANIFEST_VERSION,
         paths: states.to_vec(),
@@ -2098,6 +2106,29 @@ mod tests {
         );
         assert!(diff.patch.contains("\n--- a/base.txt\n+++ b/base.txt\n"));
         assert!(diff.patch.contains("\n-base\n+saved\n"));
+    }
+
+    #[test]
+    fn long_paths_never_push_a_summary_past_what_listing_reads() {
+        let (_directory, path) = repository();
+        // Each sampled path is stored as its name and its hex token.
+        let deep = format!("{}/", "d".repeat(200)).repeat(20);
+        let states: Vec<PathState> = (0..SUMMARY_SAMPLE_PATHS)
+            .map(|index| {
+                saved_file(
+                    &path,
+                    &format!("{deep}{index}.txt"),
+                    WorktreeEntryKind::File,
+                    b"x",
+                )
+            })
+            .collect();
+        let point = store(&path, &states);
+        assert!(!point.paths.is_empty());
+        assert!(point.paths.len() < SUMMARY_SAMPLE_PATHS);
+        let listed = list_recovery_points(request(&path)).expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path_count, SUMMARY_SAMPLE_PATHS as u64);
     }
 
     #[test]
