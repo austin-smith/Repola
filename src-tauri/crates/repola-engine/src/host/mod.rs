@@ -37,6 +37,10 @@ pub enum HostError {
     Protocol(String),
     #[error("The remote Repola agent rejected the operation: {0}")]
     Remote(String),
+    /// The error stopped the operation before any agent received the request,
+    /// so nothing it asked for ran.
+    #[error("{0}")]
+    NotDelivered(Box<HostError>),
 }
 
 pub fn execute<F>(

@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::ExitStatus;
 use std::sync::mpsc;
 use std::thread;
@@ -10,7 +10,7 @@ use crate::machines::MachineProfile;
 use crate::operation::OperationToken;
 use crate::protocol::{
     read_frame, write_frame, AgentCapability, AgentErrorKind, AgentInfo, AgentRequest, AgentResult,
-    RequestEnvelope, ResponseBody, ResponseEnvelope, PROTOCOL_VERSION,
+    FrameError, RequestEnvelope, ResponseBody, ResponseEnvelope, PROTOCOL_VERSION,
 };
 use crate::worktree::command::{self, ManagedChild};
 
@@ -39,36 +39,57 @@ where
     let initial_command = cached.map_or("repola-agent --stdio", |platform| {
         super::bootstrap::managed_agent_command(platform)
     });
-    match execute_once(
+    // Another agent is tried only while no agent has received the request, so
+    // a request never runs twice.
+    let attempt = execute_once(
         machine,
         request.clone(),
         &emit,
         token.clone(),
         initial_command,
-    ) {
-        Ok(result) => return Ok(result),
-        Err(error) if !agent_recovery_allowed(&error) => return Err(error),
-        Err(_) => {}
+    );
+    if let Some(outcome) = conclude(attempt) {
+        return outcome;
     }
 
-    let platform = super::bootstrap::detect_platform(machine, &token)?;
+    let platform = super::bootstrap::detect_platform(machine, &token).map_err(not_delivered)?;
     let managed_command = super::bootstrap::managed_agent_command(platform);
     if initial_command != managed_command {
-        match execute_once(
+        let attempt = execute_once(
             machine,
             request.clone(),
             &emit,
             token.clone(),
             managed_command,
-        ) {
-            Ok(result) => return Ok(result),
-            Err(error) if !agent_recovery_allowed(&error) => return Err(error),
-            Err(_) => {}
+        );
+        if let Some(outcome) = conclude(attempt) {
+            return outcome;
         }
     }
 
-    super::bootstrap::install_verified_agent(machine, platform, &token)?;
-    execute_once(machine, request, &emit, token, managed_command)
+    super::bootstrap::install_verified_agent(machine, platform, &token).map_err(not_delivered)?;
+    let attempt = execute_once(machine, request, &emit, token, managed_command);
+    match attempt.result {
+        Ok(result) => Ok(result),
+        Err(error) if attempt.delivered => Err(error),
+        Err(error) => Err(not_delivered(error)),
+    }
+}
+
+/// The outcome of an attempt, or `None` when another agent may be tried: only
+/// while no agent has received the request, and only for an agent that is
+/// missing or of another version.
+fn conclude(attempt: Exchange) -> Option<Result<AgentResult, HostError>> {
+    match attempt.result {
+        Ok(result) => Some(Ok(result)),
+        Err(error) if attempt.delivered => Some(Err(error)),
+        Err(error) if agent_recovery_allowed(&error) => None,
+        Err(error) => Some(Err(not_delivered(error))),
+    }
+}
+
+fn not_delivered(error: HostError) -> HostError {
+    HostError::NotDelivered(Box::new(error))
 }
 
 fn execute_once<F>(
@@ -77,27 +98,39 @@ fn execute_once<F>(
     emit: &F,
     token: OperationToken,
     remote_command: &str,
-) -> Result<AgentResult, HostError>
+) -> Exchange
 where
     F: Fn(ResponseEnvelope) + Sync,
 {
+    let unsent = |error| Exchange {
+        result: Err(error),
+        answered: false,
+        delivered: false,
+    };
     if machine.ssh.is_none() {
-        return Err(HostError::InvalidProfile(machine.name.clone()));
+        return unsent(HostError::InvalidProfile(machine.name.clone()));
     }
-    let arguments = arguments_for_command(machine, remote_command)?;
-    let mut child = command::spawn_piped("ssh", &arguments)
-        .map_err(|error| HostError::Launch(error.to_string()))?;
-    let request_id = request.request_id.clone();
+    let arguments = match arguments_for_command(machine, remote_command) {
+        Ok(arguments) => arguments,
+        Err(error) => return unsent(error),
+    };
+    let timeout = operation_timeout(&request.request);
+    let mut child = match command::spawn_piped("ssh", &arguments) {
+        Ok(child) => child,
+        Err(error) => return unsent(HostError::Launch(error.to_string())),
+    };
 
-    let mut input = child
-        .stdin()
-        .take()
-        .ok_or_else(|| HostError::Transport("OpenSSH stdin was not available".into()))?;
+    let Some(mut input) = child.stdin().take() else {
+        terminate(&mut child);
+        return unsent(HostError::Transport(
+            "OpenSSH stdin was not available".into(),
+        ));
+    };
     let handshake_id = format!("{}:handshake", request.request_id);
     let preflight = !matches!(&request.request, AgentRequest::Handshake { .. });
-    // The request is sent only once the agent's handshake checks out, so an
-    // agent of another build never starts it, and closing input afterwards
-    // tells the agent nothing more is coming.
+    // The request waits for a validated handshake: an agent of another version
+    // would otherwise run it, and the retry below with the right agent would
+    // run it a second time.
     let first = if preflight {
         RequestEnvelope::current(
             handshake_id.clone(),
@@ -112,196 +145,283 @@ where
     };
     if let Err(error) = write_frame(&mut input, &first) {
         terminate(&mut child);
-        return Err(HostError::Transport(error.to_string()));
+        return unsent(HostError::Transport(error.to_string()));
     }
-    let mut pending_input = if preflight {
+    let pending_input = if preflight {
         Some(input)
     } else {
         drop(input);
         None
     };
 
-    let mut output = child
-        .stdout()
-        .take()
-        .ok_or_else(|| HostError::Transport("OpenSSH stdout was not available".into()))?;
-    let stderr = child
-        .stderr()
-        .take()
-        .ok_or_else(|| HostError::Transport("OpenSSH stderr was not available".into()))?;
+    let (Some(mut output), Some(stderr)) = (child.stdout().take(), child.stderr().take()) else {
+        terminate(&mut child);
+        return unsent(HostError::Transport(
+            "OpenSSH output was not available".into(),
+        ));
+    };
     let diagnostic_reader = thread::spawn(move || bounded_diagnostics(stderr));
 
     let (wire_sender, wire_receiver) = mpsc::channel();
-    // Reads every frame until the agent closes its output: the handshake's
-    // answer comes before the request's, and only the loop below knows which
-    // one ends the exchange.
-    let wire_reader = thread::spawn(move || loop {
-        let response = read_frame::<_, ResponseEnvelope>(&mut output);
-        let finished = !matches!(response, Ok(Some(_)));
-        if wire_sender.send(response).is_err() || finished {
-            break;
-        }
-    });
+    let reader_handshake_id = handshake_id.clone();
+    let wire_reader =
+        thread::spawn(move || forward_responses(&mut output, &reader_handshake_id, &wire_sender));
 
-    let started = Instant::now();
-    let mut awaiting_handshake = preflight;
-    // Set when the agent answered the handshake and Repola turned it down.
-    let mut declined = false;
-    let terminal = loop {
-        if token.is_cancelled() {
-            break Err(HostError::Cancelled(machine.name.clone()));
-        }
-        let limit = phase_timeout(&request.request, awaiting_handshake);
-        let Some(remaining) = limit.checked_sub(started.elapsed()) else {
-            break Err(
-                if !awaiting_handshake && changes_working_copy(&request.request) {
-                    HostError::Unconfirmed {
-                        machine: machine.name.clone(),
-                        minutes: limit.as_secs() / 60,
-                    }
-                } else {
-                    HostError::Timeout {
-                        machine: machine.name.clone(),
-                        seconds: limit.as_secs(),
-                    }
-                },
-            );
-        };
-        let response = match wire_receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
-            Ok(Ok(Some(response))) => response,
-            Ok(Ok(None)) => {
-                break Err(HostError::Protocol(
-                    "the agent closed the stream before a terminal response".into(),
-                ));
-            }
-            Ok(Err(error)) => break Err(HostError::Protocol(error.to_string())),
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                break Err(HostError::Protocol(
-                    "the agent response reader stopped unexpectedly".into(),
-                ));
-            }
-        };
-        if response.protocol_version != PROTOCOL_VERSION {
-            let detail = format!(
-                "agent responded with protocol version {}; expected {}",
-                response.protocol_version, PROTOCOL_VERSION
-            );
-            declined = awaiting_handshake;
-            break Err(if awaiting_handshake {
-                preflight_protocol_error(machine, detail)
-            } else {
-                HostError::Protocol(detail)
-            });
-        }
-        let expected_id = if awaiting_handshake {
-            &handshake_id
-        } else {
-            &request_id
-        };
-        if response.request_id != *expected_id {
-            break Err(HostError::Protocol(format!(
-                "agent response ID {:?} did not match request ID {:?}",
-                response.request_id, expected_id
-            )));
-        }
-        if awaiting_handshake {
-            match &response.body {
-                ResponseBody::Success {
-                    result: AgentResult::Handshake { agent },
-                } => match validate_handshake(agent, &request.request, &machine.name) {
-                    Ok(()) => {
-                        awaiting_handshake = false;
-                        if let Some(mut input) = pending_input.take() {
-                            if let Err(error) = write_frame(&mut input, &request) {
-                                break Err(HostError::Transport(error.to_string()));
-                            }
-                        }
-                        continue;
-                    }
-                    Err(error) => {
-                        declined = true;
-                        break Err(error);
-                    }
-                },
-                ResponseBody::Success { .. } | ResponseBody::Event { .. } => {
-                    declined = true;
-                    break Err(HostError::Protocol(
-                        "the agent returned an invalid handshake response".into(),
-                    ));
-                }
-                ResponseBody::Failure { error } => {
-                    declined = true;
-                    break Err(if error.kind == AgentErrorKind::Protocol {
-                        preflight_protocol_error(machine, error.summary.clone())
-                    } else {
-                        HostError::Remote(error.summary.clone())
-                    });
-                }
-            }
-        }
-        match &response.body {
-            ResponseBody::Event { .. } => emit(response),
-            ResponseBody::Success { result } => {
-                if let AgentResult::Handshake { agent } = result {
-                    if let Err(error) = validate_handshake(agent, &request.request, &machine.name) {
-                        break Err(error);
-                    }
-                }
-                break Ok(result.clone());
-            }
-            ResponseBody::Failure { error } => break Err(HostError::Remote(error.summary.clone())),
-        }
-    };
+    let mut exchange = converse(
+        machine,
+        &request,
+        pending_input.map(|input| (handshake_id.as_str(), input)),
+        &wire_receiver,
+        &token,
+        timeout,
+        emit,
+    );
 
-    // An agent whose handshake was turned down is waiting for a request it
-    // will never get; closing its input lets it exit on its own, and the
-    // reason it was turned down is the answer.
-    drop(pending_input);
-    if terminal.is_err() && !declined {
+    if exchange.result.is_err() {
         terminate(&mut child);
     }
-    let status = wait_for_exit(&mut child, EXIT_GRACE_PERIOD)?;
+    let status = wait_for_exit(&mut child, EXIT_GRACE_PERIOD);
     let _ = wire_reader.join();
     let diagnostics = diagnostic_reader
         .join()
         .unwrap_or_else(|_| "OpenSSH diagnostic reader failed".into());
-    if declined
+    // The agent's own answer stands; OpenSSH exits by signal once it is
+    // terminated after an error answer. Only without one does the exit explain
+    // what went wrong.
+    if exchange.answered
         || matches!(
-            terminal,
+            exchange.result,
             Err(HostError::Timeout { .. }
                 | HostError::Unconfirmed { .. }
                 | HostError::Cancelled(_))
         )
     {
-        return terminal;
+        return exchange;
     }
-    if !status.success() {
-        return Err(ssh_exit_error(machine, status, diagnostics));
+    match status {
+        Ok(status) if !status.success() => {
+            exchange.result = Err(ssh_exit_error(
+                machine,
+                status,
+                diagnostics,
+                exchange.delivered,
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => exchange.result = Err(error),
     }
-    terminal
+    exchange
 }
 
-/// How long the exchange may run so far: an agent that has not answered the
-/// handshake gets the handshake's time whatever the request is.
-fn phase_timeout(request: &AgentRequest, awaiting_handshake: bool) -> Duration {
-    let timeout = operation_timeout(request);
-    if awaiting_handshake {
-        timeout.min(HANDSHAKE_TIMEOUT)
-    } else {
-        timeout
+/// Forwards the agent's responses until the request's terminal one. Events and
+/// the handshake's response come first, so neither ends the stream; a read
+/// error or the end of the stream does.
+fn forward_responses<R: Read>(
+    output: &mut R,
+    handshake_id: &str,
+    sender: &mpsc::Sender<Result<Option<ResponseEnvelope>, FrameError>>,
+) {
+    loop {
+        let response = read_frame::<_, ResponseEnvelope>(output);
+        let terminal = match &response {
+            Ok(Some(envelope)) => {
+                !matches!(envelope.body, ResponseBody::Event { .. })
+                    && envelope.request_id != handshake_id
+            }
+            Ok(None) | Err(_) => true,
+        };
+        if sender.send(response).is_err() || terminal {
+            break;
+        }
     }
 }
 
-/// Requests that change files or recovery points, which the agent finishes
-/// even after Repola stops waiting.
-fn changes_working_copy(request: &AgentRequest) -> bool {
-    matches!(
-        request,
-        AgentRequest::Discard { .. }
-            | AgentRequest::RestoreRecoveryPoint { .. }
-            | AgentRequest::DeleteRecoveryPoints { .. }
-    )
+/// How one exchange with the agent ended.
+#[derive(Debug)]
+struct Exchange {
+    result: Result<AgentResult, HostError>,
+    /// The result is the agent's own answer, which nothing that happens to
+    /// OpenSSH afterwards can change.
+    answered: bool,
+    /// A request with effects was written to the agent, which may have run it.
+    /// A handshake never counts: it changes nothing, so another agent may
+    /// always be asked.
+    delivered: bool,
+}
+
+/// What a response from the agent calls for next.
+enum Step {
+    Wait,
+    SendRequest,
+    Done(Box<Result<AgentResult, HostError>>),
+}
+
+/// Exchanges frames with the agent until its terminal response. With a
+/// `handshake`, its ID names the handshake that was sent first, and the request
+/// waits for the input beside it: the request is written only once the
+/// handshake is valid, so an agent of another version never receives it.
+fn converse<W, F>(
+    machine: &MachineProfile,
+    request: &RequestEnvelope,
+    handshake: Option<(&str, W)>,
+    responses: &mpsc::Receiver<Result<Option<ResponseEnvelope>, FrameError>>,
+    token: &OperationToken,
+    timeout: Duration,
+    emit: &F,
+) -> Exchange
+where
+    W: Write,
+    F: Fn(ResponseEnvelope) + Sync,
+{
+    let (handshake_id, mut pending_input) = handshake.unzip();
+    // Nothing with effects is written until the handshake is valid. Without
+    // a handshake first, the request is itself a handshake.
+    let mut delivered = false;
+    let unanswered = |result, delivered| Exchange {
+        result,
+        answered: false,
+        delivered,
+    };
+    let started = Instant::now();
+    loop {
+        if token.is_cancelled() {
+            break unanswered(Err(HostError::Cancelled(machine.name.clone())), delivered);
+        }
+        let limit = phase_timeout(timeout, pending_input.is_some());
+        let Some(remaining) = limit.checked_sub(started.elapsed()) else {
+            let error = if delivered && changes_working_copy(&request.request) {
+                HostError::Unconfirmed {
+                    machine: machine.name.clone(),
+                    minutes: limit.as_secs() / 60,
+                }
+            } else {
+                HostError::Timeout {
+                    machine: machine.name.clone(),
+                    seconds: limit.as_secs(),
+                }
+            };
+            break unanswered(Err(error), delivered);
+        };
+        let response = match responses.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(Ok(Some(response))) => response,
+            Ok(Ok(None)) => {
+                break unanswered(
+                    Err(HostError::Protocol(
+                        "the agent closed the stream before a terminal response".into(),
+                    )),
+                    delivered,
+                );
+            }
+            Ok(Err(error)) => {
+                break unanswered(Err(HostError::Protocol(error.to_string())), delivered)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break unanswered(
+                    Err(HostError::Protocol(
+                        "the agent response reader stopped unexpectedly".into(),
+                    )),
+                    delivered,
+                );
+            }
+        };
+        let awaiting_handshake = handshake_id.filter(|_| !delivered);
+        match interpret(machine, request, awaiting_handshake, response, emit) {
+            Step::Wait => {}
+            Step::SendRequest => {
+                let Some(mut input) = pending_input.take() else {
+                    break unanswered(
+                        Err(HostError::Protocol(
+                            "the request was sent before its handshake".into(),
+                        )),
+                        delivered,
+                    );
+                };
+                if let Err(error) = write_frame(&mut input, request) {
+                    // A partly written frame may still reach the agent.
+                    break unanswered(Err(HostError::Transport(error.to_string())), true);
+                }
+                drop(input);
+                delivered = true;
+            }
+            Step::Done(result) => {
+                break Exchange {
+                    result: *result,
+                    answered: true,
+                    delivered,
+                }
+            }
+        }
+    }
+}
+
+/// Decides what one response calls for, while `awaiting_handshake` names the
+/// handshake whose response comes first.
+fn interpret<F>(
+    machine: &MachineProfile,
+    request: &RequestEnvelope,
+    awaiting_handshake: Option<&str>,
+    response: ResponseEnvelope,
+    emit: &F,
+) -> Step
+where
+    F: Fn(ResponseEnvelope) + Sync,
+{
+    if response.protocol_version != PROTOCOL_VERSION {
+        let detail = format!(
+            "agent responded with protocol version {}; expected {}",
+            response.protocol_version, PROTOCOL_VERSION
+        );
+        return Step::Done(Box::new(Err(if awaiting_handshake.is_some() {
+            preflight_protocol_error(machine, detail)
+        } else {
+            HostError::Protocol(detail)
+        })));
+    }
+    let expected_id = awaiting_handshake.unwrap_or(request.request_id.as_str());
+    if response.request_id != expected_id {
+        return Step::Done(Box::new(Err(HostError::Protocol(format!(
+            "agent response ID {:?} did not match request ID {:?}",
+            response.request_id, expected_id
+        )))));
+    }
+    if awaiting_handshake.is_some() {
+        return match &response.body {
+            ResponseBody::Success {
+                result: AgentResult::Handshake { agent },
+            } => match validate_handshake(agent, &request.request, &machine.name) {
+                Ok(()) => Step::SendRequest,
+                Err(error) => Step::Done(Box::new(Err(error))),
+            },
+            ResponseBody::Success { .. } | ResponseBody::Event { .. } => Step::Done(Box::new(Err(
+                HostError::Protocol("the agent returned an invalid handshake response".into()),
+            ))),
+            ResponseBody::Failure { error } => {
+                Step::Done(Box::new(Err(if error.kind == AgentErrorKind::Protocol {
+                    preflight_protocol_error(machine, error.summary.clone())
+                } else {
+                    HostError::Remote(error.summary.clone())
+                })))
+            }
+        };
+    }
+    match &response.body {
+        ResponseBody::Event { .. } => {
+            emit(response);
+            Step::Wait
+        }
+        ResponseBody::Success { result } => {
+            if let AgentResult::Handshake { agent } = result {
+                if let Err(error) = validate_handshake(agent, &request.request, &machine.name) {
+                    return Step::Done(Box::new(Err(error)));
+                }
+            }
+            Step::Done(Box::new(Ok(result.clone())))
+        }
+        ResponseBody::Failure { error } => {
+            Step::Done(Box::new(Err(HostError::Remote(error.summary.clone()))))
+        }
+    }
 }
 
 fn agent_recovery_allowed(error: &HostError) -> bool {
@@ -406,10 +526,34 @@ fn validate_handshake(
     Ok(())
 }
 
+/// How long the exchange may run so far: an agent that has not answered the
+/// handshake gets the handshake's time whatever the request is.
+fn phase_timeout(timeout: Duration, awaiting_handshake: bool) -> Duration {
+    if awaiting_handshake {
+        timeout.min(HANDSHAKE_TIMEOUT)
+    } else {
+        timeout
+    }
+}
+
+/// Requests that change files or recovery points, which the agent finishes
+/// even after Repola stops waiting.
+fn changes_working_copy(request: &AgentRequest) -> bool {
+    matches!(
+        request,
+        AgentRequest::Discard { .. }
+            | AgentRequest::RestoreRecoveryPoint { .. }
+            | AgentRequest::DeleteRecoveryPoints { .. }
+    )
+}
+
 fn operation_timeout(request: &AgentRequest) -> Duration {
     match request {
         AgentRequest::Discard { .. } | AgentRequest::RestoreRecoveryPoint { .. } => {
             RECOVERY_CHANGE_TIMEOUT
+        }
+        AgentRequest::PlanDiscard { .. } | AgentRequest::PlanRecoveryRestore { .. } => {
+            RECOVERY_PLAN_TIMEOUT
         }
         AgentRequest::Handshake { .. } => HANDSHAKE_TIMEOUT,
         AgentRequest::ScanWorktrees { .. } => SCAN_TIMEOUT,
@@ -428,9 +572,6 @@ fn operation_timeout(request: &AgentRequest) -> Duration {
         AgentRequest::TextGenerationStatus { provider } => (HANDSHAKE_TIMEOUT
             + crate::worktree::text_generation_status_timeout(*provider))
         .max(STANDARD_TIMEOUT),
-        AgentRequest::PlanDiscard { .. } | AgentRequest::PlanRecoveryRestore { .. } => {
-            RECOVERY_PLAN_TIMEOUT
-        }
         AgentRequest::ResolveRepository { .. }
         | AgentRequest::FetchPullRequests { .. }
         | AgentRequest::MutatePullRequest { .. }
@@ -517,7 +658,7 @@ pub(super) fn arguments_for_command(
         OsString::from("-o"),
         OsString::from("ConnectTimeout=15"),
         // A connection that stops answering is noticed within a minute, even
-        // for requests that wait without a deadline.
+        // for requests that wait hours.
         OsString::from("-o"),
         OsString::from("ServerAliveInterval=15"),
         OsString::from("-o"),
@@ -553,9 +694,18 @@ fn bounded_diagnostics<R: Read>(mut reader: R) -> String {
     String::from_utf8_lossy(&captured).trim().to_string()
 }
 
-fn ssh_exit_error(machine: &MachineProfile, status: ExitStatus, diagnostics: String) -> HostError {
+/// Why OpenSSH exited without the agent's answer. Before a request is
+/// `delivered`, a shell that cannot find the agent means it is not installed;
+/// after, the agent ran, so its answer was lost in transport.
+fn ssh_exit_error(
+    machine: &MachineProfile,
+    status: ExitStatus,
+    diagnostics: String,
+    delivered: bool,
+) -> HostError {
     let normalized = diagnostics.to_ascii_lowercase();
-    if normalized.contains("repola-agent")
+    if !delivered
+        && normalized.contains("repola-agent")
         && (normalized.contains("not found")
             || normalized.contains("no such file")
             || normalized.contains("not recognized"))
@@ -683,12 +833,15 @@ mod tests {
             },
         };
         for request in [&discard, &restore, &delete] {
-            assert_eq!(phase_timeout(request, true), HANDSHAKE_TIMEOUT);
+            assert_eq!(
+                phase_timeout(operation_timeout(request), true),
+                HANDSHAKE_TIMEOUT
+            );
             assert!(changes_working_copy(request));
         }
-        assert_eq!(phase_timeout(&discard, false), RECOVERY_CHANGE_TIMEOUT);
-        assert_eq!(phase_timeout(&restore, false), RECOVERY_CHANGE_TIMEOUT);
-        assert_eq!(phase_timeout(&delete, false), STANDARD_TIMEOUT);
+        assert_eq!(operation_timeout(&discard), RECOVERY_CHANGE_TIMEOUT);
+        assert_eq!(operation_timeout(&restore), RECOVERY_CHANGE_TIMEOUT);
+        assert_eq!(operation_timeout(&delete), STANDARD_TIMEOUT);
     }
 
     #[test]
@@ -754,9 +907,19 @@ mod tests {
             &profile(),
             status,
             "sh: repola-agent: command not found".into(),
+            false,
         );
         assert!(matches!(error, HostError::AgentUnavailable { .. }));
         assert!(error.to_string().contains("matching Repola agent"));
+
+        // Once the agent has the request it ran, whatever its shell printed.
+        let error = ssh_exit_error(
+            &profile(),
+            status,
+            "sh: repola-agent: command not found".into(),
+            true,
+        );
+        assert!(matches!(error, HostError::Transport(_)), "{error:?}");
     }
 
     #[test]
@@ -809,5 +972,189 @@ mod tests {
             validate_handshake(&agent, &request, "Build server"),
             Err(HostError::AgentVersionMismatch { .. })
         ));
+    }
+
+    fn scan_request() -> RequestEnvelope {
+        RequestEnvelope::current(
+            "scan-1",
+            AgentRequest::ScanWorktrees {
+                request: crate::worktree::ScanRequest {
+                    repository_paths: vec![],
+                },
+            },
+        )
+    }
+
+    fn agent(version: &str) -> AgentInfo {
+        AgentInfo {
+            agent_version: version.into(),
+            protocol_version: PROTOCOL_VERSION,
+            operating_system: "linux".into(),
+            architecture: "x86_64".into(),
+            git_version: Some("git version 2.50.0".into()),
+            maximum_frame_bytes: crate::protocol::MAX_FRAME_BYTES,
+            capabilities: vec![
+                AgentCapability::RepositoryDiscovery,
+                AgentCapability::WorktreeInventory,
+            ],
+        }
+    }
+
+    fn handshake_response(version: &str) -> ResponseEnvelope {
+        ResponseEnvelope::new(
+            "scan-1:handshake",
+            ResponseBody::Success {
+                result: AgentResult::Handshake {
+                    agent: agent(version),
+                },
+            },
+        )
+    }
+
+    fn answer() -> ResponseEnvelope {
+        ResponseEnvelope::new(
+            "scan-1",
+            ResponseBody::Success {
+                result: AgentResult::RepositoryResolved {
+                    repository_path: "/work/repository".into(),
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn responses_are_read_past_the_handshake_until_the_requests_answer() {
+        let mut wire = Vec::new();
+        for response in [
+            handshake_response(env!("CARGO_PKG_VERSION")),
+            answer(),
+            answer(),
+        ] {
+            write_frame(&mut wire, &response).expect("write response");
+        }
+        let (sender, receiver) = mpsc::channel();
+        forward_responses(&mut std::io::Cursor::new(wire), "scan-1:handshake", &sender);
+        drop(sender);
+
+        let forwarded: Vec<String> = receiver
+            .iter()
+            .map(|response| response.expect("frame").expect("response").request_id)
+            .collect();
+        assert_eq!(forwarded, ["scan-1:handshake", "scan-1"]);
+    }
+
+    fn exchange(responses: Vec<ResponseEnvelope>, input: &mut Vec<u8>) -> Exchange {
+        let (sender, receiver) = mpsc::channel();
+        for response in responses {
+            sender.send(Ok(Some(response))).expect("queue response");
+        }
+        drop(sender);
+        converse(
+            &profile(),
+            &scan_request(),
+            Some(("scan-1:handshake", input)),
+            &receiver,
+            &OperationToken::new(),
+            Duration::from_secs(5),
+            &|_| {},
+        )
+    }
+
+    #[test]
+    fn the_request_is_sent_only_after_a_valid_handshake() {
+        let mut input = Vec::new();
+        let exchange = exchange(
+            vec![handshake_response(env!("CARGO_PKG_VERSION")), answer()],
+            &mut input,
+        );
+        assert!(
+            matches!(exchange.result, Ok(AgentResult::RepositoryResolved { .. })),
+            "{exchange:?}"
+        );
+        assert!(exchange.answered && exchange.delivered);
+        let sent: RequestEnvelope = read_frame(&mut std::io::Cursor::new(input))
+            .expect("read request")
+            .expect("one request");
+        assert_eq!(sent.request_id, "scan-1");
+    }
+
+    #[test]
+    fn an_agent_of_another_version_never_receives_the_request() {
+        let mut input = Vec::new();
+        let exchange = exchange(vec![handshake_response("999.0.0")], &mut input);
+        assert!(
+            matches!(exchange.result, Err(HostError::AgentVersionMismatch { .. })),
+            "{exchange:?}"
+        );
+        assert!(exchange.answered, "the mismatch is the agent's own answer");
+        assert!(!exchange.delivered);
+        assert!(input.is_empty(), "the request must not be written");
+    }
+
+    #[test]
+    fn a_request_left_unanswered_may_have_run() {
+        let mut input = Vec::new();
+        let exchange = exchange(
+            vec![handshake_response(env!("CARGO_PKG_VERSION"))],
+            &mut input,
+        );
+        assert!(exchange.result.is_err());
+        assert!(!exchange.answered);
+        assert!(exchange.delivered);
+    }
+
+    #[test]
+    fn only_an_agent_that_never_received_the_request_is_replaced() {
+        let attempt = |result, delivered| Exchange {
+            result,
+            answered: false,
+            delivered,
+        };
+        let mismatch = || HostError::AgentVersionMismatch {
+            machine: "Build server".into(),
+            expected: "1".into(),
+            actual: "2".into(),
+        };
+        assert!(conclude(attempt(Err(mismatch()), false)).is_none());
+        assert!(matches!(
+            conclude(attempt(Err(mismatch()), true)),
+            Some(Err(HostError::AgentVersionMismatch { .. }))
+        ));
+        assert!(matches!(
+            conclude(attempt(Err(HostError::Transport("refused".into())), false)),
+            Some(Err(HostError::NotDelivered(_)))
+        ));
+        assert!(matches!(
+            conclude(attempt(Err(HostError::Transport("reset".into())), true)),
+            Some(Err(HostError::Transport(_)))
+        ));
+    }
+
+    #[test]
+    fn a_handshake_never_counts_as_delivered() {
+        let handshake = RequestEnvelope::current(
+            "probe",
+            AgentRequest::Handshake {
+                client_version: env!("CARGO_PKG_VERSION").into(),
+                minimum_protocol_version: PROTOCOL_VERSION,
+                maximum_protocol_version: PROTOCOL_VERSION,
+            },
+        );
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        let exchange = converse::<Vec<u8>, _>(
+            &profile(),
+            &handshake,
+            None,
+            &receiver,
+            &OperationToken::new(),
+            Duration::from_secs(5),
+            &|_| {},
+        );
+        assert!(exchange.result.is_err());
+        assert!(
+            !exchange.delivered,
+            "another agent may always be asked for a handshake"
+        );
     }
 }
