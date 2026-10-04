@@ -211,7 +211,7 @@ describe("RepositoryToolbar", () => {
       remoteUnavailableReason: null,
       requiresForce: false,
       confirmation: "confirm",
-      commands: ["git -C /repos/repola branch -d -- old-work"],
+      commands: ["git -C /repos/repola update-ref -d refs/heads/old-work abcdef1234567890"],
       warnings: [],
       blockers: [],
       fingerprint: {
@@ -221,6 +221,7 @@ describe("RepositoryToolbar", () => {
         remote: null,
         remoteRef: null,
         remoteOid: null,
+        pushUrl: null,
         localExclusiveCommits: null,
         remoteExclusiveCommits: null,
         confirmation: "confirm",
@@ -242,7 +243,7 @@ describe("RepositoryToolbar", () => {
     await vi.waitFor(() => expect(actions).toBeEnabled());
     fireEvent.click(actions);
     fireEvent.click(await screen.findByRole("menuitem", { name: "Delete branch…" }));
-    await screen.findByText(/branch -d -- old-work/);
+    await screen.findByText(/update-ref -d refs\/heads\/old-work/);
     fireEvent.click(screen.getByRole("button", { name: "Delete Branch" }));
 
     await waitFor(() => expect(recordAuditPath).toHaveBeenCalledWith("/logs/actions.jsonl"));

@@ -3,14 +3,16 @@
 //! Planning is read-only and never fetches. Execution plans again, requires the
 //! reviewed fingerprint to be unchanged, asks the URL the remote deletion pushes
 //! to which branch is its default before deleting anything, checks once more
-//! that no worktree uses the local branch, and deletes the local branch first: a
-//! refusing `branch -d` then leaves the remote untouched, and the upstream that
-//! `-d` checks still exists. The remote branch is deleted last under a push lease
-//! pinned to the reviewed remote-tracking value.
+//! that no worktree uses the local branch, and deletes the local branch first, at
+//! its reviewed tip: a refused local deletion then leaves the remote untouched,
+//! and the upstream it was checked against still exists. The remote branch is
+//! deleted last under a push lease pinned to the reviewed remote-tracking value.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
+
+use crate::diagnostics;
 
 use super::command;
 use super::command_display::git_command_line;
@@ -93,11 +95,12 @@ struct Inspection<'a> {
 }
 
 /// A plan together with the exact local deletion commands it displays, so
-/// execution runs what the final review showed, and the one URL a remote
-/// deletion pushes to.
+/// execution runs what the final review showed, the reference whose containment
+/// of the branch the review checked, and the one URL a remote deletion pushes to.
 struct Review {
     plan: BranchDeletionPlan,
     local_commands: Vec<Vec<String>>,
+    merge_reference: Option<String>,
     repository: RepositoryContext,
     push_url: Option<String>,
 }
@@ -146,12 +149,11 @@ fn review(request: BranchDeletionRequest) -> Result<Review, String> {
         Some(name) => upstream_candidate(name, record, &refs, &remotes),
         None => tracking_candidate(worktree, &request.branch_ref, record, &remotes)?,
     };
-    let (remote_target, push_url) = match remote_target {
-        RemoteTarget::Available(candidate) => match single_push_url(worktree, &candidate.remote) {
-            Ok(url) => (RemoteTarget::Available(candidate), Some(url)),
-            Err(reason) => (RemoteTarget::Unavailable(reason), None),
-        },
-        unavailable => (unavailable, None),
+    let remote_target = match remote_target {
+        RemoteTarget::Available(candidate) => {
+            single_push_url(worktree, &candidate.remote).map(|url| (candidate, url))
+        }
+        RemoteTarget::Unavailable(reason) => Err(reason),
     };
     if local_name.is_none() && request.delete_local {
         blockers.push(format!(
@@ -160,27 +162,27 @@ fn review(request: BranchDeletionRequest) -> Result<Review, String> {
         ));
     }
     let remote_tracking_deleted = match (&remote_target, request.delete_remote) {
-        (RemoteTarget::Available(candidate), true) => Some(candidate.tracking_ref.as_str()),
+        (Ok((candidate, _)), true) => Some(candidate.tracking_ref.as_str()),
         _ => None,
     };
 
-    let local = match local_name.filter(|_| request.delete_local) {
-        Some(name) => Some(local_details(
-            &inspection,
-            name,
-            record,
-            remote_tracking_deleted,
-        )?),
-        None => None,
+    let (local, merge_reference) = match local_name.filter(|_| request.delete_local) {
+        Some(name) => {
+            let (local, merge_reference) =
+                local_details(&inspection, name, record, remote_tracking_deleted)?;
+            (Some(local), Some(merge_reference))
+        }
+        None => (None, None),
     };
     let local_deleted = local.as_ref().map(|local| local.name.as_str());
 
+    let push_url = remote_target.as_ref().ok().map(|(_, url)| url.clone());
     let (remote, remote_unavailable_reason) = match remote_target {
-        RemoteTarget::Available(candidate) => (
-            Some(remote_details(&inspection, candidate, local_deleted)?),
+        Ok((candidate, url)) => (
+            Some(remote_details(&inspection, candidate, &url, local_deleted)?),
             None,
         ),
-        RemoteTarget::Unavailable(reason) => (None, Some(reason)),
+        Err(reason) => (None, Some(reason)),
     };
 
     if let Some(local) = &local {
@@ -274,11 +276,7 @@ fn review(request: BranchDeletionRequest) -> Result<Review, String> {
     };
 
     let local_commands = match &local {
-        Some(local) => local_deletion_commands(
-            local,
-            requires_force,
-            has_branch_config(worktree, &local.name)?,
-        ),
+        Some(local) => local_deletion_commands(local, has_branch_config(worktree, &local.name)?),
         None => Vec::new(),
     };
     let mut commands: Vec<String> = local_commands
@@ -299,6 +297,7 @@ fn review(request: BranchDeletionRequest) -> Result<Review, String> {
         remote: selected_remote.map(|remote| remote.remote.clone()),
         remote_ref: selected_remote.map(|remote| remote.remote_ref.clone()),
         remote_oid: selected_remote.map(|remote| remote.expected_oid.clone()),
+        push_url: selected_remote.map(|remote| remote.push_url.clone()),
         local_exclusive_commits: local.as_ref().map(|local| CommitCount {
             count: local.exclusive_commit_count,
             capped: local.exclusive_commit_count_capped,
@@ -332,6 +331,7 @@ fn review(request: BranchDeletionRequest) -> Result<Review, String> {
     Ok(Review {
         plan,
         local_commands,
+        merge_reference,
         repository,
         push_url,
     })
@@ -343,6 +343,7 @@ pub fn execute_branch_deletion(
     let Review {
         plan,
         local_commands,
+        merge_reference,
         repository,
         push_url,
     } = review(request.request)?;
@@ -374,7 +375,13 @@ pub fn execute_branch_deletion(
     }
 
     let local = match &plan.local {
-        Some(local) => Some(delete_local(&repository, worktree, local, &local_commands)?),
+        Some(local) => Some(delete_local(
+            &repository,
+            worktree,
+            local,
+            &local_commands,
+            merge_reference.as_deref().filter(|_| !plan.requires_force),
+        )?),
         None => None,
     };
 
@@ -450,13 +457,16 @@ pub fn execute_branch_deletion(
 /// a failure after it is reported with the completed step, never as a failure.
 ///
 /// The review can be seconds old by now, after asking the remote, and
-/// `update-ref` deletes a branch whatever uses it, so worktrees are checked
-/// once more right before deleting.
+/// `update-ref` checks only the branch's own value, so right before deleting,
+/// worktrees are checked once more and, unless the deletion is forced, the
+/// `contained_in` reference must still be where the review found the branch
+/// contained in it.
 fn delete_local(
     repository: &RepositoryContext,
     worktree: &Path,
     local: &LocalBranchDeletion,
     commands: &[Vec<String>],
+    contained_in: Option<&str>,
 ) -> Result<BranchDeletionStep, String> {
     let (deletion, cleanup) = commands
         .split_first()
@@ -466,6 +476,14 @@ fn delete_local(
             "Nothing was deleted. {}",
             usage.blocker(&local.name)
         ));
+    }
+    if let Some(reference) = contained_in {
+        if resolve(worktree, reference)? != local.merge_reference_oid {
+            return Err(format!(
+                "Nothing was deleted. {} moved after this deletion was reviewed, so {} may no longer be contained in it. Review the deletion again.",
+                local.merge_reference, local.name
+            ));
+        }
     }
     let output = command::git_at(worktree, deletion).map_err(|error| error.to_string())?;
     let diagnostic = combined_output(&output.stdout, &output.stderr);
@@ -508,24 +526,13 @@ fn delete_local(
     })
 }
 
-/// The exact local deletion commands, both run and displayed. `branch -d` checks
-/// containment itself when it runs. `branch -D` would delete whatever the branch
-/// points to by then, so a forced deletion uses `update-ref`, which deletes the
-/// branch only while it still points to the reviewed tip, and then removes the
-/// branch's configuration as `branch -D` does.
-fn local_deletion_commands(
-    local: &LocalBranchDeletion,
-    force: bool,
-    has_config: bool,
-) -> Vec<Vec<String>> {
-    if !force {
-        return vec![vec![
-            "branch".into(),
-            "-d".into(),
-            "--".into(),
-            local.name.clone(),
-        ]];
-    }
+/// The exact local deletion commands, both run and displayed. `git branch -d`
+/// and `-D` delete whatever the branch points to when they run, so the deletion
+/// uses `update-ref`, which deletes the branch only while it still points to the
+/// reviewed tip, and then removes the branch's configuration as `git branch`
+/// does. Containment and worktrees, which `git branch` would check, are checked
+/// right before it runs.
+fn local_deletion_commands(local: &LocalBranchDeletion, has_config: bool) -> Vec<Vec<String>> {
     let mut commands = vec![vec![
         "update-ref".into(),
         "-d".into(),
@@ -700,8 +707,9 @@ fn confirm_not_remote_default(
         .map_err(|error| error.to_string())?;
     if !output.status.success() {
         return Err(format!(
-            "Could not ask {} at {url} which branch is its default, so nothing was deleted. {}",
+            "Could not ask {} at {} which branch is its default, so nothing was deleted. {}",
             remote.remote,
+            remote.push_url,
             combined_output(&output.stdout, &output.stderr)
         )
         .trim()
@@ -709,13 +717,13 @@ fn confirm_not_remote_default(
     }
     match parse_remote_head(&String::from_utf8_lossy(&output.stdout)) {
         RemoteHead::Branch(target) if target == remote.remote_ref => Err(format!(
-            "{} is the default branch of {} at {url}. Repola does not delete a remote's default branch.",
-            remote.display_name, remote.remote
+            "{} is the default branch of {} at {}. Repola does not delete a remote's default branch.",
+            remote.display_name, remote.remote, remote.push_url
         )),
         RemoteHead::Branch(_) | RemoteHead::Absent => Ok(()),
         RemoteHead::Unnamed => Err(format!(
-            "{} at {url} did not say which branch is its default, so nothing was deleted.",
-            remote.remote
+            "{} at {} did not say which branch is its default, so nothing was deleted.",
+            remote.remote, remote.push_url
         )),
     }
 }
@@ -934,7 +942,7 @@ fn local_details(
     name: &str,
     record: &RefRecord,
     remote_tracking_deleted: Option<&str>,
-) -> Result<LocalBranchDeletion, String> {
+) -> Result<(LocalBranchDeletion, String), String> {
     let Inspection {
         worktree,
         refs,
@@ -943,25 +951,28 @@ fn local_details(
     } = *inspection;
     // `git branch -d` checks the upstream when it resolves, otherwise HEAD of the
     // worktree that runs it, which is the selected worktree.
-    let (merge_reference_kind, merge_reference, merge_reference_oid) = match refs
-        .get(&record.upstream)
-        .filter(|_| !record.upstream.is_empty())
-    {
-        Some(upstream) => (
-            MergeReferenceKind::Upstream,
-            short_ref(&record.upstream),
-            Some(upstream.oid.clone()),
-        ),
-        None => (
-            MergeReferenceKind::Head,
-            snapshot
-                .branch
-                .as_ref()
-                .map(|branch| format!("HEAD ({branch})"))
-                .unwrap_or_else(|| "HEAD (detached)".into()),
-            snapshot.head.clone(),
-        ),
-    };
+    let (merge_reference_ref, merge_reference_kind, merge_reference, merge_reference_oid) =
+        match refs
+            .get(&record.upstream)
+            .filter(|_| !record.upstream.is_empty())
+        {
+            Some(upstream) => (
+                record.upstream.clone(),
+                MergeReferenceKind::Upstream,
+                short_ref(&record.upstream),
+                Some(upstream.oid.clone()),
+            ),
+            None => (
+                "HEAD".to_string(),
+                MergeReferenceKind::Head,
+                snapshot
+                    .branch
+                    .as_ref()
+                    .map(|branch| format!("HEAD ({branch})"))
+                    .unwrap_or_else(|| "HEAD (detached)".into()),
+                snapshot.head.clone(),
+            ),
+        };
     let contained_in_merge_reference = match &merge_reference_oid {
         Some(reference) => is_ancestor(worktree, &record.oid, reference)?,
         None => false,
@@ -978,7 +989,7 @@ fn local_details(
     excluded.extend(remote_tracking_deleted);
     let (exclusive_commit_count, exclusive_commit_count_capped) =
         exclusive_commits(worktree, &record.oid, &excluded)?;
-    Ok(LocalBranchDeletion {
+    let local = LocalBranchDeletion {
         name: name.to_string(),
         tip: record.oid.clone(),
         merge_reference,
@@ -997,12 +1008,14 @@ fn local_details(
         upstream: (!record.upstream.is_empty()).then(|| short_ref(&record.upstream)),
         exclusive_commit_count,
         exclusive_commit_count_capped,
-    })
+    };
+    Ok((local, merge_reference_ref))
 }
 
 fn remote_details(
     inspection: &Inspection,
     candidate: RemoteCandidate,
+    push_url: &str,
     local_deleted: Option<&str>,
 ) -> Result<RemoteBranchDeletion, String> {
     let worktree = inspection.worktree;
@@ -1036,10 +1049,31 @@ fn remote_details(
         exclusive_commit_count,
         exclusive_commit_count_capped,
         expected_oid: candidate.oid,
+        push_url: diagnostics::redact(push_url),
         remote: candidate.remote,
         remote_ref: candidate.remote_ref,
         tracking_ref: candidate.tracking_ref,
     })
+}
+
+/// The commit `reference` points to now, or `None` when it does not resolve.
+fn resolve(worktree: &Path, reference: &str) -> Result<Option<String>, String> {
+    let revision = format!("{reference}^{{commit}}");
+    let output = command::git_at(
+        worktree,
+        [
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            revision.as_str(),
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string()))
 }
 
 fn is_ancestor(worktree: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
@@ -1304,7 +1338,7 @@ mod tests {
     }
 
     #[test]
-    fn deletes_a_contained_local_branch_with_d() {
+    fn deletes_a_contained_local_branch_at_its_reviewed_tip() {
         let fixture = Fixture::new();
         git(&fixture.repository, &["branch", "contained"]);
         let plan = fixture.plan("refs/heads/contained", true, false);
@@ -1320,7 +1354,12 @@ mod tests {
             plan.commands,
             vec![git_command_line(
                 Path::new(&plan.worktree_path),
-                ["branch", "-d", "--", "contained"]
+                [
+                    "update-ref",
+                    "-d",
+                    "refs/heads/contained",
+                    local.tip.as_str()
+                ]
             )]
         );
 
@@ -1414,7 +1453,7 @@ mod tests {
 
         // A branch that moves between the final review and the deletion keeps
         // its unreviewed commits: the reviewed command no longer matches it.
-        let deletion = &local_deletion_commands(local, true, true)[0];
+        let deletion = &local_deletion_commands(local, true)[0];
         git(
             &fixture.repository,
             &["update-ref", "refs/heads/forced", "main"],
@@ -1553,6 +1592,119 @@ mod tests {
     }
 
     #[test]
+    fn a_deletion_leaves_a_branch_that_moved_after_review() {
+        let fixture = Fixture::new();
+        commit(&fixture.repository, "second");
+        git(&fixture.repository, &["branch", "contained"]);
+        let reviewed =
+            review(fixture.request("refs/heads/contained", true, false)).expect("review");
+        assert!(!reviewed.plan.requires_force);
+
+        // Still contained, so `git branch -d` would delete it, but not at the
+        // commit the review showed and the recovery command restores.
+        git(
+            &fixture.repository,
+            &["update-ref", "refs/heads/contained", "HEAD~1"],
+        );
+        let local = reviewed.plan.local.as_ref().expect("local details");
+        delete_local(
+            &reviewed.repository,
+            Path::new(&reviewed.plan.worktree_path),
+            local,
+            &reviewed.local_commands,
+            reviewed.merge_reference.as_deref(),
+        )
+        .expect_err("the branch moved to an unreviewed commit");
+        assert!(fixture.has_ref("refs/heads/contained"));
+    }
+
+    #[test]
+    fn a_contained_deletion_is_refused_once_its_merge_reference_moves() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "contained"]);
+        let reviewed =
+            review(fixture.request("refs/heads/contained", true, false)).expect("review");
+        assert_eq!(reviewed.merge_reference.as_deref(), Some("HEAD"));
+
+        // HEAD moving on would still contain the branch, but rewinding it would
+        // not, and nothing after the review has checked which happened.
+        commit(&fixture.repository, "HEAD moves after the review");
+        let local = reviewed.plan.local.as_ref().expect("local details");
+        let error = delete_local(
+            &reviewed.repository,
+            Path::new(&reviewed.plan.worktree_path),
+            local,
+            &reviewed.local_commands,
+            reviewed.merge_reference.as_deref(),
+        )
+        .expect_err("the merge reference moved");
+        assert!(
+            error.contains("moved after this deletion was reviewed"),
+            "{error}"
+        );
+        assert!(fixture.has_ref("refs/heads/contained"));
+    }
+
+    #[test]
+    fn a_review_is_refused_once_the_push_url_changes() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "topic"]);
+        git(&fixture.repository, &["push", "origin", "topic"]);
+        let plan = fixture.plan("refs/remotes/origin/topic", false, true);
+        assert_eq!(
+            plan.fingerprint.push_url.as_deref(),
+            Some(path(&fixture.remote))
+        );
+
+        let mirror = fixture.root.join("mirror.git");
+        git(
+            &fixture.root,
+            &["clone", "--bare", path(&fixture.remote), path(&mirror)],
+        );
+        git(
+            &fixture.repository,
+            &["config", "remote.origin.pushurl", path(&mirror)],
+        );
+        let error = execute(&plan, None).expect_err("the push now goes somewhere else");
+        assert!(
+            error.contains("changed after this deletion was reviewed"),
+            "{error}"
+        );
+        assert!(fixture.remote_has_branch("topic"));
+    }
+
+    #[test]
+    fn the_reviewed_push_url_hides_credentials() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "topic"]);
+        git(&fixture.repository, &["push", "origin", "topic"]);
+        git(
+            &fixture.repository,
+            &[
+                "config",
+                "remote.origin.pushurl",
+                "https://user:secret-value@example.invalid/repository.git",
+            ],
+        );
+        let plan = fixture.plan("refs/remotes/origin/topic", false, true);
+        let remote = plan.remote.as_ref().expect("remote details");
+        assert!(
+            remote.push_url.contains("example.invalid"),
+            "{}",
+            remote.push_url
+        );
+        assert!(
+            !remote.push_url.contains("secret-value"),
+            "{}",
+            remote.push_url
+        );
+        assert_eq!(
+            plan.fingerprint.push_url.as_deref(),
+            Some(remote.push_url.as_str())
+        );
+    }
+
+    #[test]
     fn a_worktree_that_starts_using_the_branch_after_review_keeps_it() {
         let fixture = Fixture::new();
         git(&fixture.repository, &["switch", "--create", "late"]);
@@ -1577,6 +1729,7 @@ mod tests {
             Path::new(&reviewed.plan.worktree_path),
             local,
             &reviewed.local_commands,
+            None,
         )
         .expect_err("the branch is checked out by now");
         assert!(error.contains("checked out"), "{error}");
@@ -1720,8 +1873,8 @@ mod tests {
         );
         assert_eq!(push[5], ":refs/heads/published");
         assert_eq!(
-            plan.commands[1],
-            git_command_line(Path::new(&plan.worktree_path), push)
+            plan.commands.last(),
+            Some(&git_command_line(Path::new(&plan.worktree_path), push))
         );
 
         let result = execute(&plan, Some("published")).expect("delete both copies");

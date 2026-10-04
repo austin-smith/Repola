@@ -277,7 +277,7 @@ function PlanReview({ plan }: { plan: BranchDeletionPlan }) {
       </dl>
       {remote ? (
         <p className="text-xs text-muted-foreground">
-          Repola does not fetch during review. Git deletes {remote.displayName} only if {remote.remote} still has it at {shortSha(remote.expectedOid)}; if it moved or is already gone, the push is rejected and nothing on the remote changes.
+          Repola does not fetch during review. Git deletes {remote.displayName} from <span className="break-all">{remote.pushUrl}</span> only if it still has it at {shortSha(remote.expectedOid)}; if it moved or is already gone, the push is rejected and nothing on the remote changes.
         </p>
       ) : null}
       {plan.blockers.map((blocker) => (

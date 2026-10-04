@@ -1102,6 +1102,8 @@ pub struct RemoteBranchDeletion {
     pub display_name: String,
     /// The remote-tracking ref's value; the push lease requires the remote to still match it.
     pub expected_oid: String,
+    /// Where the deletion pushes, with any credentials redacted.
+    pub push_url: String,
     /// When the remote-tracking ref last changed (a fetch or push that moved it), in Unix seconds.
     pub tracking_ref_updated_at: Option<u64>,
     /// The most recent fetch from any worktree of this repository, in Unix seconds.
@@ -1122,6 +1124,8 @@ pub struct BranchDeletionFingerprint {
     pub remote: Option<String>,
     pub remote_ref: Option<String>,
     pub remote_oid: Option<String>,
+    /// Where the remote deletion pushes, as reviewed, with any credentials redacted.
+    pub push_url: Option<String>,
     /// The commits the local deletion would leave unreachable, as reviewed.
     pub local_exclusive_commits: Option<CommitCount>,
     /// The commits the remote deletion would leave unreachable, as reviewed.

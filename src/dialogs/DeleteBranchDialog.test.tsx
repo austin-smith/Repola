@@ -69,6 +69,7 @@ function planFor(request: BranchDeletionRequest, overrides: Partial<BranchDeleti
       trackingRef: "refs/remotes/origin/feature",
       displayName: "origin/feature",
       expectedOid: "a".repeat(40),
+      pushUrl: "https://example.com/repola.git",
       trackingRefUpdatedAt: null,
       lastFetchedAt: null,
       isRemoteDefaultBranch: false,
@@ -80,7 +81,7 @@ function planFor(request: BranchDeletionRequest, overrides: Partial<BranchDeleti
     requiresForce: false,
     confirmation: request.deleteLocal && request.deleteRemote ? "typeBranchName" : "confirm",
     commands: [
-      ...(request.deleteLocal ? ["git -C /repos/repola branch -d -- feature"] : []),
+      ...(request.deleteLocal ? ["git -C /repos/repola update-ref -d refs/heads/feature aaaa"] : []),
       ...(request.deleteRemote ? ["git -C /repos/repola push --porcelain '--force-with-lease=refs/heads/feature:aaaa' -- origin :refs/heads/feature"] : []),
     ],
     warnings: [],
@@ -92,6 +93,7 @@ function planFor(request: BranchDeletionRequest, overrides: Partial<BranchDeleti
       remote: request.deleteRemote ? "origin" : null,
       remoteRef: request.deleteRemote ? "refs/heads/feature" : null,
       remoteOid: request.deleteRemote ? "a".repeat(40) : null,
+      pushUrl: request.deleteRemote ? "https://example.com/repola.git" : null,
       localExclusiveCommits: null,
       remoteExclusiveCommits: null,
       confirmation: "confirm",
@@ -140,7 +142,7 @@ describe("DeleteBranchDialog", () => {
     const remote = screen.getByRole("checkbox", { name: "Remote branch origin/feature" });
     expect(remote).not.toBeChecked();
     expect(screen.getByRole("checkbox", { name: "Local branch feature" })).toBeChecked();
-    await screen.findByText(/branch -d -- feature/);
+    await screen.findByText(/update-ref -d refs\/heads\/feature/);
     expect(ipc.prepareBranchDeletionReview).toHaveBeenLastCalledWith("local", {
       repositoryPath: "/repos/repola",
       worktreePath: "/repos/repola",
@@ -169,11 +171,12 @@ describe("DeleteBranchDialog", () => {
 
   it("requires the exact branch name before deleting both copies", async () => {
     renderDialog();
-    await screen.findByText(/branch -d -- feature/);
+    await screen.findByText(/update-ref -d refs\/heads\/feature/);
     fireEvent.click(screen.getByRole("checkbox", { name: "Remote branch origin/feature" }));
 
     await screen.findByText(/push --porcelain/);
     expect(screen.getByText(/Repola does not fetch during review/)).toBeInTheDocument();
+    expect(screen.getByText("https://example.com/repola.git")).toBeInTheDocument();
     const confirm = screen.getByRole("button", { name: "Delete Local and Remote" });
     expect(confirm).toBeDisabled();
     const input = screen.getByRole("textbox", { name: "Type feature to confirm" });
@@ -202,7 +205,7 @@ describe("DeleteBranchDialog", () => {
 
   it("explains why a branch checked out here can only be deleted on the remote", async () => {
     renderDialog();
-    await screen.findByText(/branch -d -- feature/);
+    await screen.findByText(/update-ref -d refs\/heads\/feature/);
     fireEvent.click(screen.getByRole("combobox", { name: "Branch to delete" }));
     const option = await screen.findByRole("option", { name: /^main.*checked out/ });
     fireEvent.pointerDown(option, { button: 0 });
@@ -221,7 +224,7 @@ describe("DeleteBranchDialog", () => {
     const notify = vi.spyOn(toast, "add");
     const onDeleted = vi.fn(() => new Promise<void>(() => undefined));
     const { onClose } = renderDialog(onDeleted);
-    await screen.findByText(/branch -d -- feature/);
+    await screen.findByText(/update-ref -d refs\/heads\/feature/);
 
     fireEvent.click(screen.getByRole("button", { name: "Delete Branch" }));
 
@@ -234,7 +237,7 @@ describe("DeleteBranchDialog", () => {
   it("shows a refused execution and reviews the branch again", async () => {
     ipc.executeBranchDeletion.mockRejectedValue(new Error("The branch changed after this deletion was reviewed."));
     const { onDeleted } = renderDialog();
-    await screen.findByText(/branch -d -- feature/);
+    await screen.findByText(/update-ref -d refs\/heads\/feature/);
     expect(ipc.prepareBranchDeletionReview).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole("button", { name: "Delete Branch" }));

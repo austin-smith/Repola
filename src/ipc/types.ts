@@ -601,6 +601,8 @@ export interface RemoteBranchDeletion {
   trackingRef: string;
   displayName: string;
   expectedOid: string;
+  /** Where the deletion pushes, with any credentials redacted. */
+  pushUrl: string;
   /** Unix seconds. */
   trackingRefUpdatedAt: number | null;
   /** Unix seconds. */
@@ -618,6 +620,8 @@ export interface BranchDeletionFingerprint {
   remote: string | null;
   remoteRef: string | null;
   remoteOid: string | null;
+  /** Where the remote deletion pushes, as reviewed, with any credentials redacted. */
+  pushUrl: string | null;
   /** The commits the local deletion would leave unreachable, as reviewed. */
   localExclusiveCommits: CommitCount | null;
   /** The commits the remote deletion would leave unreachable, as reviewed. */

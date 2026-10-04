@@ -433,6 +433,7 @@ mod tests {
                     remote: Some("origin".into()),
                     remote_ref: Some("refs/heads/feature".into()),
                     remote_oid: Some("a".repeat(40)),
+                    push_url: Some("https://example.com/repository.git".into()),
                     local_exclusive_commits: Some(crate::worktree::CommitCount {
                         count: 0,
                         capped: false,

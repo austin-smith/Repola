@@ -1312,7 +1312,7 @@ function App() {
           title={bulk.kind === "remove" ? `Remove ${bulk.items.length} clean worktree${bulk.items.length === 1 ? "" : "s"}?` : `Delete ${bulk.items.length} retained branch${bulk.items.length === 1 ? "" : "es"}?`}
           summary={bulk.kind === "remove"
             ? "Each worktree passed its own preflight moments ago and is revalidated again at execution. Branches are always retained."
-            : "Each branch is reviewed again before Git deletes it with branch -d, which refuses unmerged work. Remote branches are untouched."}
+            : "Each branch is reviewed again and deleted only if it is unchanged and still merged. Remote branches are untouched."}
           confirmationText={bulk.kind === "remove" ? "REMOVE" : "DELETE"}
           stage={bulk.stage}
           items={bulk.items}
