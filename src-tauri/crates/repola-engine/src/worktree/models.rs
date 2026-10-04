@@ -1050,6 +1050,137 @@ pub struct BranchMutationResult {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BranchDeletionRequest {
+    pub repository_path: String,
+    pub worktree_path: String,
+    /// Full ref name: `refs/heads/<branch>` or `refs/remotes/<remote>/<branch>`.
+    pub branch_ref: String,
+    pub delete_local: bool,
+    pub delete_remote: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MergeReferenceKind {
+    /// The branch's configured upstream, which `git branch -d` checks first.
+    Upstream,
+    /// HEAD of the worktree that runs the deletion, used when no upstream resolves.
+    Head,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BranchDeletionConfirmation {
+    Confirm,
+    TypeBranchName,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalBranchDeletion {
+    pub name: String,
+    pub tip: String,
+    pub merge_reference: String,
+    pub merge_reference_kind: MergeReferenceKind,
+    pub merge_reference_oid: Option<String>,
+    pub contained_in_merge_reference: bool,
+    pub default_target: Option<String>,
+    pub contained_in_default_target: Option<bool>,
+    pub occupied_worktree_path: Option<String>,
+    pub is_default_branch: bool,
+    pub upstream: Option<String>,
+    /// Commits reachable from this branch and from no ref that remains after the deletion.
+    pub exclusive_commit_count: u64,
+    pub exclusive_commit_count_capped: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteBranchDeletion {
+    pub remote: String,
+    pub remote_ref: String,
+    pub tracking_ref: String,
+    pub display_name: String,
+    /// The remote-tracking ref's value; the push lease requires the remote to still match it.
+    pub expected_oid: String,
+    /// When the remote-tracking ref last changed (a fetch or push that moved it), in Unix seconds.
+    pub tracking_ref_updated_at: Option<u64>,
+    /// The most recent fetch from any worktree of this repository, in Unix seconds.
+    pub last_fetched_at: Option<u64>,
+    pub is_remote_default_branch: bool,
+    pub tracked_by: Vec<String>,
+    pub exclusive_commit_count: u64,
+    pub exclusive_commit_count_capped: bool,
+}
+
+/// The reviewed state that execution must find unchanged before deleting anything.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchDeletionFingerprint {
+    pub local_tip: Option<String>,
+    pub merge_reference_oid: Option<String>,
+    pub requires_force: bool,
+    pub remote: Option<String>,
+    pub remote_ref: Option<String>,
+    pub remote_oid: Option<String>,
+    pub confirmation: BranchDeletionConfirmation,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchDeletionPlan {
+    pub repository_path: String,
+    pub worktree_path: String,
+    pub branch_ref: String,
+    pub branch_name: String,
+    pub delete_local: bool,
+    pub delete_remote: bool,
+    pub local: Option<LocalBranchDeletion>,
+    /// The remote branch that a remote deletion would target, reported even when not selected.
+    pub remote: Option<RemoteBranchDeletion>,
+    pub remote_unavailable_reason: Option<String>,
+    pub requires_force: bool,
+    pub confirmation: BranchDeletionConfirmation,
+    pub commands: Vec<String>,
+    pub warnings: Vec<String>,
+    pub blockers: Vec<String>,
+    pub fingerprint: BranchDeletionFingerprint,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchDeletionExecutionRequest {
+    pub request: BranchDeletionRequest,
+    pub force: bool,
+    pub expected: BranchDeletionFingerprint,
+    /// The branch name the user typed when the plan required it.
+    pub typed_confirmation: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchDeletionStep {
+    pub target: String,
+    pub deleted_oid: String,
+    pub succeeded: bool,
+    pub output: String,
+    pub recovery_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchDeletionResult {
+    pub message: String,
+    pub local: Option<BranchDeletionStep>,
+    pub remote: Option<BranchDeletionStep>,
+    pub branches: Vec<BranchInfo>,
+    pub snapshot: WorkingCopySnapshot,
+    pub audit_path: Option<String>,
+    pub audit_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CloneRepositoryRequest {
     pub source: String,
     pub destination_path: String,

@@ -25,6 +25,14 @@ pub(crate) fn redact_agent_result(mut result: AgentResult) -> AgentResult {
         AgentResult::TagMutation { result } => result.output = redact(&result.output),
         AgentResult::WorktreeCreated { result } => result.output = redact(&result.output),
         AgentResult::StashMutation { result } => result.output = redact(&result.output),
+        AgentResult::BranchDeletion { result } => {
+            for step in [&mut result.local, &mut result.remote]
+                .into_iter()
+                .flatten()
+            {
+                step.output = redact(&step.output);
+            }
+        }
         _ => {}
     }
     result

@@ -565,6 +565,97 @@ export interface BranchMutationResult {
   snapshot: WorkingCopySnapshot;
 }
 
+export interface BranchDeletionRequest {
+  repositoryPath: string;
+  worktreePath: string;
+  /** Full ref name: `refs/heads/<branch>` or `refs/remotes/<remote>/<branch>`. */
+  branchRef: string;
+  deleteLocal: boolean;
+  deleteRemote: boolean;
+}
+
+export type MergeReferenceKind = "upstream" | "head";
+
+export type BranchDeletionConfirmation = "confirm" | "typeBranchName";
+
+export interface LocalBranchDeletion {
+  name: string;
+  tip: string;
+  mergeReference: string;
+  mergeReferenceKind: MergeReferenceKind;
+  mergeReferenceOid: string | null;
+  containedInMergeReference: boolean;
+  defaultTarget: string | null;
+  containedInDefaultTarget: boolean | null;
+  occupiedWorktreePath: string | null;
+  isDefaultBranch: boolean;
+  upstream: string | null;
+  exclusiveCommitCount: number;
+  exclusiveCommitCountCapped: boolean;
+}
+
+export interface RemoteBranchDeletion {
+  remote: string;
+  remoteRef: string;
+  trackingRef: string;
+  displayName: string;
+  expectedOid: string;
+  /** Unix seconds. */
+  trackingRefUpdatedAt: number | null;
+  /** Unix seconds. */
+  lastFetchedAt: number | null;
+  isRemoteDefaultBranch: boolean;
+  trackedBy: string[];
+  exclusiveCommitCount: number;
+  exclusiveCommitCountCapped: boolean;
+}
+
+export interface BranchDeletionFingerprint {
+  localTip: string | null;
+  mergeReferenceOid: string | null;
+  requiresForce: boolean;
+  remote: string | null;
+  remoteRef: string | null;
+  remoteOid: string | null;
+  confirmation: BranchDeletionConfirmation;
+}
+
+export interface BranchDeletionPlan {
+  repositoryPath: string;
+  worktreePath: string;
+  branchRef: string;
+  branchName: string;
+  deleteLocal: boolean;
+  deleteRemote: boolean;
+  local: LocalBranchDeletion | null;
+  remote: RemoteBranchDeletion | null;
+  remoteUnavailableReason: string | null;
+  requiresForce: boolean;
+  confirmation: BranchDeletionConfirmation;
+  commands: string[];
+  warnings: string[];
+  blockers: string[];
+  fingerprint: BranchDeletionFingerprint;
+}
+
+export interface BranchDeletionStep {
+  target: string;
+  deletedOid: string;
+  succeeded: boolean;
+  output: string;
+  recoveryCommand: string | null;
+}
+
+export interface BranchDeletionResult {
+  message: string;
+  local: BranchDeletionStep | null;
+  remote: BranchDeletionStep | null;
+  branches: BranchInfo[];
+  snapshot: WorkingCopySnapshot;
+  auditPath: string | null;
+  auditWarning: string | null;
+}
+
 export interface RepositoryOperationResult {
   repositoryPath: string;
   output: string;

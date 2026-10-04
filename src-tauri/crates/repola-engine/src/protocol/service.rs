@@ -167,6 +167,18 @@ where
         AgentRequest::MutateBranch { request } => worktree::mutate_branch(request)
             .map(|result| AgentResult::BranchMutation { result })
             .map_err(AgentError::operation),
+        AgentRequest::PrepareBranchDeletion { request } => worktree::plan_branch_deletion(request)
+            .map(|plan| AgentResult::BranchDeletionPlan {
+                plan: Box::new(plan),
+            })
+            .map_err(AgentError::operation),
+        AgentRequest::ExecuteBranchDeletion { request } => {
+            worktree::execute_branch_deletion(request)
+                .map(|result| AgentResult::BranchDeletion {
+                    result: Box::new(result),
+                })
+                .map_err(AgentError::operation)
+        }
         AgentRequest::CloneRepository { request } => worktree::clone_repository(request)
             .map(|result| AgentResult::RepositoryOperation { result })
             .map_err(AgentError::operation),

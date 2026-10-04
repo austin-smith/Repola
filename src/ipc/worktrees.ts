@@ -17,6 +17,9 @@ import type {
   ConflictResolutionKind,
   ConflictFile,
   DiscardScope,
+  BranchDeletionPlan,
+  BranchDeletionRequest,
+  BranchDeletionResult,
   BranchInfo,
   BranchMutationKind,
   BranchMutationResult,
@@ -476,6 +479,37 @@ export function mutateBranch(
   return invokeOperation<BranchMutationResult>("mutate_branch", {
     machineId,
     request: { repositoryPath, worktreePath, kind, branch, startPoint, expectedHead },
+  });
+}
+
+export function prepareBranchDeletionReview(
+  machineId: string,
+  request: BranchDeletionRequest,
+  signal?: AbortSignal,
+): Promise<BranchDeletionPlan> {
+  return invokeOperation<BranchDeletionPlan>("prepare_branch_deletion", { machineId, request }, { signal });
+}
+
+/** Runs a reviewed deletion; the engine plans again and refuses if anything changed. */
+export function executeBranchDeletion(
+  machineId: string,
+  plan: BranchDeletionPlan,
+  typedConfirmation: string | null,
+): Promise<BranchDeletionResult> {
+  return invokeOperation<BranchDeletionResult>("execute_branch_deletion", {
+    machineId,
+    request: {
+      request: {
+        repositoryPath: plan.repositoryPath,
+        worktreePath: plan.worktreePath,
+        branchRef: plan.branchRef,
+        deleteLocal: plan.deleteLocal,
+        deleteRemote: plan.deleteRemote,
+      },
+      force: plan.requiresForce,
+      expected: plan.fingerprint,
+      typedConfirmation,
+    },
   });
 }
 

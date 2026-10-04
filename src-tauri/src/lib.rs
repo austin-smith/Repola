@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use operation::OperationToken;
 use protocol::{AgentEvent, AgentInfo, AgentRequest, AgentResult, RequestEnvelope, ResponseBody};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use settings::{
     AppPreferences, MachineKind, MachineProfile, MachineProfileInput, RepositoryRegistrationResult,
     WindowState, WorkspaceContext,
@@ -21,18 +21,20 @@ use tauri::ipc::Channel;
 use tauri::{Emitter, Manager};
 use worktree::{
     ActionExecutionRequest, ActionKind, ActionPlan, ActionRequest, ActionResult,
-    ApplyPatchHunkRequest, BranchInfo, BranchMutationRequest, BranchMutationResult, BranchRequest,
-    CloneRepositoryRequest, CommitChangedFile, CommitFileDiffRequest, CommitFilesRequest,
-    CommitRequest, CommitResult, ConflictFile, ConflictFileRequest, CreateRepositoryRequest,
-    CreateWorktreeRequest, CreateWorktreeResult, DiscardAllRequest, DiscardFileRequest, FileDiff,
-    FileDiffRequest, GenerateCommitMessageRequest, GeneratedCommitMessage, HistoryMutationRequest,
-    HistoryMutationResult, HistoryPage, HistoryRequest, PullRequestEvidence,
-    PullRequestMutationRequest, PullRequestMutationResult, ReflogEntry, ReflogRequest,
-    RepositoryOperationMutationResult, RepositoryOperationRequest, RepositoryOperationResult,
-    ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry,
-    StashMutationRequest, StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo,
-    TagMutationRequest, TagMutationResult, TagRequest, TextGenerationStatus, UndoCommitRequest,
-    UndoCommitResult, WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges, WorktreeWatcher,
+    ApplyPatchHunkRequest, BranchDeletionExecutionRequest, BranchDeletionPlan,
+    BranchDeletionRequest, BranchDeletionResult, BranchInfo, BranchMutationRequest,
+    BranchMutationResult, BranchRequest, CloneRepositoryRequest, CommitChangedFile,
+    CommitFileDiffRequest, CommitFilesRequest, CommitRequest, CommitResult, ConflictFile,
+    ConflictFileRequest, CreateRepositoryRequest, CreateWorktreeRequest, CreateWorktreeResult,
+    DiscardAllRequest, DiscardFileRequest, FileDiff, FileDiffRequest, GenerateCommitMessageRequest,
+    GeneratedCommitMessage, HistoryMutationRequest, HistoryMutationResult, HistoryPage,
+    HistoryRequest, PullRequestEvidence, PullRequestMutationRequest, PullRequestMutationResult,
+    ReflogEntry, ReflogRequest, RepositoryOperationMutationResult, RepositoryOperationRequest,
+    RepositoryOperationResult, ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult,
+    SetFileStagingRequest, StashEntry, StashMutationRequest, StashMutationResult, StashRequest,
+    SyncRequest, SyncResult, TagInfo, TagMutationRequest, TagMutationResult, TagRequest,
+    TextGenerationStatus, UndoCommitRequest, UndoCommitResult, WorkingCopyRequest,
+    WorkingCopySnapshot, WorktreeChanges, WorktreeWatcher,
 };
 
 const WORKTREE_CHANGED_EVENT: &str = "repola://worktree-changed";
@@ -1232,11 +1234,14 @@ async fn execute_worktree_action(
     .await;
     operations.finish(&operation_id);
     let outcome = outcome.map_err(|error| format!("Action task failed: {error}"))?;
-    let audit_outcome = outcome
-        .as_ref()
-        .map(|result| result.message.as_str())
-        .map_err(ToString::to_string);
-    let audit = append_audit_entry(&app, &machine_id, &audit_request, audit_outcome);
+    let (succeeded, message) = match &outcome {
+        Ok(result) => (true, result.message.clone()),
+        Err(error) => (false, error.clone()),
+    };
+    let audit = append_audit_entry(
+        &app,
+        &AuditEntry::worktree_action(&machine_id, &audit_request, succeeded, message),
+    );
     match outcome {
         Ok(mut result) => {
             match audit {
@@ -1247,6 +1252,81 @@ async fn execute_worktree_action(
         }
         Err(error) => Err(error.to_string()),
     }
+}
+
+#[tauri::command]
+async fn prepare_branch_deletion(
+    app: tauri::AppHandle,
+    operations: tauri::State<'_, OperationRegistry>,
+    machine_id: String,
+    operation_id: String,
+    request: BranchDeletionRequest,
+) -> Result<BranchDeletionPlan, String> {
+    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+    let token = operations.begin(&operation_id)?;
+    let request_id = operation_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        match execute_on_machine(
+            &machine,
+            request_id,
+            AgentRequest::PrepareBranchDeletion { request },
+            token,
+        )? {
+            AgentResult::BranchDeletionPlan { plan } => Ok(*plan),
+            _ => Err("The Repola agent returned an unexpected response.".to_string()),
+        }
+    })
+    .await;
+    operations.finish(&operation_id);
+    result.map_err(|error| format!("Branch deletion review failed: {error}"))?
+}
+
+#[tauri::command]
+async fn execute_branch_deletion(
+    app: tauri::AppHandle,
+    operations: tauri::State<'_, OperationRegistry>,
+    machine_id: String,
+    operation_id: String,
+    request: BranchDeletionExecutionRequest,
+) -> Result<BranchDeletionResult, String> {
+    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+    let audit_request = request.clone();
+    let token = operations.begin(&operation_id)?;
+    let request_id = operation_id.clone();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        match execute_on_machine(
+            &machine,
+            request_id,
+            AgentRequest::ExecuteBranchDeletion { request },
+            token,
+        )? {
+            AgentResult::BranchDeletion { result } => Ok(*result),
+            _ => Err("The Repola agent returned an unexpected response.".to_string()),
+        }
+    })
+    .await;
+    operations.finish(&operation_id);
+    let outcome = outcome.map_err(|error| format!("Branch deletion failed: {error}"))?;
+    let (succeeded, message) = match &outcome {
+        Ok(result) => (
+            [&result.local, &result.remote]
+                .into_iter()
+                .flatten()
+                .all(|step| step.succeeded),
+            result.message.clone(),
+        ),
+        Err(error) => (false, error.clone()),
+    };
+    let audit = append_audit_entry(
+        &app,
+        &AuditEntry::branch_deletion(&machine_id, &audit_request, succeeded, message),
+    );
+    let mut result = outcome?;
+    match audit {
+        Ok(path) => result.audit_path = Some(path),
+        Err(error) => result.audit_warning = Some(error),
+    }
+    Ok(result)
 }
 
 fn execute_on_machine(
@@ -1318,27 +1398,110 @@ fn cancel_operation(
     operations.cancel(&operation_id)
 }
 
-#[derive(Serialize)]
+/// One line of `actions.jsonl`. Fields added later are optional so entries
+/// written by earlier versions keep decoding.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AuditEntry<'a> {
+struct AuditEntry {
     timestamp_ms: u64,
     action: ActionKind,
-    machine_id: &'a str,
-    repository_path: &'a str,
-    worktree_path: &'a str,
-    expected_head: Option<&'a str>,
-    expected_branch: Option<&'a str>,
-    affected_paths: &'a [String],
+    machine_id: String,
+    repository_path: String,
+    worktree_path: String,
+    expected_head: Option<String>,
+    expected_branch: Option<String>,
+    affected_paths: Vec<String>,
     succeeded: bool,
-    outcome: &'a str,
+    outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch_deletion: Option<BranchDeletionAudit>,
 }
 
-fn append_audit_entry(
-    app: &tauri::AppHandle,
-    machine_id: &str,
-    request: &ActionExecutionRequest,
-    outcome: Result<&str, String>,
-) -> Result<String, String> {
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BranchDeletionAudit {
+    branch_ref: String,
+    delete_local: bool,
+    delete_remote: bool,
+    force: bool,
+    remote: Option<String>,
+    remote_ref: Option<String>,
+    remote_oid: Option<String>,
+}
+
+impl AuditEntry {
+    fn worktree_action(
+        machine_id: &str,
+        request: &ActionExecutionRequest,
+        succeeded: bool,
+        outcome: String,
+    ) -> Self {
+        Self {
+            timestamp_ms: now_ms(),
+            action: request.kind,
+            machine_id: machine_id.to_string(),
+            repository_path: request.repository_path.clone(),
+            worktree_path: request.worktree_path.clone(),
+            expected_head: request.expected_head.clone(),
+            expected_branch: request.expected_branch.clone(),
+            affected_paths: request.expected_affected_paths.clone(),
+            succeeded,
+            outcome,
+            branch_deletion: None,
+        }
+    }
+
+    fn branch_deletion(
+        machine_id: &str,
+        execution: &BranchDeletionExecutionRequest,
+        succeeded: bool,
+        outcome: String,
+    ) -> Self {
+        let request = &execution.request;
+        let expected = &execution.expected;
+        let mut affected_paths = Vec::new();
+        if request.delete_local {
+            affected_paths.push(request.branch_ref.clone());
+        }
+        if let (true, Some(remote), Some(remote_ref)) = (
+            request.delete_remote,
+            expected.remote.as_deref(),
+            expected.remote_ref.as_deref(),
+        ) {
+            affected_paths.push(format!("{remote}:{remote_ref}"));
+        }
+        Self {
+            timestamp_ms: now_ms(),
+            action: ActionKind::DeleteBranch,
+            machine_id: machine_id.to_string(),
+            repository_path: request.repository_path.clone(),
+            worktree_path: request.worktree_path.clone(),
+            expected_head: expected.local_tip.clone(),
+            expected_branch: Some(request.branch_ref.clone()),
+            affected_paths,
+            succeeded,
+            outcome,
+            branch_deletion: Some(BranchDeletionAudit {
+                branch_ref: request.branch_ref.clone(),
+                delete_local: request.delete_local,
+                delete_remote: request.delete_remote,
+                force: execution.force,
+                remote: expected.remote.clone(),
+                remote_ref: expected.remote_ref.clone(),
+                remote_oid: expected.remote_oid.clone(),
+            }),
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn append_audit_entry(app: &tauri::AppHandle, entry: &AuditEntry) -> Result<String, String> {
     let directory = app
         .path()
         .app_data_dir()
@@ -1346,26 +1509,7 @@ fn append_audit_entry(
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("Could not create the audit directory: {error}"))?;
     let path = directory.join("actions.jsonl");
-    let (succeeded, message) = match &outcome {
-        Ok(message) => (true, (*message).to_string()),
-        Err(message) => (false, message.clone()),
-    };
-    let entry = AuditEntry {
-        timestamp_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-            .unwrap_or(0),
-        action: request.kind,
-        machine_id,
-        repository_path: &request.repository_path,
-        worktree_path: &request.worktree_path,
-        expected_head: request.expected_head.as_deref(),
-        expected_branch: request.expected_branch.as_deref(),
-        affected_paths: &request.expected_affected_paths,
-        succeeded,
-        outcome: &message,
-    };
-    let mut line = serde_json::to_vec(&entry)
+    let mut line = serde_json::to_vec(entry)
         .map_err(|error| format!("Could not serialize the audit entry: {error}"))?;
     line.push(b'\n');
     let mut file = OpenOptions::new()
@@ -1408,6 +1552,7 @@ pub fn run() {
             create_worktree,
             discard_all,
             discard_file,
+            execute_branch_deletion,
             execute_worktree_action,
             file_diff,
             fetch_pull_requests,
@@ -1434,6 +1579,7 @@ pub fn run() {
             mutate_branch,
             mutate_stash,
             mutate_tag,
+            prepare_branch_deletion,
             prepare_worktree_action,
             remove_machine,
             register_repository,
@@ -1479,5 +1625,69 @@ mod coordinator_tests {
         assert!(registry.begin("").is_err());
         assert!(registry.begin("line\nbreak").is_err());
         assert!(registry.begin(&"x".repeat(129)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use worktree::{BranchDeletionConfirmation, BranchDeletionFingerprint};
+
+    /// A line exactly as earlier versions wrote it, before branch-deletion details existed.
+    const LEGACY_ENTRY: &str = r#"{"timestampMs":1700000000000,"action":"remove","machineId":"local","repositoryPath":"/work/repository","worktreePath":"/work/linked","expectedHead":"0123456789abcdef0123456789abcdef01234567","expectedBranch":"feature","affectedPaths":["/work/linked"],"succeeded":true,"outcome":"Worktree removed. Its Git branch was left intact."}"#;
+
+    #[test]
+    fn entries_written_by_earlier_versions_still_decode() {
+        let entry: AuditEntry = serde_json::from_str(LEGACY_ENTRY).expect("legacy audit entry");
+        assert_eq!(entry.action, ActionKind::Remove);
+        assert_eq!(entry.expected_branch.as_deref(), Some("feature"));
+        assert_eq!(entry.affected_paths, vec!["/work/linked".to_string()]);
+        assert!(entry.branch_deletion.is_none());
+        assert_eq!(
+            serde_json::to_string(&entry).expect("serialize"),
+            LEGACY_ENTRY,
+            "worktree actions keep writing the same line format"
+        );
+    }
+
+    #[test]
+    fn branch_deletions_record_their_scope_and_round_trip() {
+        let execution = BranchDeletionExecutionRequest {
+            request: BranchDeletionRequest {
+                repository_path: "/work/repository".into(),
+                worktree_path: "/work/repository".into(),
+                branch_ref: "refs/heads/feature".into(),
+                delete_local: true,
+                delete_remote: true,
+            },
+            force: true,
+            expected: BranchDeletionFingerprint {
+                local_tip: Some("a".repeat(40)),
+                merge_reference_oid: Some("b".repeat(40)),
+                requires_force: true,
+                remote: Some("origin".into()),
+                remote_ref: Some("refs/heads/feature".into()),
+                remote_oid: Some("c".repeat(40)),
+                confirmation: BranchDeletionConfirmation::TypeBranchName,
+            },
+            typed_confirmation: Some("feature".into()),
+        };
+        let entry = AuditEntry::branch_deletion("local", &execution, false, "partial".into());
+        assert_eq!(entry.action, ActionKind::DeleteBranch);
+        assert_eq!(
+            entry.affected_paths,
+            vec![
+                "refs/heads/feature".to_string(),
+                "origin:refs/heads/feature".to_string()
+            ]
+        );
+        let details = entry
+            .branch_deletion
+            .as_ref()
+            .expect("branch deletion details");
+        assert!(details.force);
+        let line = serde_json::to_string(&entry).expect("serialize");
+        let decoded: AuditEntry = serde_json::from_str(&line).expect("decode");
+        assert_eq!(decoded, entry);
     }
 }

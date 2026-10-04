@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use super::command;
+use super::command_display::git_command_line;
 use super::discovery::{list_worktrees, repository_context};
 use super::inspection::inspect_worktree;
 use super::models::{
@@ -216,11 +217,7 @@ fn delete_branch_plan(
         worktree_path: String::new(),
         branch: Some(branch.to_string()),
         expected_head: Some(tip),
-        command_display: format!(
-            "git -C {} branch -d {}",
-            shell_quote(&repository.path.to_string_lossy()),
-            shell_quote(branch)
-        ),
+        command_display: git_command_line(&repository.path, ["branch", "-d", branch]),
         affected_paths: vec![branch_ref],
         warnings: vec![
             "No worktree directories or remote branches are touched. This app never passes -D."
@@ -282,7 +279,7 @@ fn remove_plan(
         worktree_path: record.path.clone(),
         branch: record.branch.clone(),
         expected_head: record.head.clone(),
-        command_display: format!("git -C {} worktree remove {}", shell_quote(&repository.path.to_string_lossy()), shell_quote(&record.path)),
+        command_display: git_command_line(&repository.path, ["worktree", "remove", record.path.as_str()]),
         affected_paths: vec![record.path.clone()],
         warnings,
         confirmation_text: "REMOVE".to_string(),
@@ -308,10 +305,9 @@ fn repair_plan(
         worktree_path: record.path.clone(),
         branch: record.branch.clone(),
         expected_head: record.head.clone(),
-        command_display: format!(
-            "git -C {} worktree repair {}",
-            shell_quote(&repository.path.to_string_lossy()),
-            shell_quote(&record.path)
+        command_display: git_command_line(
+            &repository.path,
+            ["worktree", "repair", record.path.as_str()],
         ),
         affected_paths: vec![record.path.clone()],
         warnings: vec!["No working-tree files will be deleted.".to_string()],
@@ -338,10 +334,9 @@ fn unlock_plan(
         worktree_path: record.path.clone(),
         branch: record.branch.clone(),
         expected_head: record.head.clone(),
-        command_display: format!(
-            "git -C {} worktree unlock {}",
-            shell_quote(&repository.path.to_string_lossy()),
-            shell_quote(&record.path)
+        command_display: git_command_line(
+            &repository.path,
+            ["worktree", "unlock", record.path.as_str()],
         ),
         affected_paths: vec![record.path.clone()],
         warnings: vec!["Unlocking does not remove files or metadata.".to_string()],
@@ -379,14 +374,10 @@ fn prune_plan(
         worktree_path: record.path.clone(),
         branch: record.branch.clone(),
         expected_head: record.head.clone(),
-        command_display: format!("git -C {} worktree prune --expire=now --verbose", shell_quote(&repository.path.to_string_lossy())),
+        command_display: git_command_line(&repository.path, ["worktree", "prune", "--expire=now", "--verbose"]),
         affected_paths,
         warnings: vec!["This is repository-wide. Review every affected path below.".to_string()],
         confirmation_text: "PRUNE".to_string(),
         destructive: true,
     })
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }

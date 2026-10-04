@@ -1,10 +1,21 @@
 import type { ComponentProps } from "react";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { RepositorySummary, WorktreeRecord } from "../ipc/types";
+import type * as WorktreeIpc from "../ipc/worktrees";
+import type { BranchDeletionRequest, BranchInfo, RepositorySummary, WorktreeRecord } from "../ipc/types";
 import { fileManagerName } from "../domain/platform";
 import { RepositoryProvider } from "./context";
 import { RepositoryToolbar } from "./RepositoryToolbar";
+
+const ipc = vi.hoisted(() => ({
+  loadBranches: vi.fn(),
+  prepareBranchDeletionReview: vi.fn(),
+}));
+
+vi.mock("../ipc/worktrees", async (importOriginal) => ({
+  ...await importOriginal<typeof WorktreeIpc>(),
+  ...ipc,
+}));
 
 const repository: RepositorySummary = {
   id: "repo-1",
@@ -45,14 +56,14 @@ function worktree(path: string, branch: string, isPrimary = false): WorktreeReco
   };
 }
 
-function renderToolbar(overrides: Partial<ComponentProps<typeof RepositoryToolbar>> = {}) {
+function renderToolbar(overrides: Partial<ComponentProps<typeof RepositoryToolbar>> = {}, selected: WorktreeRecord | null = null) {
   return render(
     <RepositoryProvider value={{
       machineId: "local",
       machineKind: "local",
       machineOs: null,
       repository,
-      worktree: null,
+      worktree: selected,
       refreshWorkspace: vi.fn(),
       showChanges: vi.fn(),
     }}>
@@ -144,5 +155,31 @@ describe("RepositoryToolbar", () => {
     fireEvent.click(match);
 
     expect(onWorktreeChange).toHaveBeenCalledWith("/worktrees/t3code-30dacb81");
+  });
+
+  it("opens a reviewed branch deletion from the branch actions menu", async () => {
+    const main = worktree("/repos/repola", "main", true);
+    const branches: BranchInfo[] = [
+      { name: "main", fullName: "refs/heads/main", head: "1234567890abcdef", remote: false, current: true, upstream: null, ahead: 0, behind: 0, occupiedWorktreePath: "/repos/repola" },
+      { name: "old-work", fullName: "refs/heads/old-work", head: "abcdef1234567890", remote: false, current: false, upstream: null, ahead: 0, behind: 0, occupiedWorktreePath: null },
+    ];
+    ipc.loadBranches.mockResolvedValue(branches);
+    ipc.prepareBranchDeletionReview.mockImplementation(() => new Promise<never>(() => undefined));
+    renderToolbar({ worktrees: [main] }, main);
+
+    const actions = screen.getByRole("button", { name: "Branch actions" });
+    await vi.waitFor(() => expect(actions).toBeEnabled());
+    fireEvent.click(actions);
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Delete branch…" }));
+
+    expect(await screen.findByRole("dialog", { name: "Delete a branch" })).toBeInTheDocument();
+    const request: BranchDeletionRequest = {
+      repositoryPath: "/repos/repola",
+      worktreePath: "/repos/repola",
+      branchRef: "refs/heads/old-work",
+      deleteLocal: true,
+      deleteRemote: false,
+    };
+    expect(ipc.prepareBranchDeletionReview).toHaveBeenCalledWith("local", request, expect.any(AbortSignal));
   });
 });
