@@ -116,6 +116,26 @@ describe("DiscardedChangesDialog", () => {
     await waitFor(() => expect(ipc.planRecoveryRestore).toHaveBeenCalledTimes(2));
   });
 
+  it("restores only what the latest review planned and cancels the review it left", async () => {
+    let resolveFirst!: (plan: RecoveryRestorePlan) => void;
+    const olderPlan: RecoveryRestorePlan = { ...restorePlan, point: older, fingerprint: "older-fingerprint" };
+    ipc.planRecoveryRestore
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockResolvedValueOnce(olderPlan);
+    ipc.restoreRecoveryPoint.mockResolvedValue({ snapshot, replaced: null } satisfies RecoveryRestoreResult);
+    renderDialog();
+    fireEvent.click(await screen.findByRole("button", { name: "Review Restore…" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    fireEvent.click(within(screen.getByRole("region", { name: "Recovery points" })).getByText("Discarded all changes (30 files)"));
+    fireEvent.click(screen.getByRole("button", { name: "Review Restore…" }));
+    const confirm = await screen.findByRole("button", { name: "Restore 1 Path" });
+    expect(ipc.planRecoveryRestore.mock.calls[0]?.[4]?.aborted).toBe(true);
+
+    await act(async () => resolveFirst(restorePlan));
+    await act(async () => fireEvent.click(confirm));
+    expect(ipc.restoreRecoveryPoint).toHaveBeenCalledWith("build-box", "/repo", "/repo", olderPlan);
+  });
+
   it("deletes only the reviewed selection", async () => {
     ipc.deleteRecoveryPoints.mockResolvedValue([sibling]);
     renderDialog();

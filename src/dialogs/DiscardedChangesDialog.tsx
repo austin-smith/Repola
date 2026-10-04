@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArchiveRestoreIcon, ArrowLeftIcon, CopyIcon, RotateCcwIcon, Trash2Icon } from "lucide-react";
 import { PatchDiff } from "@pierre/diffs/react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -52,7 +52,8 @@ interface DiscardedChangesDialogProps {
 
 type View =
   | { kind: "list" }
-  | { kind: "restore"; plan: RecoveryRestorePlan | null; error: string | null }
+  // `review` distinguishes each review, so a plan is shown only for the one it answers.
+  | { kind: "restore"; point: RecoveryPoint; review: number }
   | { kind: "delete"; points: RecoveryPoint[] };
 
 /**
@@ -94,13 +95,28 @@ export default function DiscardedChangesDialog({
   const { here, elsewhere } = useMemo(() => partitionRecoveryPoints(points ?? [], worktreePath), [points, worktreePath]);
   const active = points?.find((point) => point.id === activeId) ?? null;
 
+  const reviews = useRef(0);
   const reviewRestore = (point: RecoveryPoint) => {
     setError(null);
-    setView({ kind: "restore", plan: null, error: null });
-    void planRecoveryRestore(machineId, repositoryPath, worktreePath, { id: point.id, oid: point.oid })
-      .then((plan) => setView({ kind: "restore", plan, error: null }))
-      .catch((cause: unknown) => setView({ kind: "restore", plan: null, error: toMessage(cause) }));
+    reviews.current += 1;
+    setView({ kind: "restore", point, review: reviews.current });
   };
+
+  // Leaving or replacing a review aborts its plan, and a plan is shown only
+  // for the review that requested it.
+  const reviewing = view.kind === "restore" ? view : null;
+  const [loadedPlan, setLoadedPlan] = useState<{ review: number; plan: RecoveryRestorePlan | null; error: string | null } | null>(null);
+  const plan = reviewing && loadedPlan?.review === reviewing.review ? loadedPlan.plan : null;
+  const planError = reviewing && loadedPlan?.review === reviewing.review ? loadedPlan.error : null;
+  useEffect(() => {
+    if (!reviewing) return;
+    const controller = new AbortController();
+    const { point, review } = reviewing;
+    void planRecoveryRestore(machineId, repositoryPath, worktreePath, { id: point.id, oid: point.oid }, controller.signal)
+      .then((next) => { if (!controller.signal.aborted) setLoadedPlan({ review, plan: next, error: null }); })
+      .catch((cause: unknown) => { if (!controller.signal.aborted) setLoadedPlan({ review, plan: null, error: toMessage(cause) }); });
+    return () => controller.abort();
+  }, [machineId, repositoryPath, reviewing, worktreePath]);
 
   const restore = async (plan: RecoveryRestorePlan) => {
     setBusy(true);
@@ -196,8 +212,8 @@ export default function DiscardedChangesDialog({
             machineId={machineId}
             repositoryPath={repositoryPath}
             worktreePath={worktreePath}
-            plan={view.plan}
-            planError={view.error}
+            plan={plan}
+            planError={planError}
             busy={busy}
             onBack={() => setView({ kind: "list" })}
             onConfirm={(plan) => void restore(plan)}
