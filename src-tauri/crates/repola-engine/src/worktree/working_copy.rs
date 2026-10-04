@@ -950,6 +950,12 @@ fn discard_tracked_path(
     change: &FileChange,
     current: OsString,
 ) -> Result<(), String> {
+    if change.submodule && absent_from_head(change) {
+        return Err(
+            "Repola does not delete a newly added submodule. Remove its repository explicitly."
+                .into(),
+        );
+    }
     let previous = change
         .previous_path
         .as_ref()
@@ -981,7 +987,10 @@ fn discard_tracked_path(
             restore_worktree_path(worktree, previous)?;
             clean_path(worktree, current)
         }
-        _ if absent_from_head(change) => clean_path(worktree, current),
+        // A deleted addition leaves nothing of its own on disk. Whatever now
+        // occupies the path, such as a directory, is not part of this change.
+        _ if absent_from_head(change) && change.worktree_status == "D" => Ok(()),
+        _ if absent_from_head(change) => remove_unstaged_addition(worktree, current),
         _ => restore_worktree_path(worktree, current),
     }
 }
@@ -989,6 +998,34 @@ fn discard_tracked_path(
 /// Porcelain v2 reports an all-zero mode for a side that lacks the entry.
 fn absent_from_head(change: &FileChange) -> bool {
     change.head_mode.as_deref() == Some("000000")
+}
+
+/// Removes the single file an unstaged addition leaves behind. The path names
+/// a file or symlink, never a directory, so the literal pathspec matches it
+/// alone; `-x` still removes it when an ignore rule covers it, as with a file
+/// that was force-added.
+fn remove_unstaged_addition(worktree: &Path, path: OsString) -> Result<(), String> {
+    let mut pathspec = OsString::from(":(literal)");
+    pathspec.push(&path);
+    let output = command::git_at(
+        worktree,
+        [
+            OsString::from("clean"),
+            OsString::from("-f"),
+            OsString::from("-x"),
+            OsString::from("--"),
+            pathspec,
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    ensure_success(output, "remove the selected added path")?;
+    match fs::symlink_metadata(worktree.join(&path)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(
+            "The added path was unstaged, but Git left it on disk. Remove it explicitly.".into(),
+        ),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn restore_worktree_path(worktree: &Path, path: OsString) -> Result<(), String> {
@@ -4010,6 +4047,111 @@ mod tests {
         assert!(snapshot.changes.is_empty());
         assert!(!repository.path().join("edited.txt").exists());
         assert!(!repository.path().join("removed.txt").exists());
+    }
+
+    #[test]
+    fn discarding_a_staged_addition_removes_only_the_reviewed_file() {
+        let repository = repository();
+        std::fs::write(repository.path().join(".gitignore"), "*.log\n").expect("ignore rules");
+        command::successful_git_at(repository.path(), ["add", "."]).expect("add base");
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).expect("commit");
+        for name in ["replaced", "[x].txt", "forced.log"] {
+            std::fs::write(repository.path().join(name), "staged\n").expect("new file");
+            command::successful_git_at(repository.path(), ["add", "-f", "--", name])
+                .expect("stage new file");
+        }
+        // A directory takes over a deleted addition's path; status reports only the addition.
+        std::fs::remove_file(repository.path().join("replaced")).expect("remove addition");
+        std::fs::create_dir(repository.path().join("replaced")).expect("directory");
+        std::fs::write(repository.path().join("replaced/unreviewed.txt"), "keep\n")
+            .expect("unreviewed file");
+        // A literal name that also reads as a glob matching an untracked neighbour.
+        std::fs::write(repository.path().join("[x].txt"), "staged\nedited\n").expect("edit");
+        std::fs::write(repository.path().join("x.txt"), "keep\n").expect("neighbour");
+        // A force-added file stays covered by its ignore rule once unstaged.
+        std::fs::write(repository.path().join("forced.log"), "staged\nedited\n").expect("edit");
+
+        let mut snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
+        for name in ["replaced", "[x].txt", "forced.log"] {
+            let change = snapshot
+                .changes
+                .iter()
+                .find(|change| change.path.display == name)
+                .expect("change")
+                .clone();
+            snapshot = discard_file(DiscardFileRequest {
+                repository_path: snapshot.repository_path.clone(),
+                worktree_path: snapshot.worktree_path.clone(),
+                path: change.path,
+                scope: DiscardScope::All,
+                expected_head: snapshot.head.clone(),
+                expected_index_status: change.index_status,
+                expected_worktree_status: change.worktree_status,
+            })
+            .expect("discard");
+        }
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("replaced/unreviewed.txt"))
+                .expect("unreviewed file kept"),
+            "keep\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("x.txt")).expect("neighbour kept"),
+            "keep\n"
+        );
+        assert!(!repository.path().join("[x].txt").exists());
+        assert!(!repository.path().join("forced.log").exists());
+    }
+
+    #[test]
+    fn refuses_to_discard_a_newly_added_submodule() {
+        let repository = repository();
+        std::fs::write(repository.path().join("base.txt"), "base\n").expect("base");
+        command::successful_git_at(repository.path(), ["add", "."]).expect("add base");
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).expect("commit");
+        let nested = repository.path().join("nested");
+        std::fs::create_dir(&nested).expect("nested directory");
+        command::successful_git_at(&nested, ["init"]).expect("initialize nested repository");
+        command::successful_git_at(
+            &nested,
+            [
+                "-c",
+                "user.name=Repola Test",
+                "-c",
+                "user.email=repola@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "nested",
+            ],
+        )
+        .expect("commit nested repository");
+        command::successful_git_at(repository.path(), ["add", "nested"]).expect("stage gitlink");
+
+        let snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
+        let change = snapshot
+            .changes
+            .iter()
+            .find(|change| change.path.display == "nested")
+            .expect("submodule change")
+            .clone();
+        assert!(change.submodule);
+        let error = discard_file(DiscardFileRequest {
+            repository_path: snapshot.repository_path.clone(),
+            worktree_path: snapshot.worktree_path.clone(),
+            path: change.path,
+            scope: DiscardScope::All,
+            expected_head: snapshot.head.clone(),
+            expected_index_status: change.index_status,
+            expected_worktree_status: change.worktree_status,
+        })
+        .expect_err("newly added submodule");
+        assert!(error.contains("newly added submodule"), "{error}");
+        assert!(nested.join(".git").exists());
+        assert_eq!(
+            git_text(repository.path(), ["diff", "--cached", "--name-only"]).expect("index"),
+            "nested"
+        );
     }
 
     #[test]
