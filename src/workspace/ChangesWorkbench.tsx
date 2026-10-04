@@ -7,6 +7,7 @@ import {
   FolderOpenIcon,
   FileDiffIcon,
   GitCommitIcon,
+  MoreHorizontalIcon,
   RefreshCwIcon,
   SearchIcon,
   Settings2Icon,
@@ -21,6 +22,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from "@/components/ui/context-menu";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
@@ -31,7 +33,6 @@ import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/toast";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { TooltipButton } from "@/components/tooltip-button";
 import { cn } from "@/lib/utils";
 import { toMessage } from "@/lib/errors";
 import { ActionableGitError } from "../components/ActionableGitError";
@@ -563,7 +564,7 @@ export function ChangesWorkbench() {
   return (
     <div className="grid min-h-0 flex-1 grid-cols-[380px_minmax(0,1fr)]">
       <aside className="flex min-h-0 flex-col border-r bg-sidebar">
-        <div className="flex h-12 shrink-0 items-center border-b px-4">
+        <div className="flex h-12 shrink-0 items-center border-b px-3">
           <Checkbox
             checked={allChangesIncluded}
             indeterminate={includedCount > 0 && !allChangesIncluded}
@@ -577,42 +578,52 @@ export function ChangesWorkbench() {
           />
           <strong className="ml-3 text-sm">Changes</strong>
           <Badge variant="secondary" className="ml-2">{visibleChanges.length}</Badge>
-          <TooltipButton
-            variant="ghost"
-            size="icon-sm"
-            className="text-destructive"
-            disabled={!snapshot || visibleChanges.length === 0 || commitBusy || busyPath !== null || snapshot.operation !== null}
-            onClick={() => setPendingDiscardAll(true)}
-            aria-label="Discard all changes"
-            tooltip="Discard all changes"
-          >
-            <Trash2Icon aria-hidden="true" />
-          </TooltipButton>
-          <Button variant="outline" size="sm" className="ml-auto" disabled={!snapshot || commitBusy || busyPath !== null || snapshot.operation !== null} onClick={() => setStashOpen(true)}>
-            <ArchiveIcon data-icon="inline-start" aria-hidden="true" />
-            Stashes
-          </Button>
-          <Button variant="outline" size="sm" className="ml-2" disabled={syncBusy || !snapshot?.remote || snapshot.operation !== null} onClick={() => void synchronize()}>
-            {syncBusy ? <Spinner data-icon="inline-start" /> : <RefreshCwIcon data-icon="inline-start" aria-hidden="true" />}
-            {syncBusy ? "Working…" : syncLabel}
-          </Button>
-          {snapshot?.upstream && snapshot.ahead > 0 && snapshot.behind > 0 ? (
-            <Button variant="destructive" size="sm" className="ml-2" disabled={syncBusy || snapshot.operation !== null} onClick={() => setPendingForcePush(true)}>Force…</Button>
-          ) : null}
+          <div className="ml-auto flex shrink-0 items-center gap-1">
+            <Button variant="ghost" size="sm" disabled={syncBusy || !snapshot?.remote || snapshot.operation !== null} onClick={() => void synchronize()}>
+              {syncBusy ? <Spinner data-icon="inline-start" /> : <RefreshCwIcon data-icon="inline-start" aria-hidden="true" />}
+              {syncBusy ? "Working…" : syncLabel}
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="More change actions" />}>
+                <MoreHorizontalIcon aria-hidden="true" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-52">
+                <DropdownMenuGroup>
+                  <DropdownMenuItem disabled={!snapshot || commitBusy || busyPath !== null || snapshot.operation !== null} onClick={() => setStashOpen(true)}>
+                    <ArchiveIcon aria-hidden="true" />
+                    Stashes
+                  </DropdownMenuItem>
+                </DropdownMenuGroup>
+                <DropdownMenuSeparator />
+                <DropdownMenuGroup>
+                  <DropdownMenuItem variant="destructive" disabled={!snapshot || visibleChanges.length === 0 || commitBusy || busyPath !== null || snapshot.operation !== null} onClick={() => setPendingDiscardAll(true)}>
+                    <Trash2Icon aria-hidden="true" />
+                    Discard all changes…
+                  </DropdownMenuItem>
+                  {snapshot?.upstream && snapshot.ahead > 0 && snapshot.behind > 0 ? (
+                    <DropdownMenuItem variant="destructive" disabled={syncBusy || snapshot.operation !== null} onClick={() => setPendingForcePush(true)}>
+                      <RefreshCwIcon aria-hidden="true" />
+                      Force push…
+                    </DropdownMenuItem>
+                  ) : null}
+                </DropdownMenuGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
         </div>
-        <div className="shrink-0 border-b px-3 py-2">
+        <div className="shrink-0 border-b px-2 py-1">
           <ChangeKindFilter counts={kindCounts} value={activeKinds} onValueChange={setKindFilter}>
-            <InputGroup className="h-7">
+            <InputGroup>
               <InputGroupInput
                 value={changeFilter}
                 onChange={(event) => setChangeFilter(event.currentTarget.value)}
                 placeholder="Filter changed files"
                 aria-label="Filter changed files"
-                className="text-[0.8rem]"
+                className="h-full py-0 text-[0.8rem]"
               />
-              <InputGroupAddon><SearchIcon aria-hidden="true" /></InputGroupAddon>
+              <InputGroupAddon className="h-full w-6 shrink-0 p-0"><SearchIcon aria-hidden="true" /></InputGroupAddon>
               {kindCounts.length > 1 ? (
-                <InputGroupAddon align="inline-end">
+                <InputGroupAddon align="inline-end" className="h-full w-6 shrink-0 p-0 has-[>button]:mr-0">
                   <ChangeKindFilterTrigger value={activeKinds} inInput />
                 </InputGroupAddon>
               ) : null}
@@ -683,7 +694,7 @@ export function ChangesWorkbench() {
                   if (!listedSelection.selectedIds.has(change.id)) setChangeSelection(singleChangeSelection(change.id));
                 }}
               >
-              <span className="grid w-9 shrink-0 place-items-center">
+              <span className="grid w-10 shrink-0 place-items-center">
                 <Checkbox
                   checked={isIncludedInCommit(commitSelectionFor(commitSelections, change.id))}
                   indeterminate={commitSelectionFor(commitSelections, change.id).kind === "partial"}
@@ -698,7 +709,7 @@ export function ChangesWorkbench() {
               </span>
               <button
                 type="button"
-                className="flex min-w-0 flex-1 items-center gap-2 self-stretch pr-2.5 text-left"
+                className="flex min-w-0 flex-1 items-center gap-2 self-stretch pr-3 text-left"
                 data-change-id={change.id}
                 aria-pressed={listedSelection.selectedIds.has(change.id)}
                 onClick={(event) => {

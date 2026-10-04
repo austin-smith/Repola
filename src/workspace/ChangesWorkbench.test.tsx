@@ -52,6 +52,26 @@ describe("commit-message generation", () => {
     expect(screen.getByPlaceholderText("Description")).toHaveValue("- use standard Git terminology");
   });
 
+  it("keeps secondary actions in the menu and confirms before discarding", async () => {
+    await act(async () => { render(<ChangesWorkbench />); });
+    expect(screen.queryByRole("button", { name: "Stashes" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "More change actions" })));
+    expect(screen.getByRole("menuitem", { name: "Stashes" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Force push…" })).not.toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByRole("menuitem", { name: "Discard all changes…" })));
+    expect(screen.getByRole("dialog", { name: "Discard all 1 changed files?" })).toBeInTheDocument();
+  });
+
+  it("offers force push for diverged branches through its existing confirmation", async () => {
+    ipc.fetchWorkingCopy.mockResolvedValue({ ...snapshot, remote: "origin", upstream: "origin/main", upstreamHead: "remote-head", ahead: 1, behind: 1 });
+    await act(async () => { render(<ChangesWorkbench />); });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "More change actions" })));
+    await act(async () => fireEvent.click(screen.getByRole("menuitem", { name: "Force push…" })));
+    expect(screen.getByRole("dialog", { name: "Force-push main?" })).toBeInTheDocument();
+    expect(ipc.synchronizeWorkingCopy).not.toHaveBeenCalled();
+  });
+
   it("locks selection, offers cancellation, and ignores a late cancelled response", async () => {
     let complete!: (message: GeneratedCommitMessage) => void;
     ipc.generateCommitMessage.mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
