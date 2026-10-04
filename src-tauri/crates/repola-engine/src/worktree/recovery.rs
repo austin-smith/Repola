@@ -42,6 +42,8 @@ const MANIFEST_VERSION: u32 = 1;
 /// Paths listed in a summary for display; the manifest holds all of them.
 const SUMMARY_SAMPLE_PATHS: usize = 20;
 const MAX_SUMMARY_BYTES: usize = 64 * 1024;
+/// Summaries read per Git invocation: at most 16 MiB, half the capture limit.
+const SUMMARIES_PER_READ: usize = 256;
 const MAX_RECOVERY_ID_BYTES: usize = 128;
 /// Paths per Git invocation stay well inside the Windows command-line limit.
 const ARGUMENT_BUDGET_BYTES: usize = 16 * 1024;
@@ -807,13 +809,49 @@ fn list(worktree: &Path) -> Result<Vec<RecoveryPoint>, String> {
     if references.is_empty() {
         return Ok(Vec::new());
     }
+    // Sizes come first so only summaries small enough to use are read, a
+    // bounded number at a time, keeping each read within the capture limit.
     let input: String = references
         .iter()
         .map(|reference| format!("{}:summary.json\n", reference.oid))
         .collect();
-    let output = command::git_at_with_input(worktree, ["cat-file", "--batch"], input.as_bytes())
-        .map_err(|error| error.to_string())?;
-    let objects = parse_batch(&successful_stdout(output, "read the recovery points")?)?;
+    let output = command::git_at_with_input(
+        worktree,
+        [
+            "cat-file",
+            "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+        ],
+        input.as_bytes(),
+    )
+    .map_err(|error| error.to_string())?;
+    let sizes = successful_stdout(output, "read the recovery points")?;
+    let mut readable = Vec::new();
+    for (index, line) in String::from_utf8_lossy(&sizes).lines().enumerate() {
+        let mut fields = line.split(' ');
+        if let (Some(oid), Some("blob"), Some(size)) = (fields.next(), fields.next(), fields.next())
+        {
+            if size
+                .parse::<usize>()
+                .is_ok_and(|size| size <= MAX_SUMMARY_BYTES)
+            {
+                readable.push((index, oid.to_string()));
+            }
+        }
+    }
+    let mut objects = vec![None; references.len()];
+    for chunk in readable.chunks(SUMMARIES_PER_READ) {
+        let input: String = chunk.iter().map(|(_, oid)| format!("{oid}\n")).collect();
+        let output =
+            command::git_at_with_input(worktree, ["cat-file", "--batch"], input.as_bytes())
+                .map_err(|error| error.to_string())?;
+        let read = parse_batch(&successful_stdout(output, "read the recovery points")?)?;
+        if read.len() != chunk.len() {
+            return Err("Git returned malformed recovery-point data.".into());
+        }
+        for ((index, _), object) in chunk.iter().zip(read) {
+            objects[*index] = object;
+        }
+    }
     let mut points: Vec<RecoveryPoint> = references
         .into_iter()
         .zip(objects)
@@ -2227,6 +2265,55 @@ mod tests {
             [second.id.as_str(), first.id.as_str()]
         );
         assert_eq!(points[0].paths, vec![git_path(b"b.txt")]);
+    }
+
+    #[test]
+    fn listing_reads_every_point_and_skips_summaries_too_large_to_read() {
+        let (_directory, path) = repository();
+        let first = store(
+            &path,
+            &[saved_file(&path, "a.txt", WorktreeEntryKind::File, b"a\n")],
+        );
+        // A foreign tree whose summary alone exceeds the capture limit.
+        let large = tempfile::NamedTempFile::new().expect("large summary");
+        std::fs::write(large.path(), vec![b' '; 33 * 1024 * 1024]).expect("write");
+        let blob = git(
+            &path,
+            &["hash-object", "-w", &large.path().to_string_lossy()],
+        );
+        let tree = command::git_at_with_input(
+            &path,
+            ["mktree"],
+            format!("100644 blob {}\tsummary.json\n", blob.trim()).as_bytes(),
+        )
+        .expect("mktree");
+        let large_tree = String::from_utf8_lossy(&tree.stdout).trim().to_string();
+        let large_id = format!("{RECOVERY_REF_NAMESPACE}/point-0300");
+        let mut copies = Vec::new();
+        let mut updates = String::new();
+        for index in 0..2 * SUMMARIES_PER_READ + 1 {
+            let id = format!("{RECOVERY_REF_NAMESPACE}/point-{index:04}");
+            let oid = if id == large_id {
+                large_tree.as_str()
+            } else {
+                copies.push(id.clone());
+                first.oid.as_str()
+            };
+            updates.push_str(&format!("create {id} {oid}\n"));
+        }
+        let output =
+            command::git_at_with_input(&path, ["update-ref", "--stdin"], updates.as_bytes())
+                .expect("update-ref");
+        assert!(output.status.success());
+        let mut listed: Vec<String> = list_recovery_points(request(&path))
+            .expect("list")
+            .into_iter()
+            .map(|point| point.id)
+            .collect();
+        listed.sort();
+        copies.push(first.id);
+        copies.sort();
+        assert_eq!(listed, copies);
     }
 
     #[test]
