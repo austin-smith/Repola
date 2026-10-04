@@ -52,6 +52,26 @@ describe("commit-message generation", () => {
     expect(screen.getByPlaceholderText("Description")).toHaveValue("- use standard Git terminology");
   });
 
+  it("keeps secondary actions in the menu and confirms before discarding", async () => {
+    await act(async () => { render(<ChangesWorkbench />); });
+    expect(screen.queryByRole("button", { name: "Stashes" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "More change actions" })));
+    expect(screen.getByRole("menuitem", { name: "Stashes" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Force push…" })).not.toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByRole("menuitem", { name: "Discard all changes…" })));
+    expect(screen.getByRole("dialog", { name: "Discard all 1 changed files?" })).toBeInTheDocument();
+  });
+
+  it("offers force push for diverged branches through its existing confirmation", async () => {
+    ipc.fetchWorkingCopy.mockResolvedValue({ ...snapshot, remote: "origin", upstream: "origin/main", upstreamHead: "remote-head", ahead: 1, behind: 1 });
+    await act(async () => { render(<ChangesWorkbench />); });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "More change actions" })));
+    await act(async () => fireEvent.click(screen.getByRole("menuitem", { name: "Force push…" })));
+    expect(screen.getByRole("dialog", { name: "Force-push main?" })).toBeInTheDocument();
+    expect(ipc.synchronizeWorkingCopy).not.toHaveBeenCalled();
+  });
+
   it("locks selection, offers cancellation, and ignores a late cancelled response", async () => {
     let complete!: (message: GeneratedCommitMessage) => void;
     ipc.generateCommitMessage.mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
@@ -214,5 +234,109 @@ describe("commit-message generation", () => {
     expect(screen.getByPlaceholderText("Summary (required)")).toHaveValue("");
     expect(screen.getByPlaceholderText("Summary (required)")).toBeEnabled();
     expect(screen.getByText("Could not refresh working copy")).toBeInTheDocument();
+  });
+});
+
+describe("change type filter", () => {
+  const change = snapshot.changes[0];
+  const mixed: WorkingCopySnapshot = {
+    ...snapshot,
+    changes: [
+      { ...change, id: "src/app.ts", path: { display: "src/app.ts", token: "src/app.ts" } },
+      { ...change, id: "new.txt", path: { display: "new.txt", token: "new.txt" }, kind: "untracked", indexStatus: "?", worktreeStatus: "?", untracked: true },
+      { ...change, id: "old.txt", path: { display: "old.txt", token: "old.txt" }, kind: "deleted", worktreeStatus: "D" },
+    ],
+  };
+  const listedIds = (container: HTMLElement) => (
+    [...container.querySelectorAll("[data-change-id]")].map((row) => row.getAttribute("data-change-id"))
+  );
+  // Every IPC mock resolves immediately, so flushing the render settles the
+  // workbench without polling against the clock.
+  const renderWorkbench = async () => {
+    let view!: ReturnType<typeof render>;
+    await act(async () => { view = render(<ChangesWorkbench />); });
+    return view;
+  };
+
+  const openTypeMenu = async () => {
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: /Filter by change type/ })));
+  };
+  const closeTypeMenu = async () => {
+    await act(async () => fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" }));
+  };
+  const chooseType = async (name: string) => {
+    await openTypeMenu();
+    await act(async () => fireEvent.click(screen.getByRole("menuitemcheckbox", { name })));
+    await closeTypeMenu();
+  };
+
+  afterEach(cleanup);
+  beforeEach(() => {
+    vi.clearAllMocks();
+    ipc.fetchWorkingCopy.mockResolvedValue(mixed);
+    ipc.watchWorktree.mockResolvedValue(undefined);
+    ipc.unwatchWorktree.mockResolvedValue(undefined);
+    ipc.onWorktreeChanged.mockResolvedValue(() => undefined);
+  });
+
+  it("offers no type filter when every change has the same type", async () => {
+    ipc.fetchWorkingCopy.mockResolvedValue(snapshot);
+    await renderWorkbench();
+    expect(screen.getByText("file", { selector: "strong" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Filter by change type/ })).not.toBeInTheDocument();
+  });
+
+  it("lists only the pressed types, previews a listed file, and keeps hidden files in the commit", async () => {
+    const { container } = await renderWorkbench();
+    expect(screen.queryByRole("menuitemcheckbox")).not.toBeInTheDocument();
+    await openTypeMenu();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Modified (1)" })).toBeInTheDocument();
+    await closeTypeMenu();
+    expect(screen.getByText("src/app.ts", { selector: "strong" })).toBeInTheDocument();
+
+    await chooseType("Added (1)");
+    expect(listedIds(container)).toEqual(["new.txt"]);
+    expect(screen.getByText("new.txt", { selector: "strong" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Commit 3 files to main" })).toBeInTheDocument();
+
+    await chooseType("Deleted (1)");
+    expect(listedIds(container)).toEqual(["new.txt", "old.txt"]);
+
+    await openTypeMenu();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Added (1)" })).toBeChecked();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Deleted (1)" })).toBeChecked();
+    await act(async () => fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "All change types" })));
+    expect(screen.getByRole("menuitemcheckbox", { name: "All change types" })).toBeChecked();
+    await closeTypeMenu();
+    expect(listedIds(container)).toEqual(["src/app.ts", "new.txt", "old.txt"]);
+  });
+
+  it("never acts on selected files the filter hides", async () => {
+    const { container } = await renderWorkbench();
+    const list = container.querySelector<HTMLElement>("[aria-keyshortcuts]");
+    if (!list) throw new Error("changes list missing");
+    fireEvent.keyDown(list, { key: "a", metaKey: true });
+    await chooseType("Added (1)");
+    fireEvent.keyDown(list, { key: " " });
+    expect(listedIds(container)).toEqual(["new.txt"]);
+    expect(screen.getByRole("button", { name: "Commit 2 files to main" })).toBeInTheDocument();
+    await chooseType("Added (1)");
+    expect(screen.getByRole("checkbox", { name: "Exclude src/app.ts from commit" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Exclude old.txt from commit" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Include new.txt in commit" })).not.toBeChecked();
+  });
+
+  it("stops filtering by a type once a refresh removes its last file", async () => {
+    let notify!: (event: { machineId: string }) => void;
+    ipc.onWorktreeChanged.mockImplementation(async (listener) => { notify = listener; return () => undefined; });
+    const { container } = await renderWorkbench();
+    await chooseType("Deleted (1)");
+    expect(listedIds(container)).toEqual(["old.txt"]);
+
+    ipc.fetchWorkingCopy.mockResolvedValue({ ...mixed, changes: mixed.changes.filter((entry) => entry.kind !== "deleted") });
+    await act(async () => notify({ machineId: "local" }));
+    expect(listedIds(container)).toEqual(["src/app.ts", "new.txt"]);
+    await openTypeMenu();
+    expect(screen.queryByRole("menuitemcheckbox", { name: /^Deleted/ })).not.toBeInTheDocument();
   });
 });
