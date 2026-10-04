@@ -86,6 +86,10 @@ pub(super) struct PathState {
     /// before, even empty ones, stay.
     #[serde(default)]
     pub parents: usize,
+    /// The permission bits of those folders, from the top, so a restore that
+    /// recreates one does not widen access to it. Unix only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parent_permissions: Vec<u32>,
     /// A parent of the path is a file or a link. Writing the path would
     /// replace it, and it is not saved, so nothing is written there.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -422,18 +426,17 @@ pub(super) fn observe_paths(
         index: Vec<IndexEntry>,
         entry: Option<(WorktreeEntryKind, u64, Option<u32>, Source)>,
         directory: bool,
-        parents: usize,
-        blocked: bool,
+        chain: ParentChain,
     }
     let mut observed = Vec::with_capacity(paths.len());
     for (path, valid) in paths.iter().zip(&validated) {
-        let (parents, blocked) = parent_chain(worktree, valid)?;
+        let chain = parent_chain(worktree, valid)?;
+        let blocked = chain.blocked;
         let mut item = Observed {
             index: index.remove(&valid.bytes).unwrap_or_default(),
             entry: None,
             directory: false,
-            parents,
-            blocked,
+            chain,
         };
         let location = match inspect_path(worktree, valid)? {
             Some(location) if !blocked => location,
@@ -524,8 +527,9 @@ pub(super) fn observe_paths(
             index: item.index,
             worktree: worktree_entry,
             directory: item.directory,
-            parents: item.parents,
-            blocked: item.blocked,
+            parents: item.chain.existing,
+            parent_permissions: item.chain.permissions,
+            blocked: item.chain.blocked,
             index_beneath: beneath.get(&valid.bytes).copied().unwrap_or(0),
             indexed_parent: parent_paths(&valid.bytes)
                 .find(|parent| above.contains(*parent))
@@ -578,17 +582,26 @@ fn indexed_parents(worktree: &Path, paths: &[WorktreePath]) -> Result<HashSet<Ve
 /// How many of `path`'s parent folders exist as real folders, counted from
 /// the top, and whether the first that does not is a file or a link rather
 /// than missing.
-fn parent_chain(worktree: &Path, path: &WorktreePath) -> Result<(usize, bool), String> {
+fn parent_chain(worktree: &Path, path: &WorktreePath) -> Result<ParentChain, String> {
     let parents = &path.components[..path.components.len().saturating_sub(1)];
+    let mut chain = ParentChain {
+        existing: 0,
+        blocked: false,
+        permissions: Vec::new(),
+    };
     let mut current = worktree.to_path_buf();
-    for (depth, component) in parents.iter().enumerate() {
+    for component in parents {
         current.push(component);
         match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_dir() => {}
-            Ok(_) => return Ok((depth, true)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((depth, false))
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                chain.existing += 1;
+                chain.permissions.extend(permission_bits(&metadata));
             }
+            Ok(_) => {
+                chain.blocked = true;
+                return Ok(chain);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(chain),
             Err(error) => {
                 return Err(format!(
                     "{} could not be inspected: {error}",
@@ -597,7 +610,15 @@ fn parent_chain(worktree: &Path, path: &WorktreePath) -> Result<(usize, bool), S
             }
         }
     }
-    Ok((parents.len(), false))
+    Ok(chain)
+}
+
+/// The folders above a path that exist as real folders, from the top.
+struct ParentChain {
+    existing: usize,
+    /// The first one that does not is a file or a link rather than missing.
+    blocked: bool,
+    permissions: Vec<u32>,
 }
 
 #[cfg(unix)]
@@ -1746,9 +1767,10 @@ fn apply_restore(
 ) -> Result<(), String> {
     // Everything in the way goes first: removed files, then empty folders
     // where files go back, before any file or index entry is written.
+    let mut folders = Vec::new();
     for (saved, current) in changed {
         if saved.worktree.is_none() && current.worktree.is_some() {
-            restore_worktree_entry(worktree, saved)?;
+            restore_worktree_entry(worktree, saved, &mut folders)?;
         }
     }
     for (saved, current) in changed {
@@ -1758,8 +1780,15 @@ fn apply_restore(
     }
     for (saved, current) in changed {
         if saved.worktree.is_some() && saved.worktree != current.worktree {
-            restore_worktree_entry(worktree, saved)?;
+            restore_worktree_entry(worktree, saved, &mut folders)?;
         }
+    }
+    // Recreated folders get their permissions once everything inside them is
+    // written, deepest first, so even a folder that is not writable is filled.
+    folders.sort_by_key(|(folder, _)| std::cmp::Reverse(folder.components().count()));
+    for (folder, mode) in folders {
+        set_folder_permissions(&folder, mode)
+            .map_err(|error| format!("{} could not be restored: {error}", folder.display()))?;
     }
     let absent = "0".repeat(point.oid.len());
     // Every changed path's entries are removed before any saved entry is
@@ -1878,7 +1907,13 @@ fn config_bool(worktree: &Path, key: &str, default: bool) -> Result<bool, String
     }
 }
 
-fn restore_worktree_entry(worktree: &Path, saved: &PathState) -> Result<(), String> {
+/// Writes `saved` back, adding the folders it recreates, with the
+/// permissions they had, to `folders`.
+fn restore_worktree_entry(
+    worktree: &Path,
+    saved: &PathState,
+    folders: &mut Vec<(PathBuf, u32)>,
+) -> Result<(), String> {
     let path = &saved.path;
     let valid = WorktreePath::new(path)?;
     let Some(entry) = &saved.worktree else {
@@ -1888,7 +1923,15 @@ fn restore_worktree_entry(worktree: &Path, saved: &PathState) -> Result<(), Stri
         }
         return Ok(());
     };
-    let target = prepare_path(worktree, &valid, &path.display, &mut Vec::new())?;
+    let mut created = Vec::new();
+    let target = prepare_path(worktree, &valid, &path.display, &mut created)?;
+    // The recreated folders are the deepest of the path's parents.
+    let first = valid.components.len() - 1 - created.len();
+    for (depth, folder) in (first..).zip(created) {
+        if let Some(mode) = saved.parent_permissions.get(depth) {
+            folders.push((folder, *mode));
+        }
+    }
     if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.file_type().is_dir()) {
         return Err(format!(
             "{} is now a directory, so Repola will not replace it.",
@@ -2098,6 +2141,18 @@ fn set_permissions(file: &fs::File, entry: &WorktreeEntry) -> std::io::Result<()
     };
     permissions.set_mode(mode);
     file.set_permissions(permissions)
+}
+
+#[cfg(unix)]
+fn set_folder_permissions(folder: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(folder, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(windows)]
+fn set_folder_permissions(_folder: &Path, _mode: u32) -> std::io::Result<()> {
+    // Windows records no permission bits to restore.
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -2532,6 +2587,7 @@ mod tests {
             }),
             directory: false,
             parents: 0,
+            parent_permissions: Vec::new(),
             blocked: false,
             index_beneath: 0,
             indexed_parent: None,
@@ -2752,6 +2808,7 @@ mod tests {
                 }),
                 directory: false,
                 parents: 0,
+                parent_permissions: Vec::new(),
                 blocked: false,
                 index_beneath: 0,
                 indexed_parent: None,
@@ -2798,6 +2855,7 @@ mod tests {
             }),
             directory: false,
             parents: 0,
+            parent_permissions: Vec::new(),
             blocked: false,
             index_beneath: 0,
             indexed_parent: None,

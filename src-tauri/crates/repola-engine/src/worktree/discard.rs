@@ -1523,8 +1523,13 @@ mod tests {
             std::fs::Permissions::from_mode(0o600),
         )
         .expect("private");
+        // Discarding its only file removes this private folder too.
+        write(&path, "private/notes.txt", b"secret\n");
+        std::fs::set_permissions(path.join("private"), std::fs::Permissions::from_mode(0o700))
+            .expect("private folder");
 
         let discarded = discard(&path, DiscardTarget::All);
+        assert!(!path.join("private").exists());
         restore(&path, &discarded.recovery_point);
         let mode = std::fs::metadata(path.join(".env.local"))
             .expect("restored")
@@ -1532,6 +1537,11 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600);
         assert!(path.join("old/dir").is_dir());
+        let folder = std::fs::metadata(path.join("private"))
+            .expect("recreated")
+            .permissions()
+            .mode();
+        assert_eq!(folder & 0o777, 0o700);
     }
 
     #[test]
