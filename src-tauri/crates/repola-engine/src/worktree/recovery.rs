@@ -165,6 +165,11 @@ pub(super) struct WorktreeEntry {
     /// private file. Unix only; links have none of their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<u32>,
+    /// A link made as a link to a folder. Windows records links to files and
+    /// to folders differently, so a restore makes the same kind whatever its
+    /// target is by then.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub directory_link: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,7 +437,8 @@ pub(super) fn observe_paths(
 
     enum Source {
         File(OsString),
-        Link(Vec<u8>),
+        /// A link's target, and whether it was made as a link to a folder.
+        Link(Vec<u8>, bool),
     }
     struct Observed {
         index: Vec<IndexEntry>,
@@ -500,7 +506,12 @@ pub(super) fn observe_paths(
                 .map_err(|error| format!("{} could not be read: {error}", path.display))?;
             let target = link_target_bytes(target, &path.display)?;
             let size = target.len() as u64;
-            (WorktreeEntryKind::Symlink, size, None, Source::Link(target))
+            (
+                WorktreeEntryKind::Symlink,
+                size,
+                None,
+                Source::Link(target, is_directory_link(&metadata)),
+            )
         } else if file_type.is_file() {
             let kind = if is_executable(&metadata, &item.index) {
                 WorktreeEntryKind::Executable
@@ -535,17 +546,19 @@ pub(super) fn observe_paths(
         let worktree_entry = match item.entry {
             None => None,
             Some((kind, size, permissions, source)) => {
+                let directory_link = matches!(source, Source::Link(_, true));
                 let oid = match source {
                     Source::File(_) => file_oids
                         .next()
                         .ok_or_else(|| "Git did not hash every working-tree file.".to_string())?,
-                    Source::Link(target) => hash_bytes(worktree, &target, store)?,
+                    Source::Link(target, _) => hash_bytes(worktree, &target, store)?,
                 };
                 Some(WorktreeEntry {
                     kind,
                     oid,
                     size,
                     permissions,
+                    directory_link,
                 })
             }
         };
@@ -750,6 +763,18 @@ fn entry_identity(
         .map(|stored| folder.join(stored).into_os_string())
         .into_iter()
         .collect())
+}
+
+#[cfg(windows)]
+fn is_directory_link(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::FileTypeExt;
+    metadata.file_type().is_symlink_dir()
+}
+
+/// Unix links have no kind of their own.
+#[cfg(unix)]
+fn is_directory_link(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -2123,7 +2148,7 @@ fn restore_worktree_entry(
             ["cat-file", "blob", &entry.oid],
             "read the saved link",
         )?;
-        replace_with_symlink(&target, &link, &path.display)
+        replace_with_symlink(&target, &link, entry.directory_link, &path.display)
     } else {
         replace_with_blob(worktree, entry, &target, &path.display)
     }
@@ -2338,9 +2363,14 @@ fn set_permissions(_file: &fs::File, _entry: &WorktreeEntry) -> std::io::Result<
     Ok(())
 }
 
-fn replace_with_symlink(target: &Path, link: &[u8], display: &str) -> Result<(), String> {
+fn replace_with_symlink(
+    target: &Path,
+    link: &[u8],
+    directory: bool,
+    display: &str,
+) -> Result<(), String> {
     let temporary = sibling_temporary(target)?;
-    let created = create_symlink(link, &temporary)
+    let created = create_symlink(link, &temporary, directory)
         .and_then(|()| replace(&temporary, target))
         .map_err(|error| error.to_string());
     if let Err(error) = created {
@@ -2350,22 +2380,20 @@ fn replace_with_symlink(target: &Path, link: &[u8], display: &str) -> Result<(),
     Ok(())
 }
 
+/// Unix links have no kind, so `_directory` does not matter.
 #[cfg(unix)]
-fn create_symlink(link: &[u8], path: &Path) -> std::io::Result<()> {
+fn create_symlink(link: &[u8], path: &Path, _directory: bool) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(link), path)
 }
 
+/// Makes the kind of link that was saved, a link to a folder or to a file.
 #[cfg(windows)]
-fn create_symlink(link: &[u8], path: &Path) -> std::io::Result<()> {
+fn create_symlink(link: &[u8], path: &Path, directory: bool) -> std::io::Result<()> {
     let link = std::str::from_utf8(link)
         .map_err(|_| std::io::Error::other("the saved link target is not valid Unicode"))?
         .replace('/', "\\");
-    // Like Git for Windows, link to a directory only when the target is one.
-    let points_at_directory = path
-        .parent()
-        .is_some_and(|parent| parent.join(&link).is_dir());
-    if points_at_directory {
+    if directory {
         std::os::windows::fs::symlink_dir(&link, path)
     } else {
         std::os::windows::fs::symlink_file(&link, path)
@@ -2761,6 +2789,7 @@ mod tests {
                 oid: hash_bytes(path, bytes, true).expect("blob"),
                 size: bytes.len() as u64,
                 permissions: None,
+                directory_link: false,
             }),
             directory: false,
             folder_permissions: None,
@@ -2983,6 +3012,7 @@ mod tests {
                     oid: blob.clone(),
                     size: 8,
                     permissions: None,
+                    directory_link: false,
                 }),
                 directory: false,
                 folder_permissions: None,
@@ -3031,6 +3061,7 @@ mod tests {
                 oid: saved,
                 size: 6,
                 permissions: None,
+                directory_link: false,
             }),
             directory: false,
             folder_permissions: None,
