@@ -34,8 +34,8 @@ use super::models::{
     RepositoryOperation, RestoreEffect, WorkingCopyRequest,
 };
 use super::working_copy::{
-    decode_path_token_bytes, hex, literal_pathspec, null_device, os_string_from_path_bytes,
-    working_copy_snapshot,
+    decode_path_token_bytes, git_path, hex, literal_pathspec, null_device,
+    os_string_from_path_bytes, working_copy_snapshot,
 };
 
 const RECOVERY_REF_NAMESPACE: &str = "refs/repola/discarded";
@@ -1416,7 +1416,14 @@ fn point_from_summary(id: String, oid: String, summary: Summary) -> RecoveryPoin
         worktree_path: summary.worktree_path,
         head: summary.head,
         path_count: summary.path_count,
-        paths: summary.paths,
+        // A sample's names are shown as their tokens spell them, so a crafted
+        // summary cannot list one file under another's name.
+        paths: summary
+            .paths
+            .iter()
+            .filter_map(|path| decode_path_token_bytes(&path.token).ok())
+            .map(|bytes| git_path(&bytes))
+            .collect(),
         stored_bytes: summary.stored_bytes,
     }
 }
@@ -1682,7 +1689,11 @@ fn verify_manifest(worktree: &Path, tree: &str, states: &[PathState]) -> Result<
     let mut seen = HashSet::new();
     for state in states {
         WorktreePath::new(&state.path)?;
-        if !seen.insert(state.path.token.as_str()) {
+        // Reviews show a path's name and restores act on its token, so the
+        // two must agree, and a token has one spelling so no path is saved
+        // twice under two.
+        let bytes = decode_path_token_bytes(&state.path.token)?;
+        if state.path != git_path(&bytes) || !seen.insert(state.path.token.as_str()) {
             return Err(damaged());
         }
         let path = decode_path_token_bytes(&state.path.token)?;
@@ -3131,6 +3142,79 @@ mod tests {
         );
         let error = plan(&path, &point).expect_err("damaged");
         assert!(error.contains("damaged"), "{error}");
+    }
+
+    #[test]
+    fn a_manifest_naming_one_file_under_another_is_refused() {
+        let (_directory, path) = repository();
+        fs::write(path.join(".env"), b"secret\n").expect("write");
+        let saved = hash_bytes(&path, b"replacement\n", true).expect("saved");
+        let disguised = |path: GitPath| PathState {
+            path,
+            index: Vec::new(),
+            worktree: Some(WorktreeEntry {
+                kind: WorktreeEntryKind::File,
+                oid: saved.clone(),
+                size: 12,
+                permissions: None,
+                directory_link: false,
+            }),
+            directory: false,
+            folder_permissions: None,
+            parents: 0,
+            parent_permissions: Vec::new(),
+            blocked: false,
+            index_beneath: 0,
+            indexed_parent: None,
+        };
+        // A harmless name over `.env`'s token, and `.env`'s token spelled in
+        // capitals.
+        for (index, crafted) in [
+            GitPath {
+                display: "harmless.txt".into(),
+                token: git_path(b".env").token,
+            },
+            GitPath {
+                display: ".env".into(),
+                token: git_path(b".env").token.to_uppercase(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let point = craft(
+                &path,
+                &format!("disguised-{index}"),
+                &manifest_for(&[disguised(crafted)]),
+                &[("100644", saved.clone(), b"worktree/.env".to_vec())],
+            );
+            let error = plan(&path, &point).expect_err("disguised");
+            assert!(
+                error.contains("damaged") || error.contains("malformed"),
+                "{error}"
+            );
+        }
+        assert_eq!(fs::read(path.join(".env")).expect("read"), b"secret\n");
+    }
+
+    #[test]
+    fn a_listed_sample_is_named_as_its_token_spells_it() {
+        let summary = Summary {
+            version: MANIFEST_VERSION,
+            kind: RecoveryPointKind::DiscardFile,
+            summary: "Crafted".into(),
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            worktree_path: "/repo".into(),
+            head: None,
+            path_count: 1,
+            paths: vec![GitPath {
+                display: "harmless.txt".into(),
+                token: git_path(b".env").token,
+            }],
+            stored_bytes: 0,
+        };
+        let point = point_from_summary("id".into(), "oid".into(), summary);
+        assert_eq!(point.paths, [git_path(b".env")]);
     }
 
     #[test]
