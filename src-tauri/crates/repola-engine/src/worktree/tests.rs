@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use super::actions::{execute_action, prepare_action};
+use super::actions::{execute_action, prepare_action, review_worktree};
 use super::discovery::{parse_worktree_porcelain, remote_provider, scan};
 use super::inspection::{parse_status_porcelain, registration_state};
 use super::models::{
@@ -389,6 +389,46 @@ fn removal_reviews_the_branch_from_a_checkout_that_still_exists() {
         .follow_up
         .expect("the retained branch is offered for review");
     assert_eq!(Path::new(&follow_up.worktree_path), kept);
+}
+
+#[test]
+fn a_retained_branch_is_reviewed_only_from_a_checkout_git_can_work_in() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let root = dunce::canonicalize(temp.path()).expect("canonical temp path");
+    let source = fixture_repository(&root);
+    let bare = root.join("bare.git");
+    git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            source.to_str().expect("UTF-8 source path"),
+            bare.to_str().expect("UTF-8 bare path"),
+        ],
+    );
+    // Inside another repository, which Git finds once the `.git` file is gone.
+    let hollow = source.join("hollow");
+    let hollow_path = hollow.to_str().expect("UTF-8 hollow path");
+    git(&bare, &["worktree", "add", "--detach", hollow_path, "main"]);
+    git(&bare, &["worktree", "lock", hollow_path]);
+    std::fs::remove_file(hollow.join(".git")).expect("remove the .git file");
+    assert_eq!(review_worktree(&bare), None);
+
+    let kept = root.join("kept");
+    git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            kept.to_str().expect("UTF-8 kept path"),
+            "main",
+        ],
+    );
+    assert_eq!(
+        review_worktree(&bare).map(std::path::PathBuf::from),
+        Some(kept)
+    );
 }
 
 fn fixture_repository(root: &Path) -> std::path::PathBuf {

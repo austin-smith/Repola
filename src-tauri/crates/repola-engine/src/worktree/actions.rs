@@ -145,16 +145,37 @@ fn plan_for_record(
 }
 
 /// The worktree a retained branch is reviewed from once its own worktree is
-/// gone: the first remaining checkout, which is the primary one when it has one.
-fn review_worktree(repository: &Path) -> Option<String> {
+/// gone: the first remaining checkout Git can work in, which is the primary one
+/// when it has one.
+pub(super) fn review_worktree(repository: &Path) -> Option<String> {
+    let common_dir = canonical_git_path(repository, "--git-common-dir")?;
     list_worktrees(repository)
         .ok()?
         .into_iter()
-        // A locked worktree whose directory is gone is not marked prunable.
+        .filter(|seed| seed.head.is_some() && seed.prunable_reason.is_none())
+        // A locked worktree is never marked prunable, even once its directory
+        // or its `.git` file is gone. Git run in what is left finds an
+        // enclosing repository, or none.
         .find(|seed| {
-            seed.head.is_some() && seed.prunable_reason.is_none() && Path::new(&seed.path).is_dir()
+            let Ok(path) = dunce::canonicalize(&seed.path) else {
+                return false;
+            };
+            canonical_git_path(&path, "--show-toplevel").as_ref() == Some(&path)
+                && canonical_git_path(&path, "--git-common-dir").as_ref() == Some(&common_dir)
         })
         .map(|seed| seed.path)
+}
+
+/// The path `git rev-parse --path-format=absolute <option>` prints in
+/// `directory`, canonicalized.
+fn canonical_git_path(directory: &Path, option: &str) -> Option<PathBuf> {
+    let output =
+        command::git_at(directory, ["rev-parse", "--path-format=absolute", option]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let printed = String::from_utf8(output.stdout).ok()?;
+    dunce::canonicalize(printed.strip_suffix('\n')?).ok()
 }
 
 fn remove_plan(
