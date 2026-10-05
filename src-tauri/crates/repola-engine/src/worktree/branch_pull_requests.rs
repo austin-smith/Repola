@@ -46,8 +46,9 @@ pub(crate) fn branch_pull_requests(
         },
         ..location
     };
-    if let Some(repository) = github_repository(&location) {
-        let withheld = withheld_github_tokens(&repository.host, std::env::var("GH_HOST").ok());
+    let gh_host = std::env::var("GH_HOST").ok();
+    if let Some(repository) = github_repository(&location, gh_host.as_deref()) {
+        let withheld = withheld_github_tokens(&repository.host, gh_host);
         return checked(
             RemoteProvider::GitHub,
             ask(
@@ -246,12 +247,14 @@ struct GitHubRepository {
 }
 
 /// GitHub.com, GitHub Enterprise Cloud (`*.ghe.com`), or a GitHub Enterprise
-/// Server whose host has a `github` label, as in `github.example.com`.
-fn github_repository(location: &RemoteLocation) -> Option<GitHubRepository> {
+/// Server: the host `gh_host` (`GH_HOST`) names, or one with a `github` label,
+/// as in `github.example.com`.
+fn github_repository(location: &RemoteLocation, gh_host: Option<&str>) -> Option<GitHubRepository> {
     let host = location.host.as_str();
     let is_github = host == "github.com"
         || host.ends_with(".ghe.com")
-        || host.split('.').any(|label| label == "github");
+        || host.split('.').any(|label| label == "github")
+        || gh_host.is_some_and(|gh_host| gh_host.trim().eq_ignore_ascii_case(host));
     if !is_github {
         return None;
     }
@@ -582,7 +585,7 @@ mod tests {
 
     #[test]
     fn asks_only_hosts_that_are_github() {
-        let found = |url: &str| github_repository(&location(url)).map(|found| found.host);
+        let found = |url: &str| github_repository(&location(url), None).map(|found| found.host);
         assert_eq!(
             found("git@ssh.github.com:octo/app.git"),
             Some("github.com".into())
@@ -598,6 +601,16 @@ mod tests {
         assert_eq!(found("https://notgithub.com/octo/app.git"), None);
         assert_eq!(found("https://gitlab.com/octo/app.git"), None);
         assert_eq!(found("https://github.com/octo/app/extra"), None);
+        // An Enterprise Server on any host name, once `GH_HOST` names it.
+        assert_eq!(found("https://git.company.com/team/app.git"), None);
+        assert_eq!(
+            github_repository(
+                &location("https://git.company.com/team/app.git"),
+                Some("Git.Company.com")
+            )
+            .map(|found| found.host),
+            Some("git.company.com".into())
+        );
     }
 
     #[test]
