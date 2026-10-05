@@ -774,26 +774,23 @@ fn delete_remote(
         Err(error) => return failed(error.to_string()),
     };
     let diagnostic = combined_output(&output.stdout, &output.stderr);
+    // Git exits successfully only once the remote deleted the branch.
+    if output.status.success() {
+        return RemoteDeletion {
+            outcome: RemoteOutcome::Deleted,
+            output: diagnostic,
+        };
+    }
     let report = String::from_utf8_lossy(&output.stdout);
     match reported_deletion(&report, &remote.remote_ref) {
-        Some(true) => {
-            return RemoteDeletion {
-                outcome: RemoteOutcome::Deleted,
-                output: diagnostic,
-            }
-        }
         // The lease rejects a branch that moved and one that is gone alike.
         Some(false) if report.contains("(stale info)") => {}
         Some(false) => return failed(diagnostic),
-        // No status for the branch: the push may have failed before sending
-        // anything, or lost the server's report after it deleted the branch.
-        None if output.status.success() => {
-            return RemoteDeletion {
-                outcome: RemoteOutcome::Deleted,
-                output: diagnostic,
-            }
-        }
-        None => {
+        // No status for the branch, or a deletion line from a push that still
+        // failed, which a pre-push hook can print: the push may have failed
+        // before sending anything, or lost the server's report after it
+        // deleted the branch.
+        Some(true) | None => {
             return match remote_has(worktree, &remote.remote, &remote.remote_ref) {
                 Ok(true) => failed(diagnostic),
                 Ok(false) => RemoteDeletion {
@@ -3464,6 +3461,18 @@ mod tests {
         failing_pre_push(&fixture.repository, ":");
         execute(&plan, None).expect_err("the remote still has the branch");
         assert!(fixture.remote_has_branch("kept"));
+
+        // A hook that prints Git's deletion line and then stops the push.
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "claimed"]);
+        git(&fixture.repository, &["push", "origin", "claimed"]);
+        let plan = fixture.plan("refs/remotes/origin/claimed", false, true);
+        failing_pre_push(
+            &fixture.repository,
+            "printf '%s\\t%s\\t%s\\n' - :refs/heads/claimed '[deleted]'",
+        );
+        execute(&plan, None).expect_err("the hook stopped the push");
+        assert!(fixture.remote_has_branch("claimed"));
 
         // Gone: the report was lost, but the branch was deleted.
         let fixture = Fixture::new();
