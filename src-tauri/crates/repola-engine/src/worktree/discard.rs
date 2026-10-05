@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Duration;
 
 use super::command;
 use super::models::{
@@ -23,6 +24,11 @@ use super::recovery::{
     CHANGED_WHILE_SAVING, MAX_LISTED_BYTES,
 };
 use super::working_copy::{decode_path_token_bytes, ensure_success, working_copy_snapshot};
+
+/// Writing the discarded files back runs Git's filters over content of any
+/// size, so it may take as long as a remote discard is waited for rather than
+/// the usual limit for one Git command.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
 const STALE_PLAN: &str =
     "The working copy changed after this discard was reviewed. Nothing was discarded; review it again.";
@@ -557,7 +563,7 @@ fn execute(worktree: &Path, planned: &Planned) -> Result<(), String> {
         // Without `-u` it leaves the index alone, so a run cut short never
         // leaves the index locked; the refresh afterwards records the written
         // files' stat data.
-        let output = command::git_at_with_input(
+        let output = command::git_at_with_input_timeout(
             worktree,
             [
                 "checkout-index",
@@ -567,6 +573,7 @@ fn execute(worktree: &Path, planned: &Planned) -> Result<(), String> {
                 "--stdin",
             ],
             &planned.checkout,
+            WRITE_TIMEOUT,
         )
         .map_err(|error| error.to_string())?;
         ensure_success(output, "write the restored files")?;

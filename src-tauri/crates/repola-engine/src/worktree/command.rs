@@ -534,6 +534,23 @@ where
     launch("git", command, Some(input))
 }
 
+/// Like `git_at_with_input`, with a time limit of its own for a step that
+/// handles content of any size.
+pub(crate) fn git_at_with_input_timeout<I, S>(
+    path: &Path,
+    args: I,
+    input: &[u8],
+    timeout: Duration,
+) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = command("git")?;
+    command.arg("-C").arg(path).args(args);
+    launch_with_timeout("git", command, Some(input), timeout)
+}
+
 pub fn git_at_with_env<I, S, E, K, V>(
     path: &Path,
     args: I,
