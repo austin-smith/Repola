@@ -288,6 +288,12 @@ impl WorktreePath {
             {
                 return Err(unsafe_path());
             }
+            if !fits_in_one_name(component) {
+                return Err(format!(
+                    "{} has a name too long for this file system, so Repola will not change it. Rename it with Git first.",
+                    path.display
+                ));
+            }
             if !stored_as_named(component) {
                 return Err(format!(
                     "{} cannot be stored under that name on Windows, so Repola will not change it. Rename it with Git on a system that allows the name.",
@@ -323,6 +329,58 @@ fn has_platform_separator(component: &[u8]) -> bool {
 #[cfg(not(windows))]
 fn has_platform_separator(_component: &[u8]) -> bool {
     false
+}
+
+/// File systems store at most 255 units in one name: UTF-16 units on Windows
+/// and macOS, bytes elsewhere.
+fn fits_in_one_name(component: &[u8]) -> bool {
+    const MAX_NAME_UNITS: usize = 255;
+    if cfg!(any(windows, target_os = "macos")) {
+        String::from_utf8_lossy(component).encode_utf16().count() <= MAX_NAME_UNITS
+    } else {
+        component.len() <= MAX_NAME_UNITS
+    }
+}
+
+/// Whether Git reaches paths of any length here. Unless `core.longpaths` is
+/// on, Git for Windows reaches no file of `MAX_PATH` UTF-16 units or more,
+/// counted from the drive, and creates no folder of `MAX_PATH - 12` or more.
+pub(super) fn long_paths(worktree: &Path) -> Result<bool, String> {
+    Ok(!cfg!(windows) || config_bool(worktree, "core.longpaths", false)?)
+}
+
+const MAX_PATH: usize = 260;
+
+/// Whether Git can reach the file at `path` in `worktree`.
+pub(super) fn git_can_reach(worktree: &Path, path: &[u8], long_paths: bool) -> bool {
+    long_paths || windows_path_units(worktree, path) < MAX_PATH
+}
+
+/// Whether Git can write the file at `path` in `worktree`, creating the
+/// folders on the way that are missing below the first `existing_parents`.
+pub(super) fn git_can_write(
+    worktree: &Path,
+    path: &[u8],
+    existing_parents: usize,
+    long_paths: bool,
+) -> bool {
+    let folders = path.iter().filter(|&&byte| byte == b'/').count();
+    let deepest = path.iter().rposition(|&byte| byte == b'/').unwrap_or(0);
+    git_can_reach(worktree, path, long_paths)
+        && (long_paths
+            || existing_parents >= folders
+            || windows_path_units(worktree, &path[..deepest]) < MAX_PATH - 12)
+}
+
+/// The length of `path` inside `worktree` as Windows counts it, from the drive.
+fn windows_path_units(worktree: &Path, path: &[u8]) -> usize {
+    worktree
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .count()
+        + 1
+        + String::from_utf8_lossy(path).encode_utf16().count()
 }
 
 /// Whether this platform stores a path component under exactly that name.
@@ -1944,8 +2002,19 @@ fn refuse_unsafe_restore(
         .iter()
         .map(|state| decode_path_token_bytes(&state.path.token))
         .collect::<Result<Vec<_>, _>>()?;
+    let long_paths = long_paths(worktree)?;
     let mut removals = Removals::default();
     for ((saved, current), path) in saved.iter().zip(current).zip(&paths) {
+        // Intent-to-add entries go back through `git add -N`, which must find
+        // the file where Git can reach it.
+        let adds_intent =
+            saved.index != current.index && saved.index.iter().any(|entry| entry.intent_to_add);
+        if adds_intent && !git_can_reach(worktree, path, long_paths) {
+            return Err(format!(
+                "{} is too long a path for Git to reach on Windows. Turn on core.longpaths, or move the working copy to a shorter folder, then review the restore again.",
+                saved.path.display
+            ));
+        }
         if saved.worktree.is_none() && current.worktree.is_some() {
             removals.files.insert(path);
         }
@@ -3835,6 +3904,35 @@ mod tests {
         ];
         let error = observe_paths(&path, None, &paths, false).expect_err("one name");
         assert!(error.contains("spelled differently"), "{error}");
+    }
+
+    #[test]
+    fn names_and_paths_too_long_to_write_are_recognized() {
+        // 255 two-byte characters are 255 UTF-16 units but 510 bytes.
+        let accented = "\u{e9}".repeat(255);
+        assert!(fits_in_one_name("a".repeat(255).as_bytes()));
+        assert!(!fits_in_one_name("a".repeat(256).as_bytes()));
+        assert_eq!(
+            fits_in_one_name(accented.as_bytes()),
+            cfg!(any(windows, target_os = "macos"))
+        );
+        let worktree = Path::new("C:\\repo");
+        let fits = "a".repeat(259 - 8);
+        assert_eq!(windows_path_units(worktree, fits.as_bytes()), 259);
+        assert!(git_can_write(worktree, fits.as_bytes(), 0, false));
+        let long = format!("{fits}b");
+        assert!(!git_can_reach(worktree, long.as_bytes(), false));
+        assert!(!git_can_write(worktree, long.as_bytes(), 0, false));
+        assert!(git_can_write(worktree, long.as_bytes(), 0, true));
+        // Folders Git has to create stay under 248 units.
+        let nested = format!("{}/{}", "a".repeat(247 - 8), "b".repeat(10));
+        assert_eq!(windows_path_units(worktree, &nested.as_bytes()[..239]), 247);
+        assert!(git_can_write(worktree, nested.as_bytes(), 0, false));
+        let deeper = format!("{}/{}", "a".repeat(248 - 8), "b".repeat(10));
+        assert!(git_can_reach(worktree, deeper.as_bytes(), false));
+        assert!(!git_can_write(worktree, deeper.as_bytes(), 0, false));
+        assert!(git_can_write(worktree, deeper.as_bytes(), 1, false));
+        assert!(git_can_write(worktree, deeper.as_bytes(), 0, true));
     }
 
     #[test]

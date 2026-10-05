@@ -17,10 +17,10 @@ use super::models::{
     RecoveryPointKind, WorkingCopyRequest, WorkingCopySnapshot,
 };
 use super::recovery::{
-    create_recovery_point, file_folder_conflict, fingerprint, head_entries, keep_within,
-    observe_paths, prepare_recovery_point, push_index_info, remove_empty_directory,
-    remove_worktree_entry, store_contents, stored_bytes, HeadEntry, PathState, Removals,
-    CHANGED_WHILE_SAVING, CHANGE_TIMEOUT, MAX_LISTED_BYTES,
+    create_recovery_point, file_folder_conflict, fingerprint, git_can_write, head_entries,
+    keep_within, long_paths, observe_paths, prepare_recovery_point, push_index_info,
+    remove_empty_directory, remove_worktree_entry, store_contents, stored_bytes, HeadEntry,
+    PathState, Removals, CHANGED_WHILE_SAVING, CHANGE_TIMEOUT, MAX_LISTED_BYTES,
 };
 use super::working_copy::{decode_path_token_bytes, ensure_success, working_copy_snapshot};
 
@@ -213,6 +213,7 @@ fn plan(snapshot: &WorkingCopySnapshot, target: &DiscardTarget) -> Result<Planne
         .map(|target| target.path.clone())
         .collect();
     let observed = observe_paths(worktree, head, &paths, false)?;
+    let long_paths = long_paths(worktree)?;
     let heads = match head {
         Some(head) => head_entries(worktree, head, &paths)?,
         None => HashMap::new(),
@@ -298,6 +299,12 @@ fn plan(snapshot: &WorkingCopySnapshot, target: &DiscardTarget) -> Result<Planne
             candidate.effect,
             DiscardEffect::RestoreCommitted | DiscardEffect::RestoreCommittedStaged
         );
+        if writes_disk && !git_can_write(worktree, &candidate.bytes, state.parents, long_paths) {
+            return Err(format!(
+                "{} is too long a path for Git to write on Windows. Turn on core.longpaths, or move the working copy to a shorter folder, then review the discard again.",
+                state.path.display
+            ));
+        }
         if writes_disk || writes_index {
             if writes_disk && state.directory && !removals.empties_folder(worktree, &state.path)? {
                 keep_or_refuse(
@@ -1692,6 +1699,104 @@ mod tests {
         git(&path, &["config", "filter.strict.smudge", "cat"]);
         restore(&path, &points[0]);
         assert_eq!(exact_state(&path), before);
+    }
+
+    #[test]
+    fn a_name_too_long_to_write_back_is_refused_before_anything_changes() {
+        let directory = repository();
+        let path = root(&directory);
+        write(&path, "kept.txt", b"kept\n");
+        git(&path, &["add", "kept.txt"]);
+        git(&path, &["commit", "-m", "base"]);
+        // Git records a name no file system here can hold, staged for deletion.
+        let blob = git(&path, &["hash-object", "-w", "kept.txt"]);
+        let long = "a".repeat(256);
+        record_entry(&path, &format!("100644 {}\t{long}", blob.trim()));
+        git(&path, &["commit", "-m", "long name"]);
+        git(&path, &["rm", "--cached", "--quiet", &long]);
+        let before = git(&path, &["ls-files", "--stage"]);
+
+        let request = request(&path);
+        let error = plan_discard(DiscardPlanRequest {
+            repository_path: request.repository_path,
+            worktree_path: request.worktree_path,
+            target: DiscardTarget::All,
+        })
+        .expect_err("name too long");
+        assert!(error.contains("Rename it with Git first"), "{error}");
+        assert_eq!(git(&path, &["ls-files", "--stage"]), before);
+    }
+
+    fn record_entry(path: &Path, entry: &str) {
+        let output =
+            command::git_at_with_input(path, ["update-index", "--index-info"], entry.as_bytes())
+                .expect("record entry");
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    /// A path of 302 characters, past what Git for Windows reaches without
+    /// `core.longpaths`, in folders whose names each fit.
+    #[cfg(windows)]
+    fn too_long_a_path() -> String {
+        ["d", "e", "f"].map(|letter| letter.repeat(100)).join("/")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_path_git_cannot_write_back_is_refused_before_anything_changes() {
+        let directory = repository();
+        let path = root(&directory);
+        git(&path, &["config", "core.longpaths", "false"]);
+        write(&path, "kept.txt", b"kept\n");
+        git(&path, &["add", "kept.txt"]);
+        git(&path, &["commit", "-m", "base"]);
+        let blob = git(&path, &["hash-object", "-w", "kept.txt"]);
+        let long = too_long_a_path();
+        record_entry(&path, &format!("100644 {}\t{long}", blob.trim()));
+        git(&path, &["commit", "-m", "long path"]);
+        git(&path, &["rm", "--cached", "--quiet", &long]);
+        let before = git(&path, &["ls-files", "--stage"]);
+
+        let request = request(&path);
+        let error = plan_discard(DiscardPlanRequest {
+            repository_path: request.repository_path,
+            worktree_path: request.worktree_path,
+            target: DiscardTarget::All,
+        })
+        .expect_err("path too long");
+        assert!(error.contains("core.longpaths"), "{error}");
+        assert_eq!(git(&path, &["ls-files", "--stage"]), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_intent_git_cannot_reach_is_refused_before_restoring() {
+        let directory = repository();
+        let path = root(&directory);
+        git(&path, &["config", "core.longpaths", "true"]);
+        write(&path, "kept.txt", b"kept\n");
+        git(&path, &["add", "kept.txt"]);
+        git(&path, &["commit", "-m", "base"]);
+        let long = too_long_a_path();
+        write(&path, &long, b"intended\n");
+        git(&path, &["add", "--intent-to-add", &long]);
+        let point = discard(&path, DiscardTarget::All).recovery_point;
+        git(&path, &["config", "core.longpaths", "false"]);
+        let before = git(&path, &["ls-files", "--stage"]);
+
+        let request = request(&path);
+        let error = plan_recovery_restore(RecoveryPointRequest {
+            repository_path: request.repository_path,
+            worktree_path: request.worktree_path,
+            point: RecoveryPointReference {
+                id: point.id.clone(),
+                oid: point.oid.clone(),
+            },
+        })
+        .expect_err("path too long");
+        assert!(error.contains("core.longpaths"), "{error}");
+        assert_eq!(git(&path, &["ls-files", "--stage"]), before);
+        assert!(!path.join(&long).exists());
     }
 
     #[test]
