@@ -107,15 +107,19 @@ export interface DeletionNotice {
 export function deletionNotice(result: BranchDeletionResult): DeletionNotice {
   const steps = [result.local, result.remote].flatMap((step) => (step ? [step] : []));
   const problems = steps.flatMap((step) => [step.succeeded ? "" : step.output, step.warning ?? ""]).filter(Boolean);
-  const finish = steps.flatMap((step) => step.finishCommands).join("; ");
-  const recovery = steps.flatMap((step) => step.recoveryCommands).join("; ");
   const description = [
     ...problems,
-    finish && `To finish: ${finish}`,
-    recovery && `To restore: ${recovery}`,
+    commandSteps("To finish", steps.flatMap((step) => step.finishCommands)),
+    commandSteps("To restore", steps.flatMap((step) => step.recoveryCommands)),
     result.auditWarning && `Audit warning: ${result.auditWarning}`,
   ].filter(Boolean).join(" ");
   return { type: problems.length > 0 ? "warning" : "success", title: result.message, description: description || undefined };
+}
+
+/** `commands` labeled with their `purpose`, numbered when there are several, since each must run only after the one before it succeeded. */
+function commandSteps(purpose: string, commands: string[]): string {
+  if (commands.length < 2) return commands.map((command) => `${purpose}: ${command}`).join("");
+  return `${purpose}, run in order and stop if one fails: ${commands.map((command, index) => `${index + 1}. ${command}`).join("; ")}`;
 }
 
 /** Why `executeBranchDeletion` rejected, and whether the deletion may have happened anyway. */

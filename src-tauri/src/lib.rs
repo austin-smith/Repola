@@ -1541,18 +1541,16 @@ impl AuditEntry {
                     .into_iter()
                     .flatten()
                     .collect();
-                let finish = steps
+                let finish: Vec<&str> = steps
                     .iter()
                     .flat_map(|step| &step.finish_commands)
                     .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                let restore = steps
+                    .collect();
+                let restore: Vec<&str> = steps
                     .iter()
                     .flat_map(|step| &step.recovery_commands)
                     .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join("; ");
+                    .collect();
                 (
                     steps.iter().all(|step| step.succeeded),
                     !steps.iter().any(|step| step.unconfirmed),
@@ -1565,8 +1563,8 @@ impl AuditEntry {
                                 .map(|step| step.output.clone()),
                         )
                         .chain(steps.iter().filter_map(|step| step.warning.clone()))
-                        .chain((!finish.is_empty()).then(|| format!("To finish: {finish}")))
-                        .chain((!restore.is_empty()).then(|| format!("To restore: {restore}")))
+                        .chain(command_steps("To finish", &finish))
+                        .chain(command_steps("To restore", &restore))
                         .collect::<Vec<_>>()
                         .join(" "),
                 )
@@ -1624,6 +1622,24 @@ impl AuditEntry {
                 outcome_unknown: !outcome_known,
             }),
         }
+    }
+}
+
+/// `commands` labeled with their `purpose`, numbered when there are several,
+/// since each must run only after the one before it succeeded.
+fn command_steps(purpose: &str, commands: &[&str]) -> Option<String> {
+    match commands {
+        [] => None,
+        [command] => Some(format!("{purpose}: {command}")),
+        _ => Some(format!(
+            "{purpose}, run in order and stop if one fails: {}",
+            commands
+                .iter()
+                .enumerate()
+                .map(|(index, command)| format!("{}. {command}", index + 1))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )),
     }
 }
 
@@ -1962,9 +1978,9 @@ mod audit_tests {
             entry.outcome
         );
         assert!(
-            entry
-                .outcome
-                .contains("To restore: git -C /work/repository branch -- feature aaaa"),
+            entry.outcome.contains(
+                "To restore, run in order and stop if one fails: 1. git -C /work/repository branch -- feature aaaa; 2. git -C /work/repository config --local --add branch.feature.remote "
+            ),
             "{}",
             entry.outcome
         );

@@ -165,7 +165,7 @@ describe("deletionNotice", () => {
     ...overrides,
   });
 
-  it("lists every way to restore what was deleted", () => {
+  it("numbers the commands that restore what was deleted, which must run in order", () => {
     expect(deletionNotice(result({
       local: step("feature", ["git branch -- feature aaaa", "git config --local --add branch.feature.remote origin"]),
       remote: step("origin/feature", ["git push -- origin aaaa:refs/heads/feature"]),
@@ -173,7 +173,7 @@ describe("deletionNotice", () => {
     }))).toEqual({
       type: "success",
       title: "Deleted feature.",
-      description: "To restore: git branch -- feature aaaa; git config --local --add branch.feature.remote origin; git push -- origin aaaa:refs/heads/feature Audit warning: disk full",
+      description: "To restore, run in order and stop if one fails: 1. git branch -- feature aaaa; 2. git config --local --add branch.feature.remote origin; 3. git push -- origin aaaa:refs/heads/feature Audit warning: disk full",
     });
   });
 
