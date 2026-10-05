@@ -33,7 +33,6 @@ function fakeGitHub(release = stable, { published = false, additional = [], miss
   const assets = Object.keys(contents).map((name, index) => ({ name, id: id * 100 + index + 1 }));
   const client = {
     request: vi.fn(async (url, options) => {
-      if (url === `/releases/tags/${release.tag}`) return githubRelease;
       if (url === `/commits/${release.tag}`) return { sha: release.sha };
       if (url.startsWith("/actions/runs/")) return { path: ".github/workflows/release.yml", head_sha: release.sha, status: "completed", conclusion: buildConclusion };
       if (url.startsWith("/releases/assets/")) return Buffer.from(contents[assets.find((asset) => asset.id === Number(url.split("/").at(-1))).name]);
@@ -44,7 +43,7 @@ function fakeGitHub(release = stable, { published = false, additional = [], miss
       if (url.startsWith("/git/ref/")) return { object: { sha: release.sha } };
       throw new Error(`Unexpected request: ${url}`);
     }),
-    list: vi.fn(async (url) => url.endsWith("/assets") ? assets : [githubRelease, ...additional]),
+    list: vi.fn(async (url) => url.endsWith("/assets") ? assets : [...additional, githubRelease]),
   };
   mocks.verify.mockImplementation(async (_directory, release) => Object.fromEntries(expectedArtifacts(release).map((entry) => [entry.name, "signature"])));
   return { client, githubRelease, signatures, contents };
@@ -70,13 +69,20 @@ describe("verified release publication", () => {
     expect(client.request).toHaveBeenCalledWith("/releases/1", { method: "PATCH", body: { draft: false, make_latest: "true" } });
     expect(fetch).toHaveBeenCalledTimes(releaseAssetNames(stable).length);
     expect((await readJson(path.join(directory, "updates/stable.json"))).version).toBe(stable.version);
-    expect(client.list.mock.calls.filter(([url]) => url === "/releases")).toHaveLength(1);
   });
 
   it("rejects missing publication arguments before contacting GitHub", async () => {
     const { client } = fakeGitHub();
     await expect(publishRelease(client, stable.tag, "stable", directory)).rejects.toThrow(/feed directory/);
     expect(client.request).not.toHaveBeenCalled();
+  });
+
+  it("refuses publication when only a different release tag exists", async () => {
+    const { client } = fakeGitHub();
+    await expect(publishRelease(client, "v0.1.1", "stable", directory, path.join(directory, "updates"))).rejects.toThrow("Release v0.1.1 was not found.");
+    expect(client.request).not.toHaveBeenCalled();
+    expect(mocks.verify).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("publishes nightly without becoming GitHub's latest stable release", async () => {
@@ -169,16 +175,25 @@ describe("verified release publication", () => {
     expect(mocks.execute).not.toHaveBeenCalled();
   });
 
-  it("resumes only the matching draft and uploads the exact expected asset set", async () => {
-    const { client, contents } = fakeGitHub();
-    await writeJson(path.join(directory, "release.json"), stable);
+  it.each([stable, nightly])("resumes the matching $channel draft and uploads the exact expected asset set", async (release) => {
+    const { client, contents } = fakeGitHub(release, { additional: [{ id: 2, tag_name: "v0.2.0", draft: true, prerelease: false }] });
+    await writeJson(path.join(directory, "release.json"), release);
     await writeJson(path.join(directory, "latest.json"), JSON.parse(contents["latest.json"]));
-    await createDraft(client, directory);
+    const draft = await createDraft(client, directory);
+    expect(draft.id).toBe(1);
     const [command, args] = mocks.execute.mock.calls[0];
     expect(command).toBe("gh");
-    expect(args.slice(0, 3)).toEqual(["release", "upload", stable.tag]);
-    expect(args.filter((value) => value.startsWith(directory))).toHaveLength(releaseAssetNames(stable).length);
+    expect(args.slice(0, 3)).toEqual(["release", "upload", release.tag]);
+    expect(args.filter((value) => value.startsWith(directory))).toHaveLength(releaseAssetNames(release).length);
     expect(args.at(-1)).toBe("--clobber");
+  });
+
+  it("refuses to resume a draft from a different build", async () => {
+    const { client, contents } = fakeGitHub();
+    contents["release.json"] = JSON.stringify({ ...stable, runId: "124" });
+    await writeJson(path.join(directory, "release.json"), stable);
+    await expect(createDraft(client, directory)).rejects.toThrow(/different build/);
+    expect(mocks.execute).not.toHaveBeenCalled();
   });
 });
 
