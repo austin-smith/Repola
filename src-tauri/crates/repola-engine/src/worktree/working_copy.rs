@@ -145,7 +145,7 @@ pub fn set_file_staging(request: SetFileStagingRequest) -> Result<WorkingCopySna
         ]);
     }
     for token in tokens {
-        args.push(path_from_token(&token)?);
+        args.push(literal_pathspec(path_from_token(&token)?));
     }
     let output = command::git_at(&worktree, &args).map_err(|error| error.to_string())?;
     if !output.status.success() {
@@ -224,14 +224,14 @@ fn file_diff_with_options(
             OsString::from(&base),
             OsString::from("--"),
         ];
-        patch_args.extend(paths.iter().cloned());
+        patch_args.extend(paths.iter().map(literal_pathspec));
         let mut numstat_args = vec![
             OsString::from("diff"),
             OsString::from("--numstat"),
             OsString::from(&base),
             OsString::from("--"),
         ];
-        numstat_args.extend(paths.iter().cloned());
+        numstat_args.extend(paths.iter().map(literal_pathspec));
         (
             git_diff_output(&worktree, &patch_args, false, git_options)?,
             git_diff_output(&worktree, &numstat_args, false, git_options)?,
@@ -530,14 +530,14 @@ fn partial_patch_outputs(
         OsString::from(base),
         OsString::from("--"),
     ];
-    staged_args.extend(paths.iter().cloned());
+    staged_args.extend(paths.iter().map(literal_pathspec));
     let mut unstaged_args = vec![
         OsString::from("diff"),
         OsString::from("--no-color"),
         OsString::from("--no-ext-diff"),
         OsString::from("--"),
     ];
-    unstaged_args.extend(paths.iter().cloned());
+    unstaged_args.extend(paths.iter().map(literal_pathspec));
     Ok((
         git_diff_output(worktree, &staged_args, false, git_options)?,
         git_diff_output(worktree, &unstaged_args, false, git_options)?,
@@ -636,7 +636,11 @@ pub fn resolve_conflict(request: ResolveConflictRequest) -> Result<WorkingCopySn
     if request.kind == ConflictResolutionKind::Remove {
         let output = command::git_at(
             &worktree,
-            [OsString::from("rm"), OsString::from("--"), path],
+            [
+                OsString::from("rm"),
+                OsString::from("--"),
+                literal_pathspec(path),
+            ],
         )
         .map_err(|error| error.to_string())?;
         ensure_success(output, "remove the conflicted path")?;
@@ -669,7 +673,7 @@ pub fn resolve_conflict(request: ResolveConflictRequest) -> Result<WorkingCopySn
                     OsString::from("checkout"),
                     OsString::from(side),
                     OsString::from("--"),
-                    path.clone(),
+                    literal_pathspec(&path),
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -677,7 +681,11 @@ pub fn resolve_conflict(request: ResolveConflictRequest) -> Result<WorkingCopySn
         }
         let output = command::git_at(
             &worktree,
-            [OsString::from("add"), OsString::from("--"), path],
+            [
+                OsString::from("add"),
+                OsString::from("--"),
+                literal_pathspec(path),
+            ],
         )
         .map_err(|error| error.to_string())?;
         ensure_success(output, "mark the conflict resolved")?;
@@ -729,7 +737,7 @@ fn merge_both_sides(worktree: &Path, path: &OsString) -> Result<Vec<u8>, String>
             OsString::from("--stage"),
             OsString::from("-z"),
             OsString::from("--"),
-            path.clone(),
+            literal_pathspec(path),
         ],
     )
     .map_err(|error| error.to_string())?;
@@ -858,7 +866,7 @@ pub fn discard_file(request: DiscardFileRequest) -> Result<WorkingCopySnapshot, 
                         OsString::from("rm"),
                         OsString::from("-f"),
                         OsString::from("--"),
-                        current,
+                        literal_pathspec(current),
                     ],
                 )
                 .map_err(|error| error.to_string())?;
@@ -981,7 +989,7 @@ fn discard_tracked_path(
         OsString::from("--staged"),
         OsString::from("--"),
     ];
-    reset.extend(reset_paths);
+    reset.extend(reset_paths.iter().map(literal_pathspec));
     let output = command::git_at(worktree, reset).map_err(|error| error.to_string())?;
     ensure_success(output, "reset the selected path in the index")?;
 
@@ -1013,8 +1021,6 @@ fn absent_from_head(change: &FileChange) -> bool {
 /// path is revalidated first.
 fn remove_staged_addition(worktree: &Path, path: OsString) -> Result<(), String> {
     ensure_entry_inside_worktree(worktree, Path::new(&path))?;
-    let mut pathspec = OsString::from(":(literal)");
-    pathspec.push(&path);
     let output = command::git_at(
         worktree,
         [
@@ -1022,7 +1028,7 @@ fn remove_staged_addition(worktree: &Path, path: OsString) -> Result<(), String>
             OsString::from("-f"),
             OsString::from("--quiet"),
             OsString::from("--"),
-            pathspec,
+            literal_pathspec(path),
         ],
     )
     .map_err(|error| error.to_string())?;
@@ -1062,7 +1068,7 @@ fn restore_worktree_path(worktree: &Path, path: OsString) -> Result<(), String> 
             OsString::from("restore"),
             OsString::from("--worktree"),
             OsString::from("--"),
-            path,
+            literal_pathspec(path),
         ],
     )
     .map_err(|error| error.to_string())?;
@@ -1076,7 +1082,7 @@ fn clean_path(worktree: &Path, path: OsString) -> Result<(), String> {
             OsString::from("clean"),
             OsString::from("-f"),
             OsString::from("--"),
-            path,
+            literal_pathspec(path),
         ],
     )
     .map_err(|error| error.to_string())?;
@@ -1267,7 +1273,6 @@ fn inspection_git_options(worktree: &Path, hooks: &Path) -> Result<Vec<OsString>
     }
     let mut options = [
         "--no-optional-locks",
-        "--literal-pathspecs",
         "-c",
         "core.fsmonitor=false",
         "-c",
@@ -1655,7 +1660,7 @@ pub(super) fn selected_commit_context(
             "--",
         ],
     );
-    patch_args.extend(visible_paths.iter().cloned());
+    patch_args.extend(visible_paths.iter().map(literal_pathspec));
     let mut patch = if visible_paths.is_empty() {
         String::new()
     } else {
@@ -1973,7 +1978,7 @@ fn populate_commit_index(
             OsString::from("-A"),
             OsString::from("--"),
         ];
-        args.extend(whole_paths);
+        args.extend(whole_paths.iter().map(literal_pathspec));
         let output = command::git_at_with_env(
             worktree,
             git_args(git_options, args),
@@ -2272,6 +2277,16 @@ fn combined_output(stdout: &[u8], stderr: &[u8]) -> String {
 
 pub(super) fn path_from_token(token: &str) -> Result<OsString, String> {
     os_string_from_path_bytes(decode_path_token_bytes(token)?)
+}
+
+/// Passes an exact repository path to Git as a pathspec. Git otherwise expands
+/// glob characters, so `[x].txt` would also match an unrelated `x.txt`. This is
+/// per-argument rather than `--literal-pathspecs`, which Git exports to hooks
+/// and filters and which would make this prefix part of the name.
+pub(super) fn literal_pathspec(path: impl AsRef<std::ffi::OsStr>) -> OsString {
+    let mut pathspec = OsString::from(":(literal)");
+    pathspec.push(path);
+    pathspec
 }
 
 /// The exact bytes a path token encodes, without converting them to a host path.
@@ -4032,6 +4047,338 @@ mod tests {
         assert!(repository.path().join("rename-me.txt").is_file());
         assert!(!repository.path().join("renamed.txt").exists());
         assert!(!repository.path().join("untracked.txt").exists());
+    }
+
+    fn discard_named(
+        snapshot: WorkingCopySnapshot,
+        name: &str,
+        scope: DiscardScope,
+    ) -> WorkingCopySnapshot {
+        let change = snapshot
+            .changes
+            .iter()
+            .find(|change| change.path.display == name)
+            .expect("change")
+            .clone();
+        discard_file(DiscardFileRequest {
+            repository_path: snapshot.repository_path.clone(),
+            worktree_path: snapshot.worktree_path.clone(),
+            path: change.path,
+            scope,
+            expected_head: snapshot.head.clone(),
+            expected_index_status: change.index_status,
+            expected_worktree_status: change.worktree_status,
+        })
+        .expect("discard")
+    }
+
+    #[test]
+    fn discarding_an_untracked_glob_named_file_keeps_its_untracked_neighbour() {
+        let repository = repository();
+        std::fs::write(repository.path().join("base.txt"), "base\n").expect("base");
+        command::successful_git_at(repository.path(), ["add", "."]).expect("add base");
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).expect("commit");
+        // `[x].txt` read as a glob also matches `x.txt`.
+        for (name, scope) in [
+            ("[x].txt", DiscardScope::Unstaged),
+            ("[y].txt", DiscardScope::All),
+        ] {
+            let neighbour = name.replace(['[', ']'], "");
+            std::fs::write(repository.path().join(name), "reviewed\n").expect("glob name");
+            std::fs::write(repository.path().join(&neighbour), "keep\n").expect("neighbour");
+            let snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
+            discard_named(snapshot, name, scope);
+            assert!(!repository.path().join(name).exists(), "{name}");
+            assert_eq!(
+                std::fs::read_to_string(repository.path().join(&neighbour))
+                    .expect("neighbour kept"),
+                "keep\n"
+            );
+        }
+    }
+
+    #[test]
+    fn discarding_an_untracked_nested_repository_entry_leaves_it_in_place() {
+        let repository = repository();
+        std::fs::write(repository.path().join("base.txt"), "base\n").expect("base");
+        command::successful_git_at(repository.path(), ["add", "."]).expect("add base");
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).expect("commit");
+        let nested = repository.path().join("nested");
+        std::fs::create_dir(&nested).expect("nested directory");
+        command::successful_git_at(&nested, ["init"]).expect("initialize nested repository");
+        std::fs::write(nested.join("work.txt"), "keep\n").expect("nested work");
+
+        let snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
+        assert!(snapshot
+            .changes
+            .iter()
+            .any(|change| change.path.display == "nested/" && change.untracked));
+        discard_named(snapshot, "nested/", DiscardScope::All);
+        assert!(nested.join(".git").is_dir());
+        assert!(nested.join("work.txt").is_file());
+    }
+
+    #[test]
+    fn discarding_tracked_glob_named_paths_keeps_their_neighbours_changes() {
+        let repository = repository();
+        for name in ["[x].txt", "x.txt", "old.txt"] {
+            std::fs::write(repository.path().join(name), "original\n").expect("tracked");
+        }
+        command::successful_git_at(repository.path(), ["add", "."]).expect("add");
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).expect("commit");
+        std::fs::write(repository.path().join("x.txt"), "staged\n").expect("staged neighbour");
+        command::successful_git_at(repository.path(), ["add", "--", "x.txt"]).expect("stage");
+        std::fs::write(repository.path().join("x.txt"), "unstaged\n").expect("neighbour edit");
+        std::fs::write(repository.path().join("[x].txt"), "changed\n").expect("modify");
+        command::successful_git_at(repository.path(), ["mv", "old.txt", "[n].txt"]).expect("mv");
+        std::fs::write(repository.path().join("n.txt"), "keep\n").expect("untracked neighbour");
+        for name in ["[a].txt", "a.txt"] {
+            std::fs::write(repository.path().join(name), "added\n").expect("addition");
+        }
+        command::successful_git_at(repository.path(), ["add", "--", "[a].txt", "a.txt"])
+            .expect("stage additions");
+
+        let snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
+        discard_named(snapshot, "[x].txt", DiscardScope::Unstaged);
+        std::fs::write(repository.path().join("[x].txt"), "changed again\n").expect("modify");
+        let snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
+        let snapshot = discard_named(snapshot, "[x].txt", DiscardScope::All);
+        let snapshot = discard_named(snapshot, "[n].txt", DiscardScope::All);
+        let snapshot = discard_named(snapshot, "[a].txt", DiscardScope::All);
+
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("[x].txt")).expect("restored"),
+            "original\n"
+        );
+        assert!(repository.path().join("old.txt").is_file());
+        assert!(!repository.path().join("[n].txt").exists());
+        assert_eq!(
+            git_text(repository.path(), ["show", ":x.txt"]).expect("neighbour index"),
+            "staged"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("x.txt")).expect("neighbour"),
+            "unstaged\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("n.txt")).expect("neighbour"),
+            "keep\n"
+        );
+        assert!(!repository.path().join("[a].txt").exists());
+        assert!(repository.path().join("a.txt").is_file());
+        assert!(snapshot
+            .changes
+            .iter()
+            .any(|change| change.path.display == "a.txt" && change.staged));
+    }
+
+    #[test]
+    fn discarding_a_glob_named_path_on_an_unborn_branch_keeps_its_neighbour() {
+        let repository = repository();
+        for name in ["[x].txt", "x.txt"] {
+            std::fs::write(repository.path().join(name), "staged\n").expect("file");
+        }
+        command::successful_git_at(repository.path(), ["add", "."]).expect("add");
+        let snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
+        let snapshot = discard_named(snapshot, "[x].txt", DiscardScope::All);
+        assert!(!repository.path().join("[x].txt").exists());
+        assert!(repository.path().join("x.txt").is_file());
+        assert!(snapshot
+            .changes
+            .iter()
+            .any(|change| change.path.display == "x.txt" && change.staged));
+    }
+
+    #[test]
+    fn stages_and_unstages_glob_named_paths_literally() {
+        let repository = repository();
+        let staged_names = |snapshot: &WorkingCopySnapshot| {
+            snapshot
+                .changes
+                .iter()
+                .filter(|change| change.staged)
+                .map(|change| change.path.display.clone())
+                .collect::<Vec<_>>()
+        };
+        for name in ["[x].txt", "x.txt"] {
+            std::fs::write(repository.path().join(name), "new\n").expect("file");
+        }
+        let mut snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
+        for born in [false, true] {
+            let path = snapshot
+                .changes
+                .iter()
+                .find(|change| change.path.display == "[x].txt")
+                .expect("glob-named change")
+                .path
+                .clone();
+            let staged = set_file_staging(SetFileStagingRequest {
+                repository_path: snapshot.repository_path.clone(),
+                worktree_path: snapshot.worktree_path.clone(),
+                paths: vec![path.clone()],
+                staged: true,
+            })
+            .expect("stage");
+            assert_eq!(staged_names(&staged), ["[x].txt"]);
+
+            command::successful_git_at(repository.path(), ["add", "--", "x.txt"])
+                .expect("stage neighbour");
+            snapshot = set_file_staging(SetFileStagingRequest {
+                repository_path: snapshot.repository_path.clone(),
+                worktree_path: snapshot.worktree_path.clone(),
+                paths: vec![path],
+                staged: false,
+            })
+            .expect("unstage");
+            assert_eq!(staged_names(&snapshot), ["x.txt"], "born: {born}");
+
+            if !born {
+                command::successful_git_at(repository.path(), ["rm", "--cached", "--", "x.txt"])
+                    .expect("unstage neighbour");
+                std::fs::write(repository.path().join("base.txt"), "base\n").expect("base");
+                command::successful_git_at(repository.path(), ["add", "--", "base.txt"])
+                    .expect("stage base");
+                command::successful_git_at(repository.path(), ["commit", "-m", "base"])
+                    .expect("commit base");
+                snapshot = working_copy_snapshot(request(repository.path())).expect("born");
+            }
+        }
+    }
+
+    #[test]
+    fn diffs_and_commits_glob_named_paths_literally() {
+        let repository = repository();
+        for name in ["[x].txt", "x.txt"] {
+            std::fs::write(repository.path().join(name), "original\n").expect("file");
+        }
+        command::successful_git_at(repository.path(), ["add", "."]).expect("add");
+        command::successful_git_at(repository.path(), ["commit", "-m", "base"]).expect("commit");
+        std::fs::write(repository.path().join("[x].txt"), "reviewed\n").expect("modify");
+        std::fs::write(repository.path().join("x.txt"), "unreviewed\n").expect("neighbour");
+        let snapshot = working_copy_snapshot(request(repository.path())).expect("snapshot");
+        let change = snapshot
+            .changes
+            .iter()
+            .find(|change| change.path.display == "[x].txt")
+            .expect("glob-named change");
+
+        let diff = file_diff(FileDiffRequest {
+            repository_path: snapshot.repository_path.clone(),
+            worktree_path: snapshot.worktree_path.clone(),
+            path: change.path.clone(),
+        })
+        .expect("diff");
+        assert_eq!(diff.hunks.len(), 1);
+        assert_eq!(diff.unstaged_hunks.len(), 1);
+        assert!(!diff.patch.contains("unreviewed"));
+
+        let context = selected_commit_context(&GenerateCommitMessageRequest {
+            repository_path: snapshot.repository_path.clone(),
+            worktree_path: snapshot.worktree_path.clone(),
+            expected_head: snapshot.head.clone(),
+            included_changes: vec![include_whole(change)],
+            amend: false,
+            text_generation_selection: None,
+        })
+        .expect("commit message context");
+        assert_eq!(context.changed_files, "M\t[x].txt");
+        assert!(context.patch.contains("+reviewed"));
+        assert!(!context.patch.contains("unreviewed"));
+
+        commit(CommitRequest {
+            repository_path: snapshot.repository_path.clone(),
+            worktree_path: snapshot.worktree_path.clone(),
+            expected_head: snapshot.head.clone(),
+            included_changes: vec![include_whole(change)],
+            summary: "commit the glob-named file".into(),
+            description: String::new(),
+            amend: false,
+            author: None,
+            co_authors: Vec::new(),
+            trailers: Vec::new(),
+            signing: CommitSigning::DoNotSign,
+        })
+        .expect("commit");
+        assert_eq!(
+            git_text(repository.path(), ["show", "HEAD:x.txt"]).expect("neighbour blob"),
+            "original"
+        );
+    }
+
+    #[test]
+    fn resolves_a_glob_named_conflict_without_resolving_its_neighbour() {
+        for kind in [
+            ConflictResolutionKind::Ours,
+            ConflictResolutionKind::Both,
+            ConflictResolutionKind::Remove,
+        ] {
+            let repository = repository();
+            let names = ["[x].txt", "x.txt"];
+            let write_all = |content: &str| {
+                for name in names {
+                    std::fs::write(repository.path().join(name), format!("{name} {content}\n"))
+                        .expect("write");
+                }
+            };
+            write_all("base");
+            command::successful_git_at(repository.path(), ["add", "."]).expect("add");
+            command::successful_git_at(repository.path(), ["commit", "-m", "base"])
+                .expect("commit base");
+            command::successful_git_at(repository.path(), ["branch", "feature"]).expect("branch");
+            write_all("ours");
+            command::successful_git_at(repository.path(), ["commit", "-am", "ours"])
+                .expect("commit ours");
+            command::successful_git_at(repository.path(), ["switch", "feature"]).expect("switch");
+            write_all("theirs");
+            command::successful_git_at(repository.path(), ["commit", "-am", "theirs"])
+                .expect("commit theirs");
+            command::successful_git_at(repository.path(), ["switch", "-"]).expect("switch back");
+            let merge = command::git_at(repository.path(), ["merge", "feature"]).expect("merge");
+            assert!(!merge.status.success());
+            let conflicted = working_copy_snapshot(request(repository.path())).expect("conflict");
+            let path = conflicted
+                .changes
+                .iter()
+                .find(|change| change.path.display == "[x].txt")
+                .expect("glob-named conflict")
+                .path
+                .clone();
+            let expected_content = (kind == ConflictResolutionKind::Both).then(|| {
+                conflict_file(ConflictFileRequest {
+                    repository_path: conflicted.repository_path.clone(),
+                    worktree_path: conflicted.worktree_path.clone(),
+                    path: path.clone(),
+                })
+                .expect("review conflict")
+                .content
+            });
+            let resolved = resolve_conflict(ResolveConflictRequest {
+                repository_path: conflicted.repository_path,
+                worktree_path: conflicted.worktree_path,
+                path,
+                kind,
+                expected_head: conflicted.head,
+                expected_content,
+                manual_content: None,
+            })
+            .expect("resolve");
+
+            let conflicts = resolved
+                .changes
+                .iter()
+                .filter(|change| change.conflicted)
+                .map(|change| change.path.display.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(conflicts, ["x.txt"], "{kind:?}");
+            let neighbour =
+                std::fs::read_to_string(repository.path().join("x.txt")).expect("neighbour");
+            assert!(neighbour.contains("<<<<<<<"), "{kind:?}");
+            let resolved = std::fs::read_to_string(repository.path().join("[x].txt"));
+            match kind {
+                ConflictResolutionKind::Remove => assert!(resolved.is_err()),
+                _ => assert!(!resolved.expect("resolved").contains("x.txt ")),
+            }
+        }
     }
 
     #[test]
