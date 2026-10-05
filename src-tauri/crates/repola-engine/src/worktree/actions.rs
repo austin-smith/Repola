@@ -150,7 +150,10 @@ fn review_worktree(repository: &Path) -> Option<String> {
     list_worktrees(repository)
         .ok()?
         .into_iter()
-        .find(|seed| seed.head.is_some() && seed.prunable_reason.is_none())
+        // A locked worktree whose directory is gone is not marked prunable.
+        .find(|seed| {
+            seed.head.is_some() && seed.prunable_reason.is_none() && Path::new(&seed.path).is_dir()
+        })
         .map(|seed| seed.path)
 }
 

@@ -323,6 +323,74 @@ fn removal_in_a_bare_repository_reviews_the_branch_from_a_remaining_checkout() {
     );
 }
 
+#[test]
+fn removal_reviews_the_branch_from_a_checkout_that_still_exists() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let root = dunce::canonicalize(temp.path()).expect("canonical temp path");
+    let source = fixture_repository(&root);
+    let bare = root.join("bare.git");
+    let gone = root.join("gone");
+    let kept = root.join("kept");
+    let linked = root.join("linked");
+    git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            source.to_str().expect("UTF-8 source path"),
+            bare.to_str().expect("UTF-8 bare path"),
+        ],
+    );
+    // Locked, so Git keeps its registration after its directory disappears.
+    git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            gone.to_str().expect("UTF-8"),
+            "main",
+        ],
+    );
+    git(&bare, &["worktree", "lock", gone.to_str().expect("UTF-8")]);
+    std::fs::remove_dir_all(&gone).expect("remove the locked worktree's directory");
+    git(
+        &bare,
+        &["worktree", "add", kept.to_str().expect("UTF-8"), "main"],
+    );
+    git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "old-work",
+            linked.to_str().expect("UTF-8"),
+        ],
+    );
+
+    let reviewed = prepare_action(ActionRequest {
+        kind: ActionKind::Remove,
+        repository_path: bare.to_string_lossy().into_owned(),
+        worktree_path: linked.to_string_lossy().into_owned(),
+    })
+    .expect("clean worktree is removable");
+    let removed = execute_action(ActionExecutionRequest {
+        kind: reviewed.kind,
+        repository_path: reviewed.repository_path,
+        worktree_path: reviewed.worktree_path,
+        expected_head: reviewed.expected_head,
+        expected_branch: reviewed.branch,
+        expected_affected_paths: reviewed.affected_paths,
+    })
+    .expect("normal Git removal succeeds");
+
+    let follow_up = removed
+        .follow_up
+        .expect("the retained branch is offered for review");
+    assert_eq!(Path::new(&follow_up.worktree_path), kept);
+}
+
 fn fixture_repository(root: &Path) -> std::path::PathBuf {
     let repository = root.join("repository");
     std::fs::create_dir(&repository).expect("repository directory");
