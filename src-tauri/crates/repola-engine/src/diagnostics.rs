@@ -25,6 +25,17 @@ pub(crate) fn redact_agent_result(mut result: AgentResult) -> AgentResult {
         AgentResult::TagMutation { result } => result.output = redact(&result.output),
         AgentResult::WorktreeCreated { result } => result.output = redact(&result.output),
         AgentResult::StashMutation { result } => result.output = redact(&result.output),
+        AgentResult::BranchDeletion { result } => {
+            for step in [&mut result.local, &mut result.remote]
+                .into_iter()
+                .flatten()
+            {
+                // The finishing and recovery commands are left whole: redacted,
+                // they would remove or restore something else.
+                step.output = redact(&step.output);
+                step.warning = step.warning.as_deref().map(redact);
+            }
+        }
         _ => {}
     }
     result
@@ -36,7 +47,7 @@ pub(crate) fn redact_agent_error(mut error: AgentError) -> AgentError {
     error
 }
 
-pub(crate) fn redact(input: &str) -> String {
+pub fn redact(input: &str) -> String {
     let mut output = redact_url_credentials(input);
     output = redact_assignments(&output);
     redact_known_tokens(&output)

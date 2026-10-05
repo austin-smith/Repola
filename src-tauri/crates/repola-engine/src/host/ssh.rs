@@ -483,9 +483,10 @@ fn validate_handshake(
         | AgentRequest::Tags { .. }
         | AgentRequest::MutateTag { .. } => &[AgentCapability::History],
         AgentRequest::Synchronize { .. } => &[AgentCapability::Synchronization],
-        AgentRequest::Branches { .. } | AgentRequest::MutateBranch { .. } => {
-            &[AgentCapability::Branches]
-        }
+        AgentRequest::Branches { .. }
+        | AgentRequest::MutateBranch { .. }
+        | AgentRequest::PrepareBranchDeletion { .. }
+        | AgentRequest::ExecuteBranchDeletion { .. } => &[AgentCapability::Branches],
         AgentRequest::CloneRepository { .. } | AgentRequest::CreateRepository { .. } => {
             &[AgentCapability::RepositoryManagement]
         }
@@ -551,6 +552,8 @@ fn operation_timeout(request: &AgentRequest) -> Duration {
         | AgentRequest::Synchronize { .. }
         | AgentRequest::Branches { .. }
         | AgentRequest::MutateBranch { .. }
+        | AgentRequest::PrepareBranchDeletion { .. }
+        | AgentRequest::ExecuteBranchDeletion { .. }
         | AgentRequest::CloneRepository { .. }
         | AgentRequest::CreateRepository { .. }
         | AgentRequest::CreateWorktree { .. }

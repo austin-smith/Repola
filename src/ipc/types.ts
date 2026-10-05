@@ -175,7 +175,7 @@ export interface ScanResult {
   warnings: string[];
 }
 
-export type ActionKind = "remove" | "repair" | "unlock" | "pruneRepository" | "deleteBranch";
+export type ActionKind = "remove" | "repair" | "unlock" | "pruneRepository";
 
 export interface ActionPlan {
   kind: ActionKind;
@@ -199,9 +199,10 @@ export interface ActionResult {
   followUp: FollowUpAction | null;
 }
 
+/** A branch a removed worktree left behind, reviewed for deletion from `worktreePath`. */
 export interface FollowUpAction {
-  kind: ActionKind;
   repositoryPath: string;
+  worktreePath: string;
   branch: string;
   description: string;
 }
@@ -563,6 +564,155 @@ export type BranchMutationKind = "create" | "checkout" | "rename";
 export interface BranchMutationResult {
   branches: BranchInfo[];
   snapshot: WorkingCopySnapshot;
+}
+
+export interface BranchDeletionRequest {
+  repositoryPath: string;
+  worktreePath: string;
+  /** Full ref name: `refs/heads/<branch>` or `refs/remotes/<remote>/<branch>`. */
+  branchRef: string;
+  deleteLocal: boolean;
+  deleteRemote: boolean;
+}
+
+export type MergeReferenceKind = "upstream" | "head";
+
+export type BranchDeletionConfirmation = "confirm" | "typeBranchName";
+
+export interface LocalBranchDeletion {
+  name: string;
+  tip: string;
+  mergeReference: string;
+  mergeReferenceKind: MergeReferenceKind;
+  mergeReferenceOid: string | null;
+  containedInMergeReference: boolean;
+  defaultTarget: string | null;
+  containedInDefaultTarget: boolean | null;
+  occupiedWorktreePath: string | null;
+  isDefaultBranch: boolean;
+  upstream: string | null;
+  exclusiveCommitCount: number;
+  exclusiveCommitCountCapped: boolean;
+}
+
+export interface RemoteBranchDeletion {
+  remote: string;
+  remoteRef: string;
+  trackingRef: string;
+  displayName: string;
+  expectedOid: string;
+  /** Where the deletion pushes, with any credentials redacted. */
+  pushUrl: string;
+  /** Open pull requests using this branch as their source or target; asked only when the remote branch is selected. */
+  pullRequests: BranchPullRequests | null;
+  /** Unix seconds. */
+  trackingRefUpdatedAt: number | null;
+  /** Unix seconds. */
+  lastFetchedAt: number | null;
+  isRemoteDefaultBranch: boolean;
+  trackedBy: string[];
+  exclusiveCommitCount: number;
+  exclusiveCommitCountCapped: boolean;
+}
+
+/** What the provider hosting a remote branch said about the open pull requests that use it as their source or target. */
+export type BranchPullRequests =
+  | {
+    status: "checked";
+    provider: RemoteProvider;
+    pulls: OpenPullRequest[];
+    /** The provider has more than Repola lists. */
+    moreThanListed: boolean;
+  }
+  | { status: "unsupported" }
+  | { status: "unavailable"; reason: string };
+
+export interface OpenPullRequest {
+  /** The repository the pull request belongs to, which numbers it. */
+  repository: string;
+  number: number;
+  title: string;
+  url: string | null;
+  /** Whether it merges from the branch or into it. */
+  relation: "source" | "target";
+  /** The repository and branch it merges from. */
+  from: string;
+  /** The repository and branch it merges into. */
+  into: string;
+}
+
+export interface BranchDeletionFingerprint {
+  localTip: string | null;
+  mergeReferenceOid: string | null;
+  requiresForce: boolean;
+  remote: string | null;
+  remoteRef: string | null;
+  remoteOid: string | null;
+  /** The open pull requests the review listed for the remote branch, as `repository#number`, or null when the provider could not be asked. */
+  pullRequests: string[] | null;
+  /** The provider had more open pull requests than the review listed. */
+  morePullRequests: boolean;
+  /** A digest of the exact URL the remote deletion pushes to, as reviewed. */
+  pushDestination: string | null;
+  /** A digest of exactly which commits the local deletion would leave unreachable, as reviewed. */
+  localReachability: string | null;
+  /** A digest of exactly which commits the remote deletion would leave unreachable, as reviewed. */
+  remoteReachability: string | null;
+  /** The commands the review displayed, which execution runs. */
+  commands: string[];
+  /** The warnings the review displayed. */
+  warnings: string[];
+  confirmation: BranchDeletionConfirmation;
+}
+
+export interface BranchDeletionPlan {
+  repositoryPath: string;
+  worktreePath: string;
+  branchRef: string;
+  branchName: string;
+  deleteLocal: boolean;
+  deleteRemote: boolean;
+  local: LocalBranchDeletion | null;
+  remote: RemoteBranchDeletion | null;
+  remoteUnavailableReason: string | null;
+  requiresForce: boolean;
+  confirmation: BranchDeletionConfirmation;
+  commands: string[];
+  warnings: string[];
+  blockers: string[];
+  fingerprint: BranchDeletionFingerprint;
+}
+
+export interface BranchDeletionStep {
+  target: string;
+  deletedOid: string;
+  succeeded: boolean;
+  /** The step was interrupted after it started, so it may have happened. */
+  unconfirmed: boolean;
+  output: string;
+  /** Something left undone by a step that still succeeded. */
+  warning: string | null;
+  /** The commands that finish what the warning says was left undone. */
+  finishCommands: string[];
+  /** The commands that restore what a successful step deleted, in order. */
+  recoveryCommands: string[];
+}
+
+/**
+ * Why a deletion returned no result. A refusal deletes nothing; otherwise the deletion was
+ * interrupted after it started and may have completed anyway.
+ */
+export interface BranchDeletionFailure {
+  message: string;
+  outcomeKnown: boolean;
+}
+
+export interface BranchDeletionResult {
+  message: string;
+  local: BranchDeletionStep | null;
+  remote: BranchDeletionStep | null;
+  auditPath: string | null;
+  auditWarning: string | null;
 }
 
 export interface RepositoryOperationResult {

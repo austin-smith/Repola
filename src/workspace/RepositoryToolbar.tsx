@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useReducer, useState, type FormEvent } from "react";
 import {
   ChevronRightIcon,
   DatabaseIcon,
@@ -16,7 +16,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Combobox, ComboboxCollection, ComboboxContent, ComboboxEmpty, ComboboxGroup, ComboboxInput, ComboboxItem, ComboboxLabel, ComboboxList, ComboboxSeparator, ComboboxTrigger, ComboboxValue } from "@/components/ui/combobox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -31,11 +31,11 @@ import { shortSha } from "../domain/format";
 import { matchesRepositoryQuery } from "../domain/repository-picker";
 import { groupWorktreesForPicker, matchesWorktreeQuery, worktreeBranchLabel, worktreeFolderName, type WorktreePickerGroup } from "../domain/worktree-picker";
 import { loadBranches, mutateBranch, revealWorktree } from "../ipc/worktrees";
-import type { BranchInfo, RepositorySummary, WorktreeRecord } from "../ipc/types";
+import type { BranchDeletionResult, BranchInfo, RepositorySummary, WorktreeRecord } from "../ipc/types";
 import { useRepositoryContext, useWorkingCopy } from "./context";
 import { historyMutationTitles } from "./labels";
 import { LazyDialog } from "./LazyDialog";
-import { HistoryMutationDialog, TagsDialog } from "./lazy";
+import { DeleteBranchDialog, HistoryMutationDialog, TagsDialog } from "./lazy";
 
 export function RepositoryToolbar({
   repositories,
@@ -249,7 +249,7 @@ function WorktreePicker({
 }
 
 function BranchControl() {
-  const { machineId, repository, worktree, refreshWorkspace: onChanged, showChanges: onNeedsResolution } = useWorkingCopy();
+  const { machineId, repository, worktree, refreshWorkspace: onChanged, showChanges: onNeedsResolution, recordAuditPath } = useWorkingCopy();
   const [branches, setBranches] = useState<BranchInfo[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [dialogKind, setDialogKind] = useState<"create" | "rename" | null>(null);
@@ -257,6 +257,8 @@ function BranchControl() {
   const [error, setError] = useState<string | null>(null);
   const [historyActionsOpen, setHistoryActionsOpen] = useState(false);
   const [tagsOpen, setTagsOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [branchesRevision, reloadBranches] = useReducer((revision: number) => revision + 1, 0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -266,7 +268,7 @@ function BranchControl() {
         if (!controller.signal.aborted) setError(toMessage(cause));
       });
     return () => controller.abort();
-  }, [machineId, repository.path, worktree.id, worktree.path, worktree.head]);
+  }, [machineId, repository.path, worktree.id, worktree.path, worktree.head, branchesRevision]);
 
   const current = branches?.find((branch) => branch.current && !branch.remote) ?? null;
   const localBranches = branches?.filter((branch) => !branch.remote) ?? [];
@@ -314,6 +316,12 @@ function BranchControl() {
     } finally {
       setBusy(false);
     }
+  };
+
+  const branchDeleted = async (result: BranchDeletionResult) => {
+    if (result.auditPath) recordAuditPath(result.auditPath);
+    reloadBranches();
+    await onChanged();
   };
 
   const selectBranch = (fullName: string | null) => {
@@ -388,6 +396,10 @@ function BranchControl() {
               <DropdownMenuItem disabled={current === null || historyTargets.length === 0} onClick={() => setHistoryActionsOpen(true)}><GitMergeIcon aria-hidden="true" />Merge or rebase…</DropdownMenuItem>
               <DropdownMenuItem disabled={worktree.head === null} onClick={() => setTagsOpen(true)}><TagIcon aria-hidden="true" />Tags…</DropdownMenuItem>
             </DropdownMenuGroup>
+            <DropdownMenuSeparator />
+            <DropdownMenuGroup>
+              <DropdownMenuItem variant="destructive" disabled={branches === null || branches.length === 0} onClick={() => setDeleteOpen(true)}><Trash2Icon aria-hidden="true" />Delete branch…</DropdownMenuItem>
+            </DropdownMenuGroup>
           </DropdownMenuContent>
         </DropdownMenu>
       <Dialog open={dialogKind !== null} onOpenChange={(open) => { if (!open && !busy) setDialogKind(null); }}>
@@ -445,6 +457,18 @@ function BranchControl() {
               }
               toast.add({ type: "success", title: historyMutationTitles[kind], description: kind === "squashMerge" ? `Review and commit the staged changes from ${target.label}.` : target.label });
             }}
+          />
+        </LazyDialog>
+      ) : null}
+      {deleteOpen && branches ? (
+        <LazyDialog onClose={() => setDeleteOpen(false)}>
+          <DeleteBranchDialog
+            machineId={machineId}
+            repositoryPath={repository.path}
+            worktreePath={worktree.path}
+            branches={branches}
+            onClose={() => setDeleteOpen(false)}
+            onDeleted={branchDeleted}
           />
         </LazyDialog>
       ) : null}

@@ -17,6 +17,9 @@ import type {
   ConflictResolutionKind,
   ConflictFile,
   DiscardScope,
+  BranchDeletionPlan,
+  BranchDeletionRequest,
+  BranchDeletionResult,
   BranchInfo,
   BranchMutationKind,
   BranchMutationResult,
@@ -479,6 +482,40 @@ export function mutateBranch(
   });
 }
 
+export function prepareBranchDeletionReview(
+  machineId: string,
+  request: BranchDeletionRequest,
+  signal?: AbortSignal,
+): Promise<BranchDeletionPlan> {
+  return invokeOperation<BranchDeletionPlan>("prepare_branch_deletion", { machineId, request }, { signal });
+}
+
+/**
+ * Runs a reviewed deletion; the engine plans again and refuses if anything changed. Rejects with
+ * a `BranchDeletionFailure`.
+ */
+export function executeBranchDeletion(
+  machineId: string,
+  plan: BranchDeletionPlan,
+  typedConfirmation: string | null,
+): Promise<BranchDeletionResult> {
+  return invokeOperation<BranchDeletionResult>("execute_branch_deletion", {
+    machineId,
+    request: {
+      request: {
+        repositoryPath: plan.repositoryPath,
+        worktreePath: plan.worktreePath,
+        branchRef: plan.branchRef,
+        deleteLocal: plan.deleteLocal,
+        deleteRemote: plan.deleteRemote,
+      },
+      force: plan.requiresForce,
+      expected: plan.fingerprint,
+      typedConfirmation,
+    },
+  });
+}
+
 export function cloneRepository(
   machineId: string,
   source: string,
@@ -598,17 +635,6 @@ export function prepareWorktreeAction(
   return invokeOperation<ActionPlan>("prepare_worktree_action", {
     machineId,
     request: { kind, repositoryPath, worktreePath },
-  });
-}
-
-export function prepareBranchDeletion(
-  machineId: string,
-  repositoryPath: string,
-  branch: string,
-): Promise<ActionPlan> {
-  return invokeOperation<ActionPlan>("prepare_worktree_action", {
-    machineId,
-    request: { kind: "deleteBranch", repositoryPath, worktreePath: "", branch },
   });
 }
 

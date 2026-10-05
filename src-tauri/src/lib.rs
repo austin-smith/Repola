@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use operation::OperationToken;
 use protocol::{AgentEvent, AgentInfo, AgentRequest, AgentResult, RequestEnvelope, ResponseBody};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use settings::{
     AppPreferences, MachineKind, MachineProfile, MachineProfileInput, RepositoryRegistrationResult,
     WindowState, WorkspaceContext,
@@ -21,18 +21,20 @@ use tauri::ipc::Channel;
 use tauri::{Emitter, Manager};
 use worktree::{
     ActionExecutionRequest, ActionKind, ActionPlan, ActionRequest, ActionResult,
-    ApplyPatchHunkRequest, BranchInfo, BranchMutationRequest, BranchMutationResult, BranchRequest,
-    CloneRepositoryRequest, CommitChangedFile, CommitFileDiffRequest, CommitFilesRequest,
-    CommitRequest, CommitResult, ConflictFile, ConflictFileRequest, CreateRepositoryRequest,
-    CreateWorktreeRequest, CreateWorktreeResult, DiscardAllRequest, DiscardFileRequest, FileDiff,
-    FileDiffRequest, GenerateCommitMessageRequest, GeneratedCommitMessage, HistoryMutationRequest,
-    HistoryMutationResult, HistoryPage, HistoryRequest, PullRequestEvidence,
-    PullRequestMutationRequest, PullRequestMutationResult, ReflogEntry, ReflogRequest,
-    RepositoryOperationMutationResult, RepositoryOperationRequest, RepositoryOperationResult,
-    ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry,
-    StashMutationRequest, StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo,
-    TagMutationRequest, TagMutationResult, TagRequest, TextGenerationStatus, UndoCommitRequest,
-    UndoCommitResult, WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges, WorktreeWatcher,
+    ApplyPatchHunkRequest, BranchDeletionExecutionRequest, BranchDeletionPlan,
+    BranchDeletionRequest, BranchDeletionResult, BranchInfo, BranchMutationRequest,
+    BranchMutationResult, BranchRequest, CloneRepositoryRequest, CommitChangedFile,
+    CommitFileDiffRequest, CommitFilesRequest, CommitRequest, CommitResult, ConflictFile,
+    ConflictFileRequest, CreateRepositoryRequest, CreateWorktreeRequest, CreateWorktreeResult,
+    DiscardAllRequest, DiscardFileRequest, FileDiff, FileDiffRequest, GenerateCommitMessageRequest,
+    GeneratedCommitMessage, HistoryMutationRequest, HistoryMutationResult, HistoryPage,
+    HistoryRequest, PullRequestEvidence, PullRequestMutationRequest, PullRequestMutationResult,
+    ReflogEntry, ReflogRequest, RepositoryOperationMutationResult, RepositoryOperationRequest,
+    RepositoryOperationResult, ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult,
+    SetFileStagingRequest, StashEntry, StashMutationRequest, StashMutationResult, StashRequest,
+    SyncRequest, SyncResult, TagInfo, TagMutationRequest, TagMutationResult, TagRequest,
+    TextGenerationStatus, UndoCommitRequest, UndoCommitResult, WorkingCopyRequest,
+    WorkingCopySnapshot, WorktreeChanges, WorktreeWatcher,
 };
 
 const WORKTREE_CHANGED_EVENT: &str = "repola://worktree-changed";
@@ -1232,11 +1234,14 @@ async fn execute_worktree_action(
     .await;
     operations.finish(&operation_id);
     let outcome = outcome.map_err(|error| format!("Action task failed: {error}"))?;
-    let audit_outcome = outcome
-        .as_ref()
-        .map(|result| result.message.as_str())
-        .map_err(ToString::to_string);
-    let audit = append_audit_entry(&app, &machine_id, &audit_request, audit_outcome);
+    let (succeeded, message) = match &outcome {
+        Ok(result) => (true, result.message.clone()),
+        Err(error) => (false, error.clone()),
+    };
+    let audit = append_audit_entry(
+        &app,
+        &AuditEntry::worktree_action(&machine_id, &audit_request, succeeded, message),
+    );
     match outcome {
         Ok(mut result) => {
             match audit {
@@ -1247,6 +1252,130 @@ async fn execute_worktree_action(
         }
         Err(error) => Err(error.to_string()),
     }
+}
+
+#[tauri::command]
+async fn prepare_branch_deletion(
+    app: tauri::AppHandle,
+    operations: tauri::State<'_, OperationRegistry>,
+    machine_id: String,
+    operation_id: String,
+    request: BranchDeletionRequest,
+) -> Result<BranchDeletionPlan, String> {
+    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+    let token = operations.begin(&operation_id)?;
+    let request_id = operation_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        match execute_on_machine(
+            &machine,
+            request_id,
+            AgentRequest::PrepareBranchDeletion { request },
+            token,
+        )? {
+            AgentResult::BranchDeletionPlan { plan } => Ok(*plan),
+            _ => Err("The Repola agent returned an unexpected response.".to_string()),
+        }
+    })
+    .await;
+    operations.finish(&operation_id);
+    result.map_err(|error| format!("Branch deletion review failed: {error}"))?
+}
+
+/// Why a branch deletion returned no result. The engine deletes nothing before
+/// it refuses, so a refusal, or a failure before the request reached the
+/// engine, leaves the outcome known. Anything that interrupts the request after
+/// that leaves it unknown: the deletion may have run.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BranchDeletionFailure {
+    message: String,
+    outcome_known: bool,
+}
+
+impl BranchDeletionFailure {
+    fn known(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            outcome_known: true,
+        }
+    }
+
+    fn unknown(cause: impl std::fmt::Display) -> Self {
+        Self {
+            message: format!(
+                "{cause} The deletion may have completed anyway. Review the branch before trying again."
+            ),
+            outcome_known: false,
+        }
+    }
+
+    /// Known when no agent received the request, or when the engine itself
+    /// answered; anything else interrupted a request an agent may have run.
+    fn from_host(error: host::HostError) -> Self {
+        use host::HostError;
+        match error {
+            HostError::NotDelivered(_)
+            | HostError::Disabled(_)
+            | HostError::InvalidProfile(_)
+            | HostError::Launch(_)
+            | HostError::Remote(_) => Self::known(error.to_string()),
+            HostError::AgentUnavailable { .. }
+            | HostError::AgentVersionMismatch { .. }
+            | HostError::Timeout { .. }
+            | HostError::Cancelled(_)
+            | HostError::Transport(_)
+            | HostError::Protocol(_) => Self::unknown(error),
+        }
+    }
+}
+
+#[tauri::command]
+async fn execute_branch_deletion(
+    app: tauri::AppHandle,
+    operations: tauri::State<'_, OperationRegistry>,
+    machine_id: String,
+    operation_id: String,
+    request: BranchDeletionExecutionRequest,
+) -> Result<BranchDeletionResult, BranchDeletionFailure> {
+    let machine = settings::machine(&app, &machine_id)
+        .map_err(|error| BranchDeletionFailure::known(error.to_string()))?;
+    let audit_request = request.clone();
+    let token = operations
+        .begin(&operation_id)
+        .map_err(BranchDeletionFailure::known)?;
+    let request_id = operation_id.clone();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        match host::execute(
+            &machine,
+            RequestEnvelope::current(request_id, AgentRequest::ExecuteBranchDeletion { request }),
+            |_| {},
+            token,
+        )
+        .map_err(BranchDeletionFailure::from_host)?
+        {
+            AgentResult::BranchDeletion { result } => Ok(*result),
+            _ => Err(BranchDeletionFailure::unknown(
+                "The Repola agent returned an unexpected response.",
+            )),
+        }
+    })
+    .await;
+    operations.finish(&operation_id);
+    let outcome = outcome.unwrap_or_else(|error| {
+        Err(BranchDeletionFailure::unknown(format!(
+            "Branch deletion failed: {error}."
+        )))
+    });
+    let audit = append_audit_entry(
+        &app,
+        &AuditEntry::branch_deletion_outcome(&machine_id, &audit_request, &outcome),
+    );
+    let mut result = outcome?;
+    match audit {
+        Ok(path) => result.audit_path = Some(path),
+        Err(error) => result.audit_warning = Some(error),
+    }
+    Ok(result)
 }
 
 fn execute_on_machine(
@@ -1318,27 +1447,210 @@ fn cancel_operation(
     operations.cancel(&operation_id)
 }
 
-#[derive(Serialize)]
+/// One line of `actions.jsonl`. Fields added later are optional so entries
+/// written by earlier versions keep decoding.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AuditEntry<'a> {
+struct AuditEntry {
     timestamp_ms: u64,
-    action: ActionKind,
-    machine_id: &'a str,
-    repository_path: &'a str,
-    worktree_path: &'a str,
-    expected_head: Option<&'a str>,
-    expected_branch: Option<&'a str>,
-    affected_paths: &'a [String],
+    action: AuditAction,
+    machine_id: String,
+    repository_path: String,
+    worktree_path: String,
+    expected_head: Option<String>,
+    expected_branch: Option<String>,
+    affected_paths: Vec<String>,
     succeeded: bool,
-    outcome: &'a str,
+    outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch_deletion: Option<BranchDeletionAudit>,
 }
 
-fn append_audit_entry(
-    app: &tauri::AppHandle,
-    machine_id: &str,
-    request: &ActionExecutionRequest,
-    outcome: Result<&str, String>,
-) -> Result<String, String> {
+/// Worktree actions keep their `ActionKind` names. Branch deletions, including
+/// those earlier versions ran as a worktree action, are `deleteBranch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum AuditAction {
+    Remove,
+    Repair,
+    Unlock,
+    PruneRepository,
+    DeleteBranch,
+}
+
+impl From<ActionKind> for AuditAction {
+    fn from(kind: ActionKind) -> Self {
+        match kind {
+            ActionKind::Remove => Self::Remove,
+            ActionKind::Repair => Self::Repair,
+            ActionKind::Unlock => Self::Unlock,
+            ActionKind::PruneRepository => Self::PruneRepository,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BranchDeletionAudit {
+    branch_ref: String,
+    delete_local: bool,
+    delete_remote: bool,
+    force: bool,
+    remote: Option<String>,
+    remote_ref: Option<String>,
+    remote_oid: Option<String>,
+    /// The deletion was interrupted after it started, so whether it happened is unknown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    outcome_unknown: bool,
+}
+
+impl AuditEntry {
+    fn worktree_action(
+        machine_id: &str,
+        request: &ActionExecutionRequest,
+        succeeded: bool,
+        outcome: String,
+    ) -> Self {
+        Self {
+            timestamp_ms: now_ms(),
+            action: request.kind.into(),
+            machine_id: machine_id.to_string(),
+            repository_path: request.repository_path.clone(),
+            worktree_path: request.worktree_path.clone(),
+            expected_head: request.expected_head.clone(),
+            expected_branch: request.expected_branch.clone(),
+            affected_paths: request.expected_affected_paths.clone(),
+            succeeded,
+            outcome,
+            branch_deletion: None,
+        }
+    }
+
+    /// Records how a deletion ended: what it did, what it left undone, and how
+    /// to finish and restore it. The result keeps its commands whole so they
+    /// restore exactly what was deleted; the log on disk does not keep
+    /// credentials they may contain.
+    fn branch_deletion_outcome(
+        machine_id: &str,
+        execution: &BranchDeletionExecutionRequest,
+        outcome: &Result<BranchDeletionResult, BranchDeletionFailure>,
+    ) -> Self {
+        let (succeeded, outcome_known, message) = match outcome {
+            Ok(result) => {
+                let steps: Vec<_> = [&result.local, &result.remote]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                let finish: Vec<&str> = steps
+                    .iter()
+                    .flat_map(|step| &step.finish_commands)
+                    .map(String::as_str)
+                    .collect();
+                let restore: Vec<&str> = steps
+                    .iter()
+                    .flat_map(|step| &step.recovery_commands)
+                    .map(String::as_str)
+                    .collect();
+                (
+                    steps.iter().all(|step| step.succeeded),
+                    !steps.iter().any(|step| step.unconfirmed),
+                    std::iter::once(result.message.clone())
+                        // Why a step failed, in Git's words.
+                        .chain(
+                            steps
+                                .iter()
+                                .filter(|step| !step.succeeded && !step.output.is_empty())
+                                .map(|step| step.output.clone()),
+                        )
+                        .chain(steps.iter().filter_map(|step| step.warning.clone()))
+                        .chain(command_steps("To finish", &finish))
+                        .chain(command_steps("To restore", &restore))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            }
+            Err(failure) => (false, failure.outcome_known, failure.message.clone()),
+        };
+        Self::branch_deletion(
+            machine_id,
+            execution,
+            succeeded,
+            outcome_known,
+            repola_engine::diagnostics::redact(&message),
+        )
+    }
+
+    fn branch_deletion(
+        machine_id: &str,
+        execution: &BranchDeletionExecutionRequest,
+        succeeded: bool,
+        outcome_known: bool,
+        outcome: String,
+    ) -> Self {
+        let request = &execution.request;
+        let expected = &execution.expected;
+        let mut affected_paths = Vec::new();
+        if request.delete_local {
+            affected_paths.push(request.branch_ref.clone());
+        }
+        if let (true, Some(remote), Some(remote_ref)) = (
+            request.delete_remote,
+            expected.remote.as_deref(),
+            expected.remote_ref.as_deref(),
+        ) {
+            affected_paths.push(format!("{remote}:{remote_ref}"));
+        }
+        Self {
+            timestamp_ms: now_ms(),
+            action: AuditAction::DeleteBranch,
+            machine_id: machine_id.to_string(),
+            repository_path: request.repository_path.clone(),
+            worktree_path: request.worktree_path.clone(),
+            expected_head: expected.local_tip.clone(),
+            expected_branch: Some(request.branch_ref.clone()),
+            affected_paths,
+            succeeded,
+            outcome,
+            branch_deletion: Some(BranchDeletionAudit {
+                branch_ref: request.branch_ref.clone(),
+                delete_local: request.delete_local,
+                delete_remote: request.delete_remote,
+                force: execution.force,
+                remote: expected.remote.clone(),
+                remote_ref: expected.remote_ref.clone(),
+                remote_oid: expected.remote_oid.clone(),
+                outcome_unknown: !outcome_known,
+            }),
+        }
+    }
+}
+
+/// `commands` labeled with their `purpose`, numbered when there are several,
+/// since each must run only after the one before it succeeded.
+fn command_steps(purpose: &str, commands: &[&str]) -> Option<String> {
+    match commands {
+        [] => None,
+        [command] => Some(format!("{purpose}: {command}")),
+        _ => Some(format!(
+            "{purpose}, run in order and stop if one fails: {}",
+            commands
+                .iter()
+                .enumerate()
+                .map(|(index, command)| format!("{}. {command}", index + 1))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )),
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn append_audit_entry(app: &tauri::AppHandle, entry: &AuditEntry) -> Result<String, String> {
     let directory = app
         .path()
         .app_data_dir()
@@ -1346,26 +1658,7 @@ fn append_audit_entry(
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("Could not create the audit directory: {error}"))?;
     let path = directory.join("actions.jsonl");
-    let (succeeded, message) = match &outcome {
-        Ok(message) => (true, (*message).to_string()),
-        Err(message) => (false, message.clone()),
-    };
-    let entry = AuditEntry {
-        timestamp_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-            .unwrap_or(0),
-        action: request.kind,
-        machine_id,
-        repository_path: &request.repository_path,
-        worktree_path: &request.worktree_path,
-        expected_head: request.expected_head.as_deref(),
-        expected_branch: request.expected_branch.as_deref(),
-        affected_paths: &request.expected_affected_paths,
-        succeeded,
-        outcome: &message,
-    };
-    let mut line = serde_json::to_vec(&entry)
+    let mut line = serde_json::to_vec(entry)
         .map_err(|error| format!("Could not serialize the audit entry: {error}"))?;
     line.push(b'\n');
     let mut file = OpenOptions::new()
@@ -1408,6 +1701,7 @@ pub fn run() {
             create_worktree,
             discard_all,
             discard_file,
+            execute_branch_deletion,
             execute_worktree_action,
             file_diff,
             fetch_pull_requests,
@@ -1434,6 +1728,7 @@ pub fn run() {
             mutate_branch,
             mutate_stash,
             mutate_tag,
+            prepare_branch_deletion,
             prepare_worktree_action,
             remove_machine,
             register_repository,
@@ -1479,5 +1774,235 @@ mod coordinator_tests {
         assert!(registry.begin("").is_err());
         assert!(registry.begin("line\nbreak").is_err());
         assert!(registry.begin(&"x".repeat(129)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use worktree::{BranchDeletionConfirmation, BranchDeletionFingerprint};
+
+    /// A line exactly as earlier versions wrote it, before branch-deletion details existed.
+    const LEGACY_ENTRY: &str = r#"{"timestampMs":1700000000000,"action":"remove","machineId":"local","repositoryPath":"/work/repository","worktreePath":"/work/linked","expectedHead":"0123456789abcdef0123456789abcdef01234567","expectedBranch":"feature","affectedPaths":["/work/linked"],"succeeded":true,"outcome":"Worktree removed. Its Git branch was left intact."}"#;
+
+    #[test]
+    fn entries_written_by_earlier_versions_still_decode() {
+        let entry: AuditEntry = serde_json::from_str(LEGACY_ENTRY).expect("legacy audit entry");
+        assert_eq!(entry.action, AuditAction::Remove);
+        assert_eq!(entry.expected_branch.as_deref(), Some("feature"));
+        assert_eq!(entry.affected_paths, vec!["/work/linked".to_string()]);
+        assert!(entry.branch_deletion.is_none());
+        assert_eq!(
+            serde_json::to_string(&entry).expect("serialize"),
+            LEGACY_ENTRY,
+            "worktree actions keep writing the same line format"
+        );
+    }
+
+    #[test]
+    fn a_branch_deletion_is_unknown_only_once_an_agent_may_have_run_it() {
+        use host::HostError;
+        let machine = || "build box".to_string();
+        for known in [
+            HostError::NotDelivered(Box::new(HostError::Transport("connection refused".into()))),
+            HostError::NotDelivered(Box::new(HostError::AgentVersionMismatch {
+                machine: machine(),
+                expected: "1".into(),
+                actual: "2".into(),
+            })),
+            HostError::Disabled(machine()),
+            HostError::InvalidProfile(machine()),
+            HostError::Launch("ssh not found".into()),
+            HostError::Remote("The branch deletion is blocked.".into()),
+        ] {
+            let failure = BranchDeletionFailure::from_host(known);
+            assert!(failure.outcome_known, "{}", failure.message);
+        }
+        // Without `NotDelivered`, these followed a request an agent received.
+        for unknown in [
+            HostError::AgentUnavailable {
+                machine: machine(),
+                detail: "repola-agent: not found".into(),
+            },
+            HostError::Timeout {
+                machine: machine(),
+                seconds: 120,
+            },
+            HostError::Cancelled(machine()),
+            HostError::Transport("connection reset".into()),
+            HostError::Protocol("stream closed".into()),
+        ] {
+            let failure = BranchDeletionFailure::from_host(unknown);
+            assert!(!failure.outcome_known, "{}", failure.message);
+            assert!(failure.message.contains("may have completed"));
+        }
+    }
+
+    #[test]
+    fn branch_deletions_written_as_worktree_actions_still_decode() {
+        let line = r#"{"timestampMs":1700000000000,"action":"deleteBranch","machineId":"local","repositoryPath":"/work/repository","worktreePath":"","expectedHead":"0123456789abcdef0123456789abcdef01234567","expectedBranch":"feature","affectedPaths":["refs/heads/feature"],"succeeded":true,"outcome":"Branch feature deleted with git branch -d."}"#;
+        let entry: AuditEntry = serde_json::from_str(line).expect("legacy branch deletion entry");
+        assert_eq!(entry.action, AuditAction::DeleteBranch);
+        assert!(entry.branch_deletion.is_none());
+    }
+
+    #[test]
+    fn branch_deletions_record_their_scope_and_round_trip() {
+        let execution = BranchDeletionExecutionRequest {
+            request: BranchDeletionRequest {
+                repository_path: "/work/repository".into(),
+                worktree_path: "/work/repository".into(),
+                branch_ref: "refs/heads/feature".into(),
+                delete_local: true,
+                delete_remote: true,
+            },
+            force: true,
+            expected: BranchDeletionFingerprint {
+                local_tip: Some("a".repeat(40)),
+                merge_reference_oid: Some("b".repeat(40)),
+                requires_force: true,
+                remote: Some("origin".into()),
+                remote_ref: Some("refs/heads/feature".into()),
+                remote_oid: Some("c".repeat(40)),
+                pull_requests: None,
+                more_pull_requests: false,
+                push_destination: Some("e".repeat(64)),
+                local_reachability: None,
+                remote_reachability: None,
+                commands: Vec::new(),
+                warnings: Vec::new(),
+                confirmation: BranchDeletionConfirmation::TypeBranchName,
+            },
+            typed_confirmation: Some("feature".into()),
+        };
+        let entry = AuditEntry::branch_deletion("local", &execution, false, true, "partial".into());
+        assert_eq!(entry.action, AuditAction::DeleteBranch);
+        assert_eq!(
+            entry.affected_paths,
+            vec![
+                "refs/heads/feature".to_string(),
+                "origin:refs/heads/feature".to_string()
+            ]
+        );
+        let details = entry
+            .branch_deletion
+            .as_ref()
+            .expect("branch deletion details");
+        assert!(details.force);
+        assert!(!details.outcome_unknown);
+        let line = serde_json::to_string(&entry).expect("serialize");
+        assert!(!line.contains("outcomeUnknown"), "{line}");
+        let decoded: AuditEntry = serde_json::from_str(&line).expect("decode");
+        assert_eq!(decoded, entry);
+
+        let interrupted =
+            AuditEntry::branch_deletion("local", &execution, false, false, "timed out".into());
+        let line = serde_json::to_string(&interrupted).expect("serialize");
+        assert!(line.contains("\"outcomeUnknown\":true"), "{line}");
+        let decoded: AuditEntry = serde_json::from_str(&line).expect("decode");
+        assert_eq!(decoded, interrupted);
+    }
+
+    #[test]
+    fn branch_deletion_audits_keep_the_commands_but_not_their_credentials() {
+        let execution = BranchDeletionExecutionRequest {
+            request: BranchDeletionRequest {
+                repository_path: "/work/repository".into(),
+                worktree_path: "/work/repository".into(),
+                branch_ref: "refs/heads/feature".into(),
+                delete_local: true,
+                delete_remote: false,
+            },
+            force: false,
+            expected: BranchDeletionFingerprint {
+                local_tip: Some("a".repeat(40)),
+                merge_reference_oid: Some("b".repeat(40)),
+                requires_force: false,
+                remote: None,
+                remote_ref: None,
+                remote_oid: None,
+                pull_requests: None,
+                more_pull_requests: false,
+                push_destination: None,
+                local_reachability: None,
+                remote_reachability: None,
+                commands: Vec::new(),
+                warnings: Vec::new(),
+                confirmation: BranchDeletionConfirmation::Confirm,
+            },
+            typed_confirmation: None,
+        };
+        let result = BranchDeletionResult {
+            message: "Deleted local branch feature.".into(),
+            local: Some(worktree::BranchDeletionStep {
+                target: "feature".into(),
+                deleted_oid: "a".repeat(40),
+                succeeded: true,
+                unconfirmed: false,
+                output: String::new(),
+                warning: Some("feature was deleted, but its configuration was not removed.".into()),
+                finish_commands: vec![
+                    "git -C /work/repository config --local --remove-section branch.feature".into(),
+                ],
+                recovery_commands: vec![
+                    "git -C /work/repository branch -- feature aaaa".into(),
+                    "git -C /work/repository config --local --add branch.feature.remote https://alice:hunter2@example.com/repo.git".into(),
+                ],
+            }),
+            remote: Some(worktree::BranchDeletionStep {
+                target: "origin/feature".into(),
+                deleted_oid: "a".repeat(40),
+                succeeded: false,
+                unconfirmed: false,
+                output: "! (delete):refs/heads/feature [rejected] (stale info)".into(),
+                warning: None,
+                finish_commands: Vec::new(),
+                recovery_commands: Vec::new(),
+            }),
+            audit_path: None,
+            audit_warning: None,
+        };
+
+        let entry = AuditEntry::branch_deletion_outcome("local", &execution, &Ok(result));
+        assert!(!entry.succeeded);
+        assert!(
+            entry.outcome.contains("[rejected] (stale info)"),
+            "{}",
+            entry.outcome
+        );
+        assert!(
+            entry.outcome.contains(
+                "To finish: git -C /work/repository config --local --remove-section branch.feature"
+            ),
+            "{}",
+            entry.outcome
+        );
+        assert!(
+            entry.outcome.contains(
+                "To restore, run in order and stop if one fails: 1. git -C /work/repository branch -- feature aaaa; 2. git -C /work/repository config --local --add branch.feature.remote "
+            ),
+            "{}",
+            entry.outcome
+        );
+        assert!(
+            entry.outcome.contains("example.com/repo.git"),
+            "{}",
+            entry.outcome
+        );
+        assert!(!entry.outcome.contains("hunter2"), "{}", entry.outcome);
+
+        let interrupted = AuditEntry::branch_deletion_outcome(
+            "local",
+            &execution,
+            &Err(BranchDeletionFailure::unknown("The SSH connection closed.")),
+        );
+        assert!(!interrupted.succeeded);
+        assert!(
+            interrupted
+                .branch_deletion
+                .as_ref()
+                .expect("branch deletion details")
+                .outcome_unknown
+        );
     }
 }

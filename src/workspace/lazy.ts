@@ -16,6 +16,10 @@ export const HistoryWorkbench = lazy(() =>
 );
 export const HistoryMutationDialog = lazy(() => import("../dialogs/HistoryMutationDialog"));
 export const TagsDialog = lazy(() => import("../dialogs/TagsDialog"));
+export const DeleteBranchDialog = lazy(() => import("../dialogs/DeleteBranchDialog"));
+export const BulkActionDialog = lazy(() =>
+  import("../dialogs/BulkActionDialog").then((module) => ({ default: module.BulkActionDialog })),
+);
 export const ReflogDialog = lazy(() => import("../dialogs/ReflogDialog"));
 export const ConflictResolutionDialog = lazy(() => import("../dialogs/ConflictResolutionDialog"));
 export const PullRequestDialog = lazy(() => import("../dialogs/PullRequestDialog"));

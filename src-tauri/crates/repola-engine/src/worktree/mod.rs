@@ -1,9 +1,12 @@
 mod actions;
 mod agents;
+mod branch_deletion;
+mod branch_pull_requests;
 mod branches;
 mod claude;
 mod codex;
 pub(crate) mod command;
+mod command_display;
 mod create_worktree;
 mod discovery;
 mod external_tools;
@@ -26,6 +29,7 @@ mod working_copy;
 
 pub use crate::preferences::{TextGenerationProvider, TextGenerationSelection};
 pub use actions::{execute_action, prepare_action};
+pub use branch_deletion::{execute_branch_deletion, plan_branch_deletion};
 pub use branches::{branches, mutate_branch};
 pub use create_worktree::create_worktree;
 pub use discovery::{resolve_repository, scan, scan_streaming, ScanError};
@@ -38,15 +42,19 @@ pub use history_mutations::mutate_history;
 pub use inspection::worktree_changes;
 pub use models::{
     ActionExecutionRequest, ActionKind, ActionPlan, ActionRequest, ActionResult,
-    ApplyPatchHunkRequest, BranchInfo, BranchMutationRequest, BranchMutationResult, BranchRequest,
-    CloneRepositoryRequest, CommitChangedFile, CommitFileDiffRequest, CommitFilesRequest,
-    CommitRequest, CommitResult, ConflictFile, ConflictFileRequest, CreateRepositoryRequest,
-    CreateWorktreeRequest, CreateWorktreeResult, DiscardAllRequest, DiscardFileRequest,
-    DiscardScope, FileDiff, FileDiffRequest, GenerateCommitMessageRequest, GeneratedCommitMessage,
-    HistoryMutationKind, HistoryMutationRequest, HistoryMutationResult, HistoryPage,
-    HistoryRequest, PatchHunk, PatchHunkAction, PullRequestEvidence, PullRequestMutationKind,
-    PullRequestMutationRequest, PullRequestMutationResult, ReasoningEffort, ReflogEntry,
-    ReflogRequest, RepositoryOperationAction, RepositoryOperationMutationResult,
+    ApplyPatchHunkRequest, BranchDeletionConfirmation, BranchDeletionExecutionRequest,
+    BranchDeletionFingerprint, BranchDeletionPlan, BranchDeletionRequest, BranchDeletionResult,
+    BranchDeletionStep, BranchInfo, BranchMutationRequest, BranchMutationResult,
+    BranchPullRequests, BranchRequest, CloneRepositoryRequest, CommitChangedFile,
+    CommitFileDiffRequest, CommitFilesRequest, CommitRequest, CommitResult, ConflictFile,
+    ConflictFileRequest, CreateRepositoryRequest, CreateWorktreeRequest, CreateWorktreeResult,
+    DiscardAllRequest, DiscardFileRequest, DiscardScope, FileDiff, FileDiffRequest,
+    GenerateCommitMessageRequest, GeneratedCommitMessage, HistoryMutationKind,
+    HistoryMutationRequest, HistoryMutationResult, HistoryPage, HistoryRequest,
+    LocalBranchDeletion, MergeReferenceKind, OpenPullRequest, PatchHunk, PatchHunkAction,
+    PullRequestEvidence, PullRequestMutationKind, PullRequestMutationRequest,
+    PullRequestMutationResult, PullRequestRelation, ReasoningEffort, ReflogEntry, ReflogRequest,
+    RemoteBranchDeletion, RepositoryOperationAction, RepositoryOperationMutationResult,
     RepositoryOperationRequest, RepositoryOperationResult, ResolveConflictRequest,
     ReviewedFileChange, ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry,
     StashMutationRequest, StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo,

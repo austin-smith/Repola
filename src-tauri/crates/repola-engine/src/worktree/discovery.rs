@@ -284,6 +284,7 @@ pub(crate) fn parse_worktree_porcelain(bytes: &[u8]) -> Vec<WorktreeSeed> {
             }
             current = Some(WorktreeSeed {
                 path: native_path(path),
+                bare: false,
                 head: None,
                 branch: None,
                 detached: false,
@@ -302,6 +303,8 @@ pub(crate) fn parse_worktree_porcelain(bytes: &[u8]) -> Vec<WorktreeSeed> {
                         .unwrap_or(branch)
                         .to_string(),
                 );
+            } else if text == "bare" {
+                record.bare = true;
             } else if text == "detached" {
                 record.detached = true;
             } else if text == "locked" {

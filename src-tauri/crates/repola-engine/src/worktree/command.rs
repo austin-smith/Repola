@@ -477,6 +477,27 @@ where
     launch_with_timeout(program, command, Some(input), timeout)
 }
 
+/// Runs `program` in `directory` with nothing on its stdin and without the
+/// `removed` environment variables, stopping it after `timeout`.
+pub(crate) fn output_at_with_timeout_without_env<I, S>(
+    directory: &Path,
+    program: &str,
+    args: I,
+    removed: &[&str],
+    timeout: Duration,
+) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = command(program)?;
+    command.current_dir(directory).args(args);
+    for name in removed {
+        command.env_remove(name);
+    }
+    launch_with_timeout(program, command, Some(&[]), timeout)
+}
+
 pub fn git_at<I, S>(path: &Path, args: I) -> Result<Output, CommandError>
 where
     I: IntoIterator<Item = S>,
