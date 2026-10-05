@@ -20,7 +20,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -43,6 +43,11 @@ const MANIFEST_VERSION: u32 = 1;
 /// Paths listed in a summary for display; the manifest holds all of them.
 const SUMMARY_SAMPLE_PATHS: usize = 20;
 const MAX_SUMMARY_BYTES: usize = 64 * 1024;
+/// For Git steps that run once a discard or restore has started changing
+/// files: running out of time partway would leave the change half done, so
+/// they get as long as a remote change is waited for rather than the usual
+/// limit for one Git command.
+pub(super) const CHANGE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 pub(super) const CHANGED_WHILE_SAVING: &str =
     "The working copy changed while Repola was saving it. Nothing was changed; review it again.";
 /// Summaries read per Git invocation: at most 16 MiB, half the capture limit.
@@ -2079,9 +2084,13 @@ fn apply_restore(
     }
     removals.extend(input);
     if !removals.is_empty() {
-        let output =
-            command::git_at_with_input(worktree, ["update-index", "-z", "--index-info"], &removals)
-                .map_err(|error| error.to_string())?;
+        let output = command::git_at_with_input_timeout(
+            worktree,
+            ["update-index", "-z", "--index-info"],
+            &removals,
+            CHANGE_TIMEOUT,
+        )
+        .map_err(|error| error.to_string())?;
         successful_stdout(output, "restore the saved index entries")?;
     }
     if !intents.is_empty() {
@@ -2090,12 +2099,13 @@ fn apply_restore(
     restore_index_flags(worktree, changed)?;
     // Entries written without stat data would otherwise look modified to
     // commands that do not refresh the index first.
-    git_stdout(
+    let output = command::git_at_timeout(
         worktree,
         ["update-index", "-q", "--unmerged", "--refresh"],
-        "refresh the index",
+        CHANGE_TIMEOUT,
     )
-    .map(drop)
+    .map_err(|error| error.to_string())?;
+    successful_stdout(output, "refresh the index").map(drop)
 }
 
 /// Records intent-to-add entries the way they were made, since plumbing cannot
@@ -2127,7 +2137,7 @@ fn restore_intents(
             Ok(())
         })
         .and_then(|()| {
-            let output = command::git_at_with_input(
+            let output = command::git_at_with_input_timeout(
                 worktree,
                 [
                     "add",
@@ -2137,6 +2147,7 @@ fn restore_intents(
                     "--pathspec-file-nul",
                 ],
                 intents,
+                CHANGE_TIMEOUT,
             )
             .map_err(|error| error.to_string())?;
             successful_stdout(output, "restore the intent-to-add entries").map(drop)
@@ -2221,11 +2232,10 @@ fn restore_worktree_entry(
     if entry.kind == WorktreeEntryKind::Symlink {
         // Only a real link on disk is saved as one, so it comes back as one
         // whatever `core.symlinks` says.
-        let link = git_stdout(
-            worktree,
-            ["cat-file", "blob", &entry.oid],
-            "read the saved link",
-        )?;
+        let output =
+            command::git_at_timeout(worktree, ["cat-file", "blob", &entry.oid], CHANGE_TIMEOUT)
+                .map_err(|error| error.to_string())?;
+        let link = successful_stdout(output, "read the saved link")?;
         replace_with_symlink(&target, &link, entry.directory_link, &path.display)
     } else {
         replace_with_blob(worktree, entry, &target, &path.display)
@@ -2400,8 +2410,10 @@ fn write_object(worktree: &Path, oid: &str, destination: &Path) -> Result<fs::Fi
         .open(destination)
         .map_err(|error| error.to_string())?;
     let sink = file.try_clone().map_err(|error| error.to_string())?;
-    let output = command::git_at_to_file(worktree, ["cat-file", "blob", oid], sink)
-        .map_err(|error| error.to_string())?;
+    // A restore may be writing it, so it is not cut short by the usual limit.
+    let output =
+        command::git_at_to_file_timeout(worktree, ["cat-file", "blob", oid], sink, CHANGE_TIMEOUT)
+            .map_err(|error| error.to_string())?;
     successful_stdout(output, "read the saved file")?;
     file.sync_all().map_err(|error| error.to_string())?;
     Ok(file)
@@ -2508,9 +2520,13 @@ fn set_index_flag(
     if input.is_empty() {
         return Ok(());
     }
-    let output =
-        command::git_at_with_input(worktree, ["update-index", "-z", flag, "--stdin"], &input)
-            .map_err(|error| error.to_string())?;
+    let output = command::git_at_with_input_timeout(
+        worktree,
+        ["update-index", "-z", flag, "--stdin"],
+        &input,
+        CHANGE_TIMEOUT,
+    )
+    .map_err(|error| error.to_string())?;
     successful_stdout(output, "restore the saved index flags").map(drop)
 }
 

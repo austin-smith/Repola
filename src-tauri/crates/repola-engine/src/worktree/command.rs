@@ -534,8 +534,22 @@ where
     launch("git", command, Some(input))
 }
 
-/// Like `git_at_with_input`, with a time limit of its own for a step that
-/// handles content of any size.
+/// Like `git_at`, with a time limit of its own.
+pub(crate) fn git_at_timeout<I, S>(
+    path: &Path,
+    args: I,
+    timeout: Duration,
+) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = command("git")?;
+    command.arg("-C").arg(path).args(args);
+    launch_with_timeout("git", command, None, timeout)
+}
+
+/// Like `git_at_with_input`, with a time limit of its own.
 pub(crate) fn git_at_with_input_timeout<I, S>(
     path: &Path,
     args: I,
@@ -598,15 +612,23 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    git_at_to_file_timeout(path, args, file, COMMAND_TIMEOUT)
+}
+
+/// Like `git_at_to_file`, with a time limit of its own.
+pub(crate) fn git_at_to_file_timeout<I, S>(
+    path: &Path,
+    args: I,
+    file: std::fs::File,
+    timeout: Duration,
+) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut command = command("git")?;
     command.arg("-C").arg(path).args(args);
-    run(
-        "git",
-        command,
-        None,
-        COMMAND_TIMEOUT,
-        StdoutSink::File(file),
-    )
+    run("git", command, None, timeout, StdoutSink::File(file))
 }
 
 pub fn successful_git_at<I, S>(path: &Path, args: I) -> Result<Output, CommandError>

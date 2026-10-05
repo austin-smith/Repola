@@ -9,7 +9,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::Duration;
 
 use super::command;
 use super::models::{
@@ -21,14 +20,9 @@ use super::recovery::{
     create_recovery_point, file_folder_conflict, fingerprint, head_entries, keep_within,
     observe_paths, prepare_recovery_point, push_index_info, remove_empty_directory,
     remove_worktree_entry, store_contents, stored_bytes, HeadEntry, PathState, Removals,
-    CHANGED_WHILE_SAVING, MAX_LISTED_BYTES,
+    CHANGED_WHILE_SAVING, CHANGE_TIMEOUT, MAX_LISTED_BYTES,
 };
 use super::working_copy::{decode_path_token_bytes, ensure_success, working_copy_snapshot};
-
-/// Writing the discarded files back runs Git's filters over content of any
-/// size, so it may take as long as a remote discard is waited for rather than
-/// the usual limit for one Git command.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
 const STALE_PLAN: &str =
     "The working copy changed after this discard was reviewed. Nothing was discarded; review it again.";
@@ -534,10 +528,11 @@ fn execute(worktree: &Path, planned: &Planned) -> Result<(), String> {
     }
     let index_info = [planned.index_removals.as_slice(), &planned.index_writes].concat();
     if !index_info.is_empty() {
-        let output = command::git_at_with_input(
+        let output = command::git_at_with_input_timeout(
             worktree,
             ["update-index", "-z", "--index-info"],
             &index_info,
+            CHANGE_TIMEOUT,
         )
         .map_err(|error| error.to_string())?;
         ensure_success(output, "update the index")?;
@@ -547,10 +542,11 @@ fn execute(worktree: &Path, planned: &Planned) -> Result<(), String> {
         ("--assume-unchanged", &planned.assume_unchanged),
     ] {
         if !paths.is_empty() {
-            let output = command::git_at_with_input(
+            let output = command::git_at_with_input_timeout(
                 worktree,
                 ["update-index", "-z", flag, "--stdin"],
                 paths,
+                CHANGE_TIMEOUT,
             )
             .map_err(|error| error.to_string())?;
             ensure_success(output, "keep the index flags")?;
@@ -573,12 +569,16 @@ fn execute(worktree: &Path, planned: &Planned) -> Result<(), String> {
                 "--stdin",
             ],
             &planned.checkout,
-            WRITE_TIMEOUT,
+            CHANGE_TIMEOUT,
         )
         .map_err(|error| error.to_string())?;
         ensure_success(output, "write the restored files")?;
-        let output = command::git_at(worktree, ["update-index", "-q", "--unmerged", "--refresh"])
-            .map_err(|error| error.to_string())?;
+        let output = command::git_at_timeout(
+            worktree,
+            ["update-index", "-q", "--unmerged", "--refresh"],
+            CHANGE_TIMEOUT,
+        )
+        .map_err(|error| error.to_string())?;
         ensure_success(output, "refresh the index")?;
     }
     Ok(())
