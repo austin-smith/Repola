@@ -315,4 +315,14 @@ describe("DeleteBranchDialog", () => {
     expect(await screen.findByText("Could not check for open pull requests")).toBeInTheDocument();
     expect(screen.getByText("The gh CLI is not installed on this machine.")).toBeInTheDocument();
   });
+
+  it("does not claim there are no open pull requests when the provider has more than it listed", async () => {
+    reviewRemoteWith({ status: "checked", provider: "azureDevOps", pulls: [], moreThanListed: true });
+    renderDialog();
+    await screen.findByText(/update-ref --no-deref -d refs\/heads\/feature/);
+    fireEvent.click(screen.getByRole("checkbox", { name: "Remote branch origin/feature" }));
+
+    expect(await screen.findByText("Open pull requests may use origin/feature")).toBeInTheDocument();
+    expect(screen.queryByText(/No open pull requests/)).not.toBeInTheDocument();
+  });
 });

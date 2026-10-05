@@ -319,6 +319,15 @@ function PullRequestCheck({ name, check }: { name: string; check: BranchPullRequ
       </Alert>
     );
   }
+  if (check.pulls.length === 0 && check.moreThanListed) {
+    return (
+      <Alert variant="warning">
+        <GitPullRequestIcon aria-hidden="true" />
+        <AlertTitle>Open pull requests may use {name}</AlertTitle>
+        <AlertDescription>{pullRequestOverflow(check.provider)}</AlertDescription>
+      </Alert>
+    );
+  }
   if (check.pulls.length === 0) {
     return <p className="text-xs text-muted-foreground">No open pull requests merge from or into {name}.</p>;
   }
