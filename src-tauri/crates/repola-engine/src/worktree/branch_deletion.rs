@@ -527,16 +527,19 @@ pub fn execute_branch_deletion(
                     tracking_kept,
                 } => {
                     already_gone = true;
+                    let absent = "0".repeat(remote.expected_oid.len());
                     match tracking_kept {
                         None => (
                             true,
                             None,
+                            // Recreates the ref only while it does not exist.
                             vec![git_command_line(
                                 worktree,
                                 [
                                     "update-ref",
                                     remote.tracking_ref.as_str(),
                                     remote.expected_oid.as_str(),
+                                    absent.as_str(),
                                 ],
                             )],
                         ),
@@ -3840,13 +3843,41 @@ mod tests {
             .expect("remote details")
             .expected_oid
             .clone();
-        let restore = ["update-ref", "refs/remotes/origin/gone", tip.as_str()];
+        let absent = "0".repeat(tip.len());
+        let restore = [
+            "update-ref",
+            "refs/remotes/origin/gone",
+            tip.as_str(),
+            absent.as_str(),
+        ];
         assert_eq!(
             remote.recovery_commands,
             vec![git_command_line(Path::new(&plan.worktree_path), restore)]
         );
+
+        // A later fetch can bring the ref back at another commit, which the
+        // restore must not overwrite.
+        commit(&fixture.repository, "fetched later");
+        git(
+            &fixture.repository,
+            &["update-ref", "refs/remotes/origin/gone", "HEAD"],
+        );
+        let refused = command::git_at(&fixture.repository, restore).expect("run the restore");
+        assert!(!refused.status.success());
+        assert_ne!(
+            resolve(&fixture.repository, "refs/remotes/origin/gone").expect("resolve"),
+            Some(tip.clone())
+        );
+
+        git(
+            &fixture.repository,
+            &["update-ref", "-d", "refs/remotes/origin/gone"],
+        );
         git(&fixture.repository, &restore);
-        assert!(fixture.has_ref("refs/remotes/origin/gone"));
+        assert_eq!(
+            resolve(&fixture.repository, "refs/remotes/origin/gone").expect("resolve"),
+            Some(tip)
+        );
     }
 
     #[test]
