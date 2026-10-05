@@ -15,6 +15,8 @@
 //! `git log --all` never show it, writing it needs no identity or signing, and
 //! every saved object stays reachable until the user deletes the point.
 
+use std::cell::OnceCell;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -655,7 +657,7 @@ pub(super) fn observe_paths(
     let mut folder_listings = HashMap::new();
     let mut observed = Vec::with_capacity(paths.len());
     for (path, valid) in paths.iter().zip(&validated) {
-        let chain = parent_chain(worktree, valid)?;
+        let chain = parent_chain(worktree, valid, &path.display, &mut folder_listings)?;
         let blocked = chain.blocked;
         let mut item = Observed {
             index: index.remove(&valid.bytes).unwrap_or_default(),
@@ -679,6 +681,7 @@ pub(super) fn observe_paths(
             }
             Err(error) => return Err(format!("{} could not be inspected: {error}", path.display)),
         };
+        refuse_alias(&location, &path.display, &mut folder_listings)?;
         for identity in entry_identity(&location, &metadata, &mut folder_listings)? {
             if let Some(other) = entries_on_disk.insert(identity, path) {
                 return Err(format!(
@@ -825,7 +828,12 @@ fn indexed_parents(worktree: &Path, paths: &[WorktreePath]) -> Result<HashSet<Ve
 /// How many of `path`'s parent folders exist as real folders, counted from
 /// the top, and whether the first that does not is a file or a link rather
 /// than missing.
-fn parent_chain(worktree: &Path, path: &WorktreePath) -> Result<ParentChain, String> {
+fn parent_chain(
+    worktree: &Path,
+    path: &WorktreePath,
+    display: &str,
+    folder_listings: &mut HashMap<PathBuf, FolderListing>,
+) -> Result<ParentChain, String> {
     let parents = &path.components[..path.components.len().saturating_sub(1)];
     let mut chain = ParentChain {
         existing: 0,
@@ -835,7 +843,11 @@ fn parent_chain(worktree: &Path, path: &WorktreePath) -> Result<ParentChain, Str
     let mut current = worktree.to_path_buf();
     for component in parents {
         current.push(component);
-        match fs::symlink_metadata(&current) {
+        let found = fs::symlink_metadata(&current);
+        if found.is_ok() {
+            refuse_alias(&current, display, folder_listings)?;
+        }
+        match found {
             Ok(metadata) if metadata.file_type().is_dir() => {
                 chain.existing += 1;
                 chain.permissions.extend(permission_bits(&metadata));
@@ -864,11 +876,93 @@ struct ParentChain {
     permissions: Vec<u32>,
 }
 
-/// A folder's entries: their names, and on Unix their inodes.
-#[cfg(unix)]
-type FolderListing = Vec<(OsString, u64)>;
-#[cfg(windows)]
-type FolderListing = Vec<OsString>;
+/// A folder's entries, read once.
+struct FolderListing {
+    names: HashSet<OsString>,
+    /// Each name with its inode, to find the names of a link.
+    #[cfg(unix)]
+    inodes: Vec<(OsString, u64)>,
+    /// Every name's case forms, worked out when a name is first not found as
+    /// spelled.
+    forms: OnceCell<HashSet<(usize, String)>>,
+}
+
+impl FolderListing {
+    fn read(folder: &Path) -> Result<Self, String> {
+        let mut listing = Self {
+            names: HashSet::new(),
+            #[cfg(unix)]
+            inodes: Vec::new(),
+            forms: OnceCell::new(),
+        };
+        for entry in fs::read_dir(folder)
+            .map_err(|error| format!("{} could not be read: {error}", folder.display()))?
+        {
+            let entry = entry.map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirEntryExt;
+                listing.inodes.push((entry.file_name(), entry.ino()));
+            }
+            listing.names.insert(entry.file_name());
+        }
+        Ok(listing)
+    }
+
+    /// Whether the folder stores `name` as spelled or under a spelling a file
+    /// system may take as the same name.
+    fn stores(&self, name: &OsStr) -> bool {
+        if self.names.contains(name) {
+            return true;
+        }
+        let forms = self.forms.get_or_init(|| {
+            self.names
+                .iter()
+                .flat_map(|stored| {
+                    case_forms(&stored.to_string_lossy())
+                        .into_iter()
+                        .enumerate()
+                })
+                .collect()
+        });
+        case_forms(&name.to_string_lossy())
+            .into_iter()
+            .enumerate()
+            .any(|form| forms.contains(&form))
+    }
+}
+
+fn folder_listing<'a>(
+    folder: &Path,
+    listings: &'a mut HashMap<PathBuf, FolderListing>,
+) -> Result<&'a FolderListing, String> {
+    Ok(match listings.entry(folder.to_path_buf()) {
+        Entry::Occupied(listing) => listing.into_mut(),
+        Entry::Vacant(listing) => listing.insert(FolderListing::read(folder)?),
+    })
+}
+
+/// Refuses a path that reaches an entry through a name its folder does not
+/// store. A file system can find an entry under such an alias, as Windows
+/// finds one under the short name it makes up for a long name, and `GIT~2`
+/// can be the `.git` folder itself.
+fn refuse_alias(
+    location: &Path,
+    display: &str,
+    listings: &mut HashMap<PathBuf, FolderListing>,
+) -> Result<(), String> {
+    let (Some(folder), Some(name)) = (location.parent(), location.file_name()) else {
+        return Ok(());
+    };
+    if folder_listing(folder, listings)?.stores(name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{display} reaches {} through a name its folder does not store, such as a short name Windows makes up, so Repola will not change it. Rename it with Git first.",
+            location.display()
+        ))
+    }
+}
 
 /// What names one entry on disk, so two paths sharing any of these are one
 /// entry under two spellings. On Unix it is the real path, which on macOS is
@@ -881,7 +975,7 @@ fn entry_identity(
     metadata: &fs::Metadata,
     folder_listings: &mut HashMap<PathBuf, FolderListing>,
 ) -> Result<Vec<OsString>, String> {
-    use std::os::unix::fs::{DirEntryExt, MetadataExt};
+    use std::os::unix::fs::MetadataExt;
     let mut identities = Vec::new();
     let mut real_path = |real: PathBuf| {
         let mut identity = OsString::from("path:");
@@ -900,21 +994,15 @@ fn entry_identity(
         // or else each name stored for the link's own inode.
         let folder = dunce::canonicalize(parent)
             .map_err(|error| format!("{} could not be inspected: {error}", parent.display()))?;
-        if !folder_listings.contains_key(&folder) {
-            let mut listing = Vec::new();
-            for entry in fs::read_dir(&folder)
-                .map_err(|error| format!("{} could not be read: {error}", folder.display()))?
-            {
-                let entry = entry.map_err(|error| error.to_string())?;
-                listing.push((entry.file_name(), entry.ino()));
-            }
-            folder_listings.insert(folder.clone(), listing);
-        }
-        let listing = &folder_listings[&folder];
-        if listing.iter().any(|(stored, _)| stored == name) {
+        let listing = folder_listing(parent, folder_listings)?;
+        if listing.names.contains(name) {
             real_path(folder.join(name));
         } else {
-            for (stored, _) in listing.iter().filter(|(_, inode)| *inode == metadata.ino()) {
+            for (stored, _) in listing
+                .inodes
+                .iter()
+                .filter(|(_, inode)| *inode == metadata.ino())
+            {
                 real_path(folder.join(stored));
             }
         }
@@ -944,22 +1032,15 @@ fn entry_identity(
     };
     let folder = dunce::canonicalize(parent)
         .map_err(|error| format!("{} could not be inspected: {error}", parent.display()))?;
-    if !folder_listings.contains_key(&folder) {
-        let names = fs::read_dir(&folder)
-            .map_err(|error| format!("{} could not be read: {error}", folder.display()))?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        folder_listings.insert(folder.clone(), names);
-    }
-    let listing = &folder_listings[&folder];
-    if listing.iter().any(|stored| stored == name) {
+    let listing = folder_listing(parent, folder_listings)?;
+    if listing.names.contains(name) {
         return Ok(vec![folder.join(name).into_os_string()]);
     }
     // The file system found the name under another spelling, so the folder
     // stores it under a name sharing one of its forms. Any that does counts.
     let wanted = case_forms(&name.to_string_lossy());
     Ok(listing
+        .names
         .iter()
         .filter(|stored| {
             let forms = case_forms(&stored.to_string_lossy());
@@ -4049,6 +4130,32 @@ mod tests {
         .expect("stored identity");
         let found = entry_identity(&other, &metadata, &mut listings).expect("identity");
         assert!(found.iter().any(|identity| stored.contains(identity)));
+    }
+
+    #[test]
+    fn a_name_its_folder_does_not_store_is_refused() {
+        let (_directory, path) = repository();
+        fs::create_dir(path.join("longfoldername")).expect("folder");
+        fs::write(path.join("longfoldername/file.txt"), b"one\n").expect("write");
+        fs::write(path.join("longfilename.txt"), b"two\n").expect("write");
+        let listing = FolderListing::read(&path).expect("listing");
+        assert!(listing.stores(OsStr::new("longfilename.txt")));
+        assert!(listing.stores(OsStr::new("LONGFILENAME.TXT")));
+        assert!(!listing.stores(OsStr::new("LONGFI~1.TXT")));
+        // Where the file system finds entries under the short names Windows
+        // makes up, a path through one is refused.
+        for alias in ["LONGFO~1/file.txt", "LONGFI~1.TXT"] {
+            if path.join(alias).exists() {
+                let error = observe_paths(&path, None, &[git_path(alias.as_bytes())], false)
+                    .expect_err("an alias");
+                assert!(error.contains("does not store"), "{error}");
+            }
+        }
+        let stored = [
+            git_path(b"longfoldername/file.txt"),
+            git_path(b"longfilename.txt"),
+        ];
+        observe_paths(&path, None, &stored, false).expect("stored names");
     }
 
     // Only macOS file systems compare names this way.
