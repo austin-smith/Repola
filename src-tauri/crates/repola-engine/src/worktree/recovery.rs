@@ -1361,6 +1361,15 @@ pub(super) fn store_contents(worktree: &Path, states: &[PathState]) -> Result<()
         .filter_map(|state| state.worktree.as_ref())
         .map(|entry| (entry.oid.as_str(), entry.size))
         .collect();
+    if !objects_have_sizes(worktree, &objects)? {
+        return Err("Git did not store the saved content intact, so nothing was changed.".into());
+    }
+    Ok(())
+}
+
+/// Whether every one of `objects` is stored with the size given beside it.
+/// Git reports sizes without reading the content.
+fn objects_have_sizes(worktree: &Path, objects: &[(&str, u64)]) -> Result<bool, String> {
     for chunk in objects.chunks(SUMMARIES_PER_READ) {
         let input: String = chunk.iter().map(|(oid, _)| format!("{oid}\n")).collect();
         let output = command::git_at_with_input(
@@ -1380,12 +1389,10 @@ pub(super) fn store_contents(worktree: &Path, states: &[PathState]) -> Result<()
                 .zip(chunk)
                 .all(|(line, (oid, size))| *line == format!("{oid} {size}"));
         if !intact {
-            return Err(
-                "Git did not store the saved content intact, so nothing was changed.".into(),
-            );
+            return Ok(false);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Creates `id` pointing at `tree`. The all-zero old value makes the update
@@ -1692,11 +1699,10 @@ fn verify_manifest(worktree: &Path, tree: &str, states: &[PathState]) -> Result<
         // Reviews show a path's name and restores act on its token, so the
         // two must agree, and a token has one spelling so no path is saved
         // twice under two.
-        let bytes = decode_path_token_bytes(&state.path.token)?;
-        if state.path != git_path(&bytes) || !seen.insert(state.path.token.as_str()) {
+        let path = decode_path_token_bytes(&state.path.token)?;
+        if state.path != git_path(&path) || !seen.insert(state.path.token.as_str()) {
             return Err(damaged());
         }
-        let path = decode_path_token_bytes(&state.path.token)?;
         if let Some(entry) = &state.worktree {
             let key = [b"worktree/".as_slice(), &path].concat();
             if entries.get(key.as_slice()) != Some(&(entry.kind.mode(), entry.oid.as_str())) {
@@ -1715,6 +1721,15 @@ fn verify_manifest(worktree: &Path, tree: &str, states: &[PathState]) -> Result<
                 return Err(damaged());
             }
         }
+    }
+    // Previews and restores rely on the sizes recorded for saved files.
+    let saved_files: Vec<(&str, u64)> = states
+        .iter()
+        .filter_map(|state| state.worktree.as_ref())
+        .map(|entry| (entry.oid.as_str(), entry.size))
+        .collect();
+    if !objects_have_sizes(worktree, &saved_files)? {
+        return Err(damaged());
     }
     Ok(())
 }
@@ -3195,6 +3210,38 @@ mod tests {
             );
         }
         assert_eq!(fs::read(path.join(".env")).expect("read"), b"secret\n");
+    }
+
+    #[test]
+    fn a_manifest_understating_a_saved_file_is_refused() {
+        let (_directory, path) = repository();
+        let large = hash_bytes(&path, &vec![b'x'; 64 * 1024], true).expect("large");
+        let state = PathState {
+            path: git_path(b"a.txt"),
+            index: Vec::new(),
+            worktree: Some(WorktreeEntry {
+                kind: WorktreeEntryKind::File,
+                oid: large.clone(),
+                size: 6,
+                permissions: None,
+                directory_link: false,
+            }),
+            directory: false,
+            folder_permissions: None,
+            parents: 0,
+            parent_permissions: Vec::new(),
+            blocked: false,
+            index_beneath: 0,
+            indexed_parent: None,
+        };
+        let point = craft(
+            &path,
+            "understated",
+            &manifest_for(&[state]),
+            &[("100644", large, b"worktree/a.txt".to_vec())],
+        );
+        let error = plan(&path, &point).expect_err("damaged");
+        assert!(error.contains("damaged"), "{error}");
     }
 
     #[test]
