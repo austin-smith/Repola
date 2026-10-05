@@ -40,6 +40,19 @@ pub enum CommandError {
         stream: &'static str,
         maximum: usize,
     },
+    #[error("Could not save the output of {program}: {source}")]
+    SaveOutput {
+        program: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Where a child's stdout goes: captured in memory up to the stream bound, or
+/// copied without a bound into a file the caller owns.
+enum StdoutSink {
+    Capture,
+    File(std::fs::File),
 }
 
 /// Windows `CREATE_NO_WINDOW` process-creation flag. Without it every child
@@ -253,9 +266,19 @@ fn launch(program: &str, command: Command, input: Option<&[u8]>) -> Result<Outpu
 
 fn launch_with_timeout(
     program: &str,
+    command: Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<Output, CommandError> {
+    run(program, command, input, timeout, StdoutSink::Capture)
+}
+
+fn run(
+    program: &str,
     mut command: Command,
     input: Option<&[u8]>,
     timeout: Duration,
+    sink: StdoutSink,
 ) -> Result<Output, CommandError> {
     let token = operation::current_operation();
     if token.is_cancelled() {
@@ -278,7 +301,10 @@ fn launch_with_timeout(
     })?;
     let stdout = child.stdout().take().expect("captured stdout must exist");
     let stderr = child.stderr().take().expect("captured stderr must exist");
-    let stdout_reader = thread::spawn(move || read_bounded(stdout));
+    let stdout_reader = thread::spawn(move || match sink {
+        StdoutSink::Capture => Ok(read_bounded(stdout)),
+        StdoutSink::File(file) => copy_into(stdout, file).map(|()| (Vec::new(), false)),
+    });
     let stderr_reader = thread::spawn(move || read_bounded(stderr));
     let mut input_writer = input.map(|input| {
         let mut stdin = child.stdin().take().expect("piped stdin must exist");
@@ -338,7 +364,13 @@ fn launch_with_timeout(
             source,
         });
     }
-    let (stdout, stdout_truncated) = stdout_reader.join().unwrap_or_default();
+    let (stdout, stdout_truncated) = stdout_reader
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("command output reader panicked")))
+        .map_err(|source| CommandError::SaveOutput {
+            program: program.to_string(),
+            source,
+        })?;
     let (stderr, stderr_truncated) = stderr_reader.join().unwrap_or_default();
     if stdout_truncated {
         return Err(CommandError::OutputTooLarge {
@@ -359,6 +391,11 @@ fn launch_with_timeout(
         stdout,
         stderr,
     })
+}
+
+fn copy_into<R: Read>(mut reader: R, mut file: std::fs::File) -> std::io::Result<()> {
+    std::io::copy(&mut reader, &mut file)?;
+    file.flush()
 }
 
 fn read_bounded<R: Read>(mut reader: R) -> (Vec<u8>, bool) {
@@ -497,6 +534,37 @@ where
     launch("git", command, Some(input))
 }
 
+/// Like `git_at`, with a time limit of its own.
+pub(crate) fn git_at_timeout<I, S>(
+    path: &Path,
+    args: I,
+    timeout: Duration,
+) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = command("git")?;
+    command.arg("-C").arg(path).args(args);
+    launch_with_timeout("git", command, None, timeout)
+}
+
+/// Like `git_at_with_input`, with a time limit of its own.
+pub(crate) fn git_at_with_input_timeout<I, S>(
+    path: &Path,
+    args: I,
+    input: &[u8],
+    timeout: Duration,
+) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = command("git")?;
+    command.arg("-C").arg(path).args(args);
+    launch_with_timeout("git", command, Some(input), timeout)
+}
+
 pub fn git_at_with_env<I, S, E, K, V>(
     path: &Path,
     args: I,
@@ -530,6 +598,37 @@ where
     let mut command = command("git")?;
     command.arg("-C").arg(path).args(args).envs(environment);
     launch("git", command, Some(input))
+}
+
+/// Runs Git with stdout copied straight into `file` instead of captured, so
+/// object contents larger than the capture bound can be saved. The returned
+/// output carries stderr only.
+pub fn git_at_to_file<I, S>(
+    path: &Path,
+    args: I,
+    file: std::fs::File,
+) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    git_at_to_file_timeout(path, args, file, COMMAND_TIMEOUT)
+}
+
+/// Like `git_at_to_file`, with a time limit of its own.
+pub(crate) fn git_at_to_file_timeout<I, S>(
+    path: &Path,
+    args: I,
+    file: std::fs::File,
+    timeout: Duration,
+) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = command("git")?;
+    command.arg("-C").arg(path).args(args);
+    run("git", command, None, timeout, StdoutSink::File(file))
 }
 
 pub fn successful_git_at<I, S>(path: &Path, args: I) -> Result<Output, CommandError>

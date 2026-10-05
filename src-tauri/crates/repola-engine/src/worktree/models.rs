@@ -688,18 +688,6 @@ pub enum DiscardScope {
     All,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscardFileRequest {
-    pub repository_path: String,
-    pub worktree_path: String,
-    pub path: GitPath,
-    pub scope: DiscardScope,
-    pub expected_head: Option<String>,
-    pub expected_index_status: String,
-    pub expected_worktree_status: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewedFileChange {
@@ -709,13 +697,246 @@ pub struct ReviewedFileChange {
     pub worktree_status: String,
 }
 
+/// What a discard covers. Every variant is planned first and then executed
+/// against the plan's fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum DiscardTarget {
+    File { path: GitPath, scope: DiscardScope },
+    All,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DiscardAllRequest {
+pub struct DiscardPlanRequest {
     pub repository_path: String,
     pub worktree_path: String,
-    pub expected_head: Option<String>,
-    pub expected_changes: Vec<ReviewedFileChange>,
+    pub target: DiscardTarget,
+}
+
+/// The exact, read-only preview of a discard. `fingerprint` identifies the
+/// HEAD, any in-progress operation, and the index entries and working-tree
+/// contents of every path the discard would touch; execution refuses unless
+/// it observes the same state.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscardPlan {
+    pub target: DiscardTarget,
+    /// As many entries as fit in one response.
+    pub entries: Vec<DiscardPlanEntry>,
+    /// Paths the discard changes beyond `entries`.
+    pub omitted: u64,
+    /// As many as fit in one response.
+    pub kept: Vec<KeptChange>,
+    /// Paths left alone beyond `kept`.
+    pub kept_omitted: u64,
+    /// Working-tree bytes the recovery point adds to the object store.
+    pub backup_bytes: u64,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscardPlanEntry {
+    pub path: GitPath,
+    pub effect: DiscardEffect,
+    /// A file is at the path now.
+    pub on_disk: bool,
+    /// The index has an entry for the path now.
+    pub tracked: bool,
+}
+
+/// What a discard does to one path, decided from what the last commit, the
+/// index, and the disk hold there. A rename is two paths: its new name and
+/// its original one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiscardEffect {
+    /// The index entry and the file return to the last commit's version.
+    RestoreCommitted,
+    /// The file returns to the staged version.
+    RestoreStaged,
+    /// The last commit lacks the path, so its index entry, if any, and its
+    /// file are removed.
+    Remove,
+    /// The last commit lacks the path and its file is already gone, so only
+    /// its index entry is removed.
+    Unstage,
+    /// The index entry returns to the last commit's version; the file stays
+    /// off disk, where sparse checkout leaves it.
+    RestoreCommittedStaged,
+}
+
+/// A change a discard deliberately leaves alone because its content cannot be
+/// saved in a recovery point.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeptChange {
+    pub path: GitPath,
+    pub reason: KeptChangeReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KeptChangeReason {
+    Submodule,
+    NestedRepository,
+    /// The path is a file in one place and a folder in another, so restoring
+    /// it would replace something the discard does not save.
+    FileFolderConflict,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscardRequest {
+    pub repository_path: String,
+    pub worktree_path: String,
+    pub target: DiscardTarget,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscardResult {
+    pub recovery_point: RecoveryPoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RecoveryPointKind {
+    DiscardFile,
+    DiscardAll,
+    /// The state a restore replaced, saved before the restore ran.
+    Restore,
+}
+
+/// Content saved by Repola before it discarded or overwrote it, stored as a
+/// Git tree under `refs/repola/discarded/` in the repository's common Git
+/// directory on the machine that owns the working copy.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryPoint {
+    /// The full reference name.
+    pub id: String,
+    /// The tree the reference points at.
+    pub oid: String,
+    pub kind: RecoveryPointKind,
+    pub summary: String,
+    /// RFC 3339 UTC timestamp.
+    pub created_at: String,
+    pub worktree_path: String,
+    pub head: Option<String>,
+    pub path_count: u64,
+    /// The first saved paths, for display; `path_count` is authoritative.
+    pub paths: Vec<GitPath>,
+    pub stored_bytes: u64,
+}
+
+/// The newest recovery points that fit in one response, and how many older
+/// ones were left out.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryPointList {
+    pub points: Vec<RecoveryPoint>,
+    pub omitted: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryPointReference {
+    pub id: String,
+    pub oid: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryPointRequest {
+    pub repository_path: String,
+    pub worktree_path: String,
+    pub point: RecoveryPointReference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RestoreEffect {
+    Unchanged,
+    Create,
+    Replace,
+    Remove,
+    /// A folder stood at the path when it was saved; whatever is there now is
+    /// removed and the folder comes back.
+    CreateFolder,
+    /// The saved folder is there, and only its permissions change back.
+    FolderPermissions,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryRestoreEntry {
+    pub path: GitPath,
+    pub worktree: RestoreEffect,
+    /// Whether the path's index entries differ from the saved ones.
+    pub index_changes: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryRestorePlan {
+    pub point: RecoveryPoint,
+    /// As many entries as fit in one response.
+    pub entries: Vec<RecoveryRestoreEntry>,
+    /// Saved paths the restore covers beyond `entries`.
+    pub omitted: u64,
+    /// The current state of every saved path; the restore refuses unless it
+    /// observes the same state.
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryRestoreRequest {
+    pub repository_path: String,
+    pub worktree_path: String,
+    pub point: RecoveryPointReference,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryRestoreResult {
+    /// The recovery point holding the content the restore replaced, when
+    /// there was any.
+    pub replaced: Option<RecoveryPoint>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryFileDiffRequest {
+    pub repository_path: String,
+    pub worktree_path: String,
+    pub point: RecoveryPointReference,
+    pub path: GitPath,
+}
+
+/// The change restoring one saved path would make to the working tree.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryFileDiff {
+    pub patch: String,
+    pub binary: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteRecoveryPointsRequest {
+    pub repository_path: String,
+    pub worktree_path: String,
+    pub points: Vec<RecoveryPointReference>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
