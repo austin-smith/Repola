@@ -1301,6 +1301,18 @@ fn has_branch_config(worktree: &Path, name: &str) -> Result<bool, String> {
 /// it fetches from. A remote with several push URLs is refused: Git pushes to
 /// each in turn, so the branch could be deleted from some while others refuse.
 fn single_push_url(worktree: &Path, remote: &str) -> Result<String, String> {
+    // Either one makes the push run a program of the remote's choosing, which
+    // can act on a different repository than the URL Repola asks about.
+    for setting in ["receivepack", "vcs"] {
+        let key = format!("remote.{remote}.{setting}");
+        let configured = command::git_at(worktree, ["config", "--get", key.as_str()])
+            .map_err(|error| error.to_string())?;
+        if configured.status.success() {
+            return Err(format!(
+                "{remote} sets {key}, so its push runs a program Repola cannot check, and Repola does not delete branches from it."
+            ));
+        }
+    }
     let output = command::git_at(
         worktree,
         ["remote", "get-url", "--push", "--all", "--", remote],
@@ -3934,6 +3946,28 @@ mod tests {
             executing.plan.confirmation,
             BranchDeletionConfirmation::TypeBranchName
         );
+    }
+
+    #[test]
+    fn a_remote_with_its_own_push_program_is_not_deleted_from() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "topic"]);
+        git(&fixture.repository, &["push", "origin", "topic"]);
+        git(
+            &fixture.repository,
+            &["config", "remote.origin.receivepack", "git-receive-pack"],
+        );
+        let plan = fixture.plan("refs/remotes/origin/topic", false, true);
+        assert!(plan.remote.is_none());
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| blocker.contains("remote.origin.receivepack")),
+            "{:?}",
+            plan.blockers
+        );
+        execute(&plan, None).expect_err("the push program cannot be checked");
+        assert!(fixture.remote_has_branch("topic"));
     }
 
     #[test]
