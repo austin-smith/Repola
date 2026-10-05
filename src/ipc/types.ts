@@ -650,6 +650,8 @@ export interface BranchDeletionFingerprint {
   remoteOid: string | null;
   /** The open pull requests the review listed for the remote branch, as `repository#number`, or null when the provider could not be asked. */
   pullRequests: string[] | null;
+  /** The provider had more open pull requests than the review listed. */
+  morePullRequests: boolean;
   /** A digest of the exact URL the remote deletion pushes to, as reviewed. */
   pushDestination: string | null;
   /** A digest of exactly which commits the local deletion would leave unreachable, as reviewed. */

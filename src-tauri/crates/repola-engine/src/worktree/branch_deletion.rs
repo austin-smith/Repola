@@ -260,6 +260,16 @@ fn review(
         }
         _ => None,
     };
+    let more_pull_requests = matches!(
+        remote
+            .as_ref()
+            .filter(|_| request.delete_remote)
+            .and_then(|remote| remote.pull_requests.as_ref()),
+        Some(BranchPullRequests::Checked {
+            more_than_listed: true,
+            ..
+        })
+    );
 
     if let Some(local) = &local {
         if let Some(usage) = occupancy.get(&format!("refs/heads/{}", local.name)) {
@@ -383,6 +393,7 @@ fn review(
         remote_ref: selected_remote.map(|remote| remote.remote_ref.clone()),
         remote_oid: selected_remote.map(|remote| remote.expected_oid.clone()),
         pull_requests: open_pull_requests,
+        more_pull_requests,
         push_destination: push_url
             .as_deref()
             .filter(|_| request.delete_remote)
@@ -438,30 +449,15 @@ pub fn execute_branch_deletion(
     // Pull requests come from the provider, which can fail to answer; only one
     // the review did not show refuses the deletion. It is checked first: a new
     // one also changes the confirmation the fingerprint records.
-    let unreviewed = unreviewed_pull_requests(
-        request.expected.pull_requests.as_deref(),
-        plan.fingerprint.pull_requests.as_deref(),
-    );
-    if !unreviewed.is_empty() {
-        return Err(format!(
-            "{} {} {}, and the review did not show {}. Review the deletion again.",
-            if unreviewed.len() == 1 {
-                "Pull request"
-            } else {
-                "Pull requests"
-            },
-            unreviewed.join(", "),
-            if unreviewed.len() == 1 {
-                format!("now uses {}", plan.branch_name)
-            } else {
-                format!("now use {}", plan.branch_name)
-            },
-            if unreviewed.len() == 1 { "it" } else { "them" },
-        ));
+    if let Some(change) =
+        pull_request_change(&request.expected, &plan.fingerprint, &plan.branch_name)
+    {
+        return Err(change);
     }
     let without_pull_requests =
         |fingerprint: &BranchDeletionFingerprint| BranchDeletionFingerprint {
             pull_requests: None,
+            more_pull_requests: false,
             ..fingerprint.clone()
         };
     if without_pull_requests(&plan.fingerprint) != without_pull_requests(&request.expected)
@@ -662,6 +658,36 @@ fn affects_pull_requests(
         _ => false,
     };
     listed_now || reviewed.is_some_and(|reviewed| !reviewed.is_empty())
+}
+
+/// Why open pull requests found now refuse a deletion reviewed with
+/// `reviewed`: one the review did not show, or more than the provider lists
+/// where the review had them all.
+fn pull_request_change(
+    reviewed: &BranchDeletionFingerprint,
+    current: &BranchDeletionFingerprint,
+    branch: &str,
+) -> Option<String> {
+    let unreviewed = unreviewed_pull_requests(
+        reviewed.pull_requests.as_deref(),
+        current.pull_requests.as_deref(),
+    );
+    if let [single] = unreviewed.as_slice() {
+        return Some(format!(
+            "Pull request {single} now uses {branch}, and the review did not show it. Review the deletion again."
+        ));
+    }
+    if !unreviewed.is_empty() {
+        return Some(format!(
+            "Pull requests {} now use {branch}, and the review did not show them. Review the deletion again.",
+            unreviewed.join(", ")
+        ));
+    }
+    (current.more_pull_requests && !reviewed.more_pull_requests).then(|| {
+        format!(
+            "More open pull requests now use {branch} than Repola can list, and the review did not show that. Review the deletion again."
+        )
+    })
 }
 
 /// The open pull requests found now that the review did not show. The review
@@ -3911,6 +3937,45 @@ mod tests {
             plan.remote.as_ref().expect("remote details").pull_requests,
             None
         );
+    }
+
+    #[test]
+    fn more_pull_requests_than_listed_after_a_complete_review_refuse_the_deletion() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "topic"]);
+        git(&fixture.repository, &["push", "origin", "topic"]);
+        let plan = fixture.plan("refs/remotes/origin/topic", false, true);
+        let fingerprint = |keys: &[&str], more: bool| BranchDeletionFingerprint {
+            pull_requests: Some(keys.iter().map(|key| key.to_string()).collect()),
+            more_pull_requests: more,
+            ..plan.fingerprint.clone()
+        };
+        let all = ["octo/app#1", "octo/app#2"];
+
+        assert_eq!(
+            pull_request_change(
+                &fingerprint(&all, false),
+                &fingerprint(&all, false),
+                "topic"
+            ),
+            None
+        );
+        // The same pull requests come back, but now the provider has more.
+        assert!(
+            pull_request_change(&fingerprint(&all, false), &fingerprint(&all, true), "topic")
+                .is_some_and(|change| change.contains("More open pull requests"))
+        );
+        // The review already said there were more.
+        assert_eq!(
+            pull_request_change(&fingerprint(&all, true), &fingerprint(&all, true), "topic"),
+            None
+        );
+        assert!(pull_request_change(
+            &fingerprint(&all[..1], false),
+            &fingerprint(&all, false),
+            "topic"
+        )
+        .is_some_and(|change| change.contains("Pull request octo/app#2 now uses topic")));
     }
 
     #[test]

@@ -55,6 +55,7 @@ function plan(overrides: Partial<BranchDeletionPlan>): BranchDeletionPlan {
       remoteRef: null,
       remoteOid: null,
       pullRequests: null,
+      morePullRequests: false,
       pushDestination: null,
       localReachability: null,
       remoteReachability: null,

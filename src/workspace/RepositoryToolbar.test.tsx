@@ -222,6 +222,7 @@ describe("RepositoryToolbar", () => {
         remoteRef: null,
         remoteOid: null,
         pullRequests: null,
+        morePullRequests: false,
         pushDestination: null,
         localReachability: null,
         remoteReachability: null,

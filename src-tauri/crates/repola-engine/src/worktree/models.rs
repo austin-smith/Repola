@@ -1130,6 +1130,8 @@ pub struct BranchDeletionFingerprint {
     /// The open pull requests the review listed for the remote branch, by
     /// [`OpenPullRequest::key`], or `None` when the provider could not be asked.
     pub pull_requests: Option<Vec<String>>,
+    /// The provider had more open pull requests than the review listed.
+    pub more_pull_requests: bool,
     /// A digest of the exact URL the remote deletion pushes to, as reviewed.
     /// The plan displays it with credentials redacted, which can make two
     /// different URLs look alike.

@@ -97,6 +97,7 @@ function planFor(request: BranchDeletionRequest, overrides: Partial<BranchDeleti
       remoteRef: request.deleteRemote ? "refs/heads/feature" : null,
       remoteOid: request.deleteRemote ? "a".repeat(40) : null,
       pullRequests: null,
+      morePullRequests: false,
       pushDestination: request.deleteRemote ? "f".repeat(64) : null,
       localReachability: null,
       remoteReachability: null,

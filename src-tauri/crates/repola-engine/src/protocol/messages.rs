@@ -433,7 +433,7 @@ mod tests {
                     remote: Some("origin".into()),
                     remote_ref: Some("refs/heads/feature".into()),
                     remote_oid: Some("a".repeat(40)),
-                    pull_requests: Some(vec!["octo/app#42".into()]),
+                    pull_requests: Some(vec!["octo/app#42".into()]), more_pull_requests: false,
                     push_destination: Some("e".repeat(64)),
                     local_reachability: Some("c".repeat(64)),
                     remote_reachability: Some("d".repeat(64)),
