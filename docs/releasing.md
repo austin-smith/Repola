@@ -1,6 +1,6 @@
 # Releasing Repola
 
-Stable tags (`vX.Y.Z`) create drafts. Nightlies (`X.Y.Z-nightly.<run-number>`) publish daily at 09:17 UTC or through **Release → Run workflow → main → Publish nightly**. Unchanged nightlies are skipped. Both channels require passing three-platform CI at the source commit on `main`.
+Stable tags (`vX.Y.Z`) create drafts. Nightlies (`X.Y.Z-nightly.YYYYMMDD.N`, for example `0.1.0-nightly.20261005.1`) use the workflow run's UTC date and a sequence starting at 1 for each date and base version. Saved build metadata reserves numbers for unpublished or failed builds; reruns reuse the reservation while that artifact remains available. Nightlies publish daily at 09:17 UTC or through **Release → Run workflow → main → Publish nightly**. Unchanged nightlies are skipped. Both channels require passing three-platform CI at the source commit on `main`.
 
 Desktop releases support macOS arm64 (DMG), Linux x64 (AppImage and Debian package), and Windows x64 (NSIS), with matching agents for each target plus Linux arm64.
 

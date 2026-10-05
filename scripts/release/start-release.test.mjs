@@ -157,7 +157,7 @@ describe("source version checks", () => {
 
   it("requires both distinct workspace lock entries and a stable version", () => {
     expect(() => stableVersion({ ...files, "src-tauri/Cargo.lock": files["src-tauri/Cargo.lock"].replace("repola-engine", "repola") })).toThrow(/agree/);
-    expect(() => stableVersion({ ...files, "package.json": '{"version":"0.1.0-nightly.1"}' })).toThrow(/stable/);
+    expect(() => stableVersion({ ...files, "package.json": '{"version":"0.1.0-nightly.20260930.1"}' })).toThrow(/stable/);
   });
 });
 
