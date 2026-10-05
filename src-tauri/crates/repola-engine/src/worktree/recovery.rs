@@ -16,7 +16,7 @@
 //! every saved object stays reachable until the user deletes the point.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -1231,9 +1231,12 @@ fn intent_to_add_paths(
 /// The empty tree's object ID in this repository's hash format, which Git
 /// knows without storing it.
 fn empty_tree(worktree: &Path) -> Result<String, String> {
-    let output =
-        command::git_at_with_input(worktree, ["hash-object", "-t", "tree", "--stdin"], b"")
-            .map_err(|error| error.to_string())?;
+    let output = command::git_at_with_input(
+        worktree,
+        HooksOff::new()?.args(["hash-object", "-t", "tree", "--stdin"]),
+        b"",
+    )
+    .map_err(|error| error.to_string())?;
     let oid = successful_stdout(output, "name the empty tree")?;
     Ok(String::from_utf8_lossy(&oid).trim().to_string())
 }
@@ -1288,8 +1291,8 @@ fn hash_bytes(worktree: &Path, bytes: &[u8], store: bool) -> Result<String, Stri
         args.push("-w");
     }
     args.extend(["--no-filters", "--stdin"]);
-    let output =
-        command::git_at_with_input(worktree, args, bytes).map_err(|error| error.to_string())?;
+    let output = command::git_at_with_input(worktree, HooksOff::new()?.args(args), bytes)
+        .map_err(|error| error.to_string())?;
     let stdout = successful_stdout(output, "hash the saved content")?;
     let oid = String::from_utf8_lossy(&stdout).trim().to_string();
     if !is_object_id(&oid) {
@@ -1405,15 +1408,16 @@ pub(super) fn prepare_recovery_point(
         .map_err(|error| format!("Could not create a temporary Git index: {error}"))?;
     let index_path = temporary.path().join("index");
     let environment = [("GIT_INDEX_FILE", index_path.as_os_str())];
+    let hooks_off = HooksOff::new()?;
     let output = command::git_at_with_input_and_env(
         worktree,
-        ["update-index", "-z", "--index-info"],
+        hooks_off.args(["update-index", "-z", "--index-info"]),
         &input,
         environment,
     )
     .map_err(|error| error.to_string())?;
     successful_stdout(output, "assemble the recovery point")?;
-    let output = command::git_at_with_env(worktree, ["write-tree"], environment)
+    let output = command::git_at_with_env(worktree, hooks_off.args(["write-tree"]), environment)
         .map_err(|error| error.to_string())?;
     let tree = String::from_utf8_lossy(&successful_stdout(output, "write the recovery point")?)
         .trim()
@@ -1494,7 +1498,7 @@ fn objects_have_sizes(worktree: &Path, objects: &[(&str, u64)]) -> Result<bool, 
         let input: String = chunk.iter().map(|(oid, _)| format!("{oid}\n")).collect();
         let output = command::git_at_with_input(
             worktree,
-            ["cat-file", "--batch-check=%(objectname) %(objectsize)"],
+            HooksOff::new()?.args(["cat-file", "--batch-check=%(objectname) %(objectsize)"]),
             input.as_bytes(),
         )
         .map_err(|error| error.to_string())?;
@@ -1525,6 +1529,45 @@ fn create_reference(worktree: &Path, id: &str, tree: &str) -> Result<(), String>
         "create the recovery point",
     )
     .map(|_| ())
+}
+
+/// Leading options for every Git command Repola runs to save, discard,
+/// restore, or delete. Hooks and fsmonitor programs are user code that could
+/// change the working copy between Repola's last look and its change, so none
+/// runs; the hooks folder is empty.
+pub(super) struct HooksOff {
+    _folder: tempfile::TempDir,
+    options: [OsString; 4],
+}
+
+impl HooksOff {
+    pub(super) fn new() -> Result<Self, String> {
+        let folder = tempfile::tempdir()
+            .map_err(|error| format!("Could not create an empty hooks folder: {error}"))?;
+        let mut hooks = OsString::from("core.hooksPath=");
+        hooks.push(folder.path());
+        Ok(Self {
+            options: [
+                "-c".into(),
+                hooks,
+                "-c".into(),
+                "core.fsmonitor=false".into(),
+            ],
+            _folder: folder,
+        })
+    }
+
+    pub(super) fn args<I, S>(&self, args: I) -> Vec<OsString>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.options
+            .iter()
+            .cloned()
+            .chain(args.into_iter().map(|arg| arg.as_ref().to_os_string()))
+            .collect()
+    }
 }
 
 pub(super) fn push_index_info(input: &mut Vec<u8>, mode: &str, oid: &str, path: &[u8]) {
@@ -1622,10 +1665,10 @@ fn list(worktree: &Path) -> Result<Vec<RecoveryPoint>, String> {
         .collect();
     let output = command::git_at_with_input(
         worktree,
-        [
+        HooksOff::new()?.args([
             "cat-file",
             "--batch-check=%(objectname) %(objecttype) %(objectsize)",
-        ],
+        ]),
         input.as_bytes(),
     )
     .map_err(|error| error.to_string())?;
@@ -1646,9 +1689,12 @@ fn list(worktree: &Path) -> Result<Vec<RecoveryPoint>, String> {
     let mut objects = vec![None; references.len()];
     for chunk in readable.chunks(SUMMARIES_PER_READ) {
         let input: String = chunk.iter().map(|(_, oid)| format!("{oid}\n")).collect();
-        let output =
-            command::git_at_with_input(worktree, ["cat-file", "--batch"], input.as_bytes())
-                .map_err(|error| error.to_string())?;
+        let output = command::git_at_with_input(
+            worktree,
+            HooksOff::new()?.args(["cat-file", "--batch"]),
+            input.as_bytes(),
+        )
+        .map_err(|error| error.to_string())?;
         let read = parse_batch(&successful_stdout(output, "read the recovery points")?)?;
         if read.len() != chunk.len() {
             return Err("Git returned malformed recovery-point data.".into());
@@ -1740,13 +1786,13 @@ fn load_point(
     validate_reference(reference)?;
     let output = command::git_at(
         worktree,
-        [
+        HooksOff::new()?.args([
             "rev-parse",
             "--verify",
             "--quiet",
             "--end-of-options",
             reference.id.as_str(),
-        ],
+        ]),
     )
     .map_err(|error| error.to_string())?;
     if !output.status.success() {
@@ -2209,10 +2255,11 @@ fn apply_restore(
         }
     }
     removals.extend(input);
+    let hooks_off = HooksOff::new()?;
     if !removals.is_empty() {
         let output = command::git_at_with_input_timeout(
             worktree,
-            ["update-index", "-z", "--index-info"],
+            hooks_off.args(["update-index", "-z", "--index-info"]),
             &removals,
             CHANGE_TIMEOUT,
         )
@@ -2227,7 +2274,7 @@ fn apply_restore(
     // commands that do not refresh the index first.
     let output = command::git_at_timeout(
         worktree,
-        ["update-index", "-q", "--unmerged", "--refresh"],
+        hooks_off.args(["update-index", "-q", "--unmerged", "--refresh"]),
         CHANGE_TIMEOUT,
     )
     .map_err(|error| error.to_string())?;
@@ -2265,13 +2312,13 @@ fn restore_intents(
         .and_then(|()| {
             let output = command::git_at_with_input_timeout(
                 worktree,
-                [
+                HooksOff::new()?.args([
                     "add",
                     "--force",
                     "--intent-to-add",
                     "--pathspec-from-file=-",
                     "--pathspec-file-nul",
-                ],
+                ]),
                 intents,
                 CHANGE_TIMEOUT,
             )
@@ -2291,8 +2338,11 @@ fn restore_intents(
 }
 
 fn config_bool(worktree: &Path, key: &str, default: bool) -> Result<bool, String> {
-    let output = command::git_at(worktree, ["config", "--type=bool", "--get", key])
-        .map_err(|error| error.to_string())?;
+    let output = command::git_at(
+        worktree,
+        HooksOff::new()?.args(["config", "--type=bool", "--get", key]),
+    )
+    .map_err(|error| error.to_string())?;
     match output.status.code() {
         Some(0) => Ok(String::from_utf8_lossy(&output.stdout).trim() == "true"),
         Some(1) => Ok(default),
@@ -2358,9 +2408,12 @@ fn restore_worktree_entry(
     if entry.kind == WorktreeEntryKind::Symlink {
         // Only a real link on disk is saved as one, so it comes back as one
         // whatever `core.symlinks` says.
-        let output =
-            command::git_at_timeout(worktree, ["cat-file", "blob", &entry.oid], CHANGE_TIMEOUT)
-                .map_err(|error| error.to_string())?;
+        let output = command::git_at_timeout(
+            worktree,
+            HooksOff::new()?.args(["cat-file", "blob", &entry.oid]),
+            CHANGE_TIMEOUT,
+        )
+        .map_err(|error| error.to_string())?;
         let link = successful_stdout(output, "read the saved link")?;
         replace_with_symlink(&target, &link, entry.directory_link, &path.display)
     } else {
@@ -2537,9 +2590,13 @@ fn write_object(worktree: &Path, oid: &str, destination: &Path) -> Result<fs::Fi
         .map_err(|error| error.to_string())?;
     let sink = file.try_clone().map_err(|error| error.to_string())?;
     // A restore may be writing it, so it is not cut short by the usual limit.
-    let output =
-        command::git_at_to_file_timeout(worktree, ["cat-file", "blob", oid], sink, CHANGE_TIMEOUT)
-            .map_err(|error| error.to_string())?;
+    let output = command::git_at_to_file_timeout(
+        worktree,
+        HooksOff::new()?.args(["cat-file", "blob", oid]),
+        sink,
+        CHANGE_TIMEOUT,
+    )
+    .map_err(|error| error.to_string())?;
     successful_stdout(output, "read the saved file")?;
     file.sync_all().map_err(|error| error.to_string())?;
     Ok(file)
@@ -2648,7 +2705,7 @@ fn set_index_flag(
     }
     let output = command::git_at_with_input_timeout(
         worktree,
-        ["update-index", "-z", flag, "--stdin"],
+        HooksOff::new()?.args(["update-index", "-z", flag, "--stdin"]),
         &input,
         CHANGE_TIMEOUT,
     )
@@ -2726,7 +2783,7 @@ pub fn recovery_file_diff(request: RecoveryFileDiffRequest) -> Result<RecoveryFi
         let sink = file.try_clone().map_err(|error| error.to_string())?;
         let output = command::git_at_to_file(
             worktree,
-            [
+            HooksOff::new()?.args([
                 OsString::from("diff"),
                 OsString::from("--no-index"),
                 OsString::from("--no-color"),
@@ -2736,7 +2793,7 @@ pub fn recovery_file_diff(request: RecoveryFileDiffRequest) -> Result<RecoveryFi
                 OsString::from("--"),
                 current.clone(),
                 saved_side.clone(),
-            ],
+            ]),
             sink,
         )
         .map_err(|error| error.to_string())?;
@@ -2871,8 +2928,12 @@ pub fn delete_recovery_points(request: DeleteRecoveryPointsRequest) -> Result<()
         }
         input.extend_from_slice(format!("delete {}\0{}\0", point.id, point.oid).as_bytes());
     }
-    let output = command::git_at_with_input(worktree, ["update-ref", "--stdin", "-z"], &input)
-        .map_err(|error| error.to_string())?;
+    let output = command::git_at_with_input(
+        worktree,
+        HooksOff::new()?.args(["update-ref", "--stdin", "-z"]),
+        &input,
+    )
+    .map_err(|error| error.to_string())?;
     if !output.status.success() {
         return Err(format!(
             "Nothing was deleted: a selected recovery point changed or no longer exists. Refresh and review the selection again.\n\n{}",
@@ -2904,7 +2965,8 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let output = command::git_at(worktree, args).map_err(|error| error.to_string())?;
+    let output = command::git_at(worktree, HooksOff::new()?.args(args))
+        .map_err(|error| error.to_string())?;
     successful_stdout(output, intent)
 }
 
@@ -2917,8 +2979,8 @@ where
 {
     let mut file = tempfile::tempfile().map_err(|error| error.to_string())?;
     let sink = file.try_clone().map_err(|error| error.to_string())?;
-    let output =
-        command::git_at_to_file(worktree, args, sink).map_err(|error| error.to_string())?;
+    let output = command::git_at_to_file(worktree, HooksOff::new()?.args(args), sink)
+        .map_err(|error| error.to_string())?;
     successful_stdout(output, intent)?;
     file.rewind().map_err(|error| error.to_string())?;
     Ok(file)

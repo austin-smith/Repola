@@ -20,7 +20,7 @@ use super::recovery::{
     create_recovery_point, file_folder_conflict, fingerprint, git_can_write, head_entries,
     keep_within, long_paths, observe_paths, prepare_recovery_point, push_index_info,
     remove_empty_directory, remove_worktree_entry, store_contents, stored_bytes, HeadEntry,
-    PathState, Removals, CHANGED_WHILE_SAVING, CHANGE_TIMEOUT, MAX_LISTED_BYTES,
+    HooksOff, PathState, Removals, CHANGED_WHILE_SAVING, CHANGE_TIMEOUT, MAX_LISTED_BYTES,
 };
 use super::working_copy::{decode_path_token_bytes, ensure_success, working_copy_snapshot};
 
@@ -533,11 +533,12 @@ fn execute(worktree: &Path, planned: &Planned) -> Result<(), String> {
     for folder in &planned.empty_folders {
         remove_empty_directory(worktree, folder)?;
     }
+    let hooks_off = HooksOff::new()?;
     let index_info = [planned.index_removals.as_slice(), &planned.index_writes].concat();
     if !index_info.is_empty() {
         let output = command::git_at_with_input_timeout(
             worktree,
-            ["update-index", "-z", "--index-info"],
+            hooks_off.args(["update-index", "-z", "--index-info"]),
             &index_info,
             CHANGE_TIMEOUT,
         )
@@ -551,7 +552,7 @@ fn execute(worktree: &Path, planned: &Planned) -> Result<(), String> {
         if !paths.is_empty() {
             let output = command::git_at_with_input_timeout(
                 worktree,
-                ["update-index", "-z", flag, "--stdin"],
+                hooks_off.args(["update-index", "-z", flag, "--stdin"]),
                 paths,
                 CHANGE_TIMEOUT,
             )
@@ -568,13 +569,13 @@ fn execute(worktree: &Path, planned: &Planned) -> Result<(), String> {
         // files' stat data.
         let output = command::git_at_with_input_timeout(
             worktree,
-            [
+            hooks_off.args([
                 "checkout-index",
                 "--force",
                 "--ignore-skip-worktree-bits",
                 "-z",
                 "--stdin",
-            ],
+            ]),
             &planned.checkout,
             CHANGE_TIMEOUT,
         )
@@ -582,7 +583,7 @@ fn execute(worktree: &Path, planned: &Planned) -> Result<(), String> {
         ensure_success(output, "write the restored files")?;
         let output = command::git_at_timeout(
             worktree,
-            ["update-index", "-q", "--unmerged", "--refresh"],
+            hooks_off.args(["update-index", "-q", "--unmerged", "--refresh"]),
             CHANGE_TIMEOUT,
         )
         .map_err(|error| error.to_string())?;
@@ -1699,6 +1700,69 @@ mod tests {
         git(&path, &["config", "filter.strict.smudge", "cat"]);
         restore(&path, &points[0]);
         assert_eq!(exact_state(&path), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discarding_restoring_and_deleting_run_no_hooks() {
+        use crate::worktree::models::DeleteRecoveryPointsRequest;
+        use crate::worktree::recovery::delete_recovery_points;
+        use std::os::unix::fs::PermissionsExt;
+        let directory = repository();
+        let path = root(&directory);
+        write(&path, "a.txt", b"committed\n");
+        git(&path, &["add", "a.txt"]);
+        git(&path, &["commit", "-m", "base"]);
+        // The snapshot's `git status` runs before Repola looks at the paths,
+        // so anything a hook changes there fails the final comparison; every
+        // command after it must run none.
+        let runs = path.join(".git/hook-runs");
+        for name in [
+            "post-index-change",
+            "reference-transaction",
+            "fsmonitor-test",
+        ] {
+            let hook = path.join(".git/hooks").join(name);
+            let script = format!(
+                "#!/bin/sh\ncaller=$(ps -o args= -p $PPID)\ncase \"$caller\" in *\" status \"*) exit 0 ;; esac\necho {name} $caller >> '{}'\n",
+                runs.display()
+            );
+            std::fs::write(&hook, script).expect("hook");
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                .expect("executable hook");
+        }
+        git(
+            &path,
+            &["config", "core.fsmonitor", ".git/hooks/fsmonitor-test"],
+        );
+        write(&path, "a.txt", b"staged\n");
+        git(&path, &["add", "a.txt"]);
+        git(&path, &["update-index", "--assume-unchanged", "a.txt"]);
+        write(&path, "new.txt", b"intended\n");
+        git(&path, &["add", "--intent-to-add", "new.txt"]);
+        let _ = std::fs::remove_file(&runs);
+
+        let point = discard(&path, DiscardTarget::All).recovery_point;
+        restore(&path, &point);
+        let points = list_recovery_points(request(&path))
+            .expect("list")
+            .points
+            .iter()
+            .map(|point| RecoveryPointReference {
+                id: point.id.clone(),
+                oid: point.oid.clone(),
+            })
+            .collect();
+        let request = request(&path);
+        delete_recovery_points(DeleteRecoveryPointsRequest {
+            repository_path: request.repository_path,
+            worktree_path: request.worktree_path,
+            points,
+        })
+        .expect("delete");
+
+        let ran = std::fs::read_to_string(&runs).unwrap_or_default();
+        assert!(ran.is_empty(), "{ran}");
     }
 
     #[test]
