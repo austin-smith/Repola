@@ -14,7 +14,7 @@ vi.mock("node:child_process", () => ({ execFile: (...args) => mocks.execute(...a
 
 const source = { version: "0.1.0", sha: "a".repeat(40), runId: "123", pubDate: "2026-09-30T09:17:00Z" };
 const stable = planRelease({ ...source, sourceRef: "refs/tags/v0.1.0", tag: "v0.1.0" });
-const nightly = planRelease({ ...source, sourceRef: "refs/heads/main", runNumber: "10" });
+const nightly = planRelease({ ...source, sourceRef: "refs/heads/main", sequence: "10" });
 let directory;
 
 function fakeGitHub(release = stable, { published = false, additional = [], missing, corruptManifest = false, buildConclusion = "success", id = 1 } = {}) {
@@ -108,7 +108,7 @@ describe("verified release publication", () => {
     { version: "0.2.0", published: false },
     { version: "0.1.0", published: true },
   ])("allows a newer-base nightly or repairs an already-published nightly ($version, published=$published)", async ({ version, published }) => {
-    const release = planRelease({ ...source, version, sourceRef: "refs/heads/main", runNumber: "10" });
+    const release = planRelease({ ...source, version, sourceRef: "refs/heads/main", sequence: "10" });
     const a = fakeGitHub(release, { published, id: 1 });
     const b = fakeGitHub(stable, { published: true, id: 2 });
     const client = {

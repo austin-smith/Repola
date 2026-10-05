@@ -41,8 +41,8 @@ describe("installer downloads", () => {
 
   it("retains the macOS updater archive for release staging", async () => {
     await withBundles({ "dmg/Repola.dmg": "installer", "macos/Repola.app.tar.gz": "updater" }, async (bundle, destination) => {
-      const names = await stageBundles(targets[0], "0.1.0-nightly.10", bundle, destination);
-      expect(names).toEqual(["Repola-0.1.0-nightly.10-arm64.dmg", "Repola-0.1.0-nightly.10-arm64.app.tar.gz"]);
+      const names = await stageBundles(targets[0], "0.1.0-nightly.20260930.10", bundle, destination);
+      expect(names).toEqual(["Repola-0.1.0-nightly.20260930.10-arm64.dmg", "Repola-0.1.0-nightly.20260930.10-arm64.app.tar.gz"]);
     });
   });
 
