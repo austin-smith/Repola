@@ -151,6 +151,8 @@ export function confirmationReasons(plan: BranchDeletionPlan): string[] {
   const pulls = openPullRequests(plan).length;
   if (pulls === 1) reasons.push("An open pull request uses the remote branch.");
   if (pulls > 1) reasons.push(`${pulls} open pull requests use the remote branch.`);
+  const check = plan.deleteRemote ? plan.remote?.pullRequests : null;
+  if (check?.status === "checked" && check.moreThanListed) reasons.push("The provider has more open pull requests than Repola lists.");
   return reasons;
 }
 

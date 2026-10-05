@@ -347,10 +347,13 @@ fn review(
         && remote
             .as_ref()
             .is_some_and(|remote| remote.exclusive_commit_count > 0);
-    let closes_pull_requests = [open_pull_requests.as_deref(), reviewed_pull_requests]
-        .into_iter()
-        .flatten()
-        .any(|pulls| !pulls.is_empty());
+    let closes_pull_requests = affects_pull_requests(
+        remote
+            .as_ref()
+            .filter(|_| request.delete_remote)
+            .and_then(|remote| remote.pull_requests.as_ref()),
+        reviewed_pull_requests,
+    );
     let confirmation = if requires_force || remote_loses_commits || closes_pull_requests {
         BranchDeletionConfirmation::TypeBranchName
     } else {
@@ -642,6 +645,23 @@ pub fn execute_branch_deletion(
         audit_path: None,
         audit_warning: None,
     })
+}
+
+/// Whether deleting the remote branch may close open pull requests: some are
+/// listed now or were in the review, or the provider has more than it listed.
+fn affects_pull_requests(
+    current: Option<&BranchPullRequests>,
+    reviewed: Option<&[String]>,
+) -> bool {
+    let listed_now = match current {
+        Some(BranchPullRequests::Checked {
+            pulls,
+            more_than_listed,
+            ..
+        }) => *more_than_listed || !pulls.is_empty(),
+        _ => false,
+    };
+    listed_now || reviewed.is_some_and(|reviewed| !reviewed.is_empty())
 }
 
 /// The open pull requests found now that the review did not show. The review
@@ -3879,6 +3899,22 @@ mod tests {
             plan.remote.as_ref().expect("remote details").pull_requests,
             None
         );
+    }
+
+    #[test]
+    fn pull_requests_past_those_listed_require_the_typed_name() {
+        let checked = |more_than_listed| BranchPullRequests::Checked {
+            provider: crate::worktree::models::RemoteProvider::AzureDevOps,
+            pulls: Vec::new(),
+            more_than_listed,
+        };
+        assert!(!affects_pull_requests(Some(&checked(false)), None));
+        assert!(affects_pull_requests(Some(&checked(true)), None));
+        assert!(affects_pull_requests(
+            Some(&BranchPullRequests::Unsupported),
+            Some(&["octo/app#1".to_string()])
+        ));
+        assert!(!affects_pull_requests(None, Some(&[])));
     }
 
     #[test]

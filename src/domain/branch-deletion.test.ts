@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { BranchDeletionPlan, BranchDeletionResult, BranchInfo, BranchPullRequests, OpenPullRequest, RemoteBranchDeletion } from "../ipc/types";
+import type { BranchDeletionPlan, BranchDeletionResult, BranchInfo, BranchPullRequests, LocalBranchDeletion, OpenPullRequest, RemoteBranchDeletion } from "../ipc/types";
 import {
   canExecuteDeletion,
   confirmationReasons,
@@ -270,10 +270,28 @@ describe("open pull requests", () => {
   });
 
   it("explains every reason the branch name must be typed", () => {
+    const local = (exclusiveCommitCount: number): LocalBranchDeletion => ({
+      name: "feature",
+      tip: "a".repeat(40),
+      mergeReference: "origin/feature",
+      mergeReferenceKind: "upstream",
+      mergeReferenceOid: "b".repeat(40),
+      containedInMergeReference: false,
+      defaultTarget: null,
+      containedInDefaultTarget: null,
+      occupiedWorktreePath: null,
+      isDefaultBranch: false,
+      upstream: "origin/feature",
+      exclusiveCommitCount,
+      exclusiveCommitCountCapped: false,
+    });
     const pulls: BranchPullRequests = { status: "checked", provider: "gitHub", pulls: [pull(1), pull(2)], moreThanListed: false };
-    expect(confirmationReasons(plan({ requiresForce: true, deleteRemote: true, remote: remote(pulls) }))).toEqual([
+    expect(confirmationReasons(plan({ requiresForce: true, local: local(2), deleteRemote: true, remote: remote(pulls) }))).toEqual([
       "This forced deletion discards commits that no other ref contains.",
       "2 open pull requests use the remote branch.",
+    ]);
+    expect(confirmationReasons(plan({ deleteRemote: true, remote: remote({ status: "checked", provider: "azureDevOps", pulls: [], moreThanListed: true }) }))).toEqual([
+      "The provider has more open pull requests than Repola lists.",
     ]);
     expect(confirmationReasons(plan({ deleteRemote: true, remote: remote({ status: "checked", provider: "gitHub", pulls: [pull(1)], moreThanListed: false }) }))).toEqual([
       "An open pull request uses the remote branch.",
