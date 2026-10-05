@@ -390,8 +390,16 @@ fn prepare_path(
     Ok(current)
 }
 
+/// Whether the working copy's file system treats names that differ only in
+/// case as one: `.git` is also found as `.GIT`.
+fn folds_case(worktree: &Path) -> bool {
+    fs::symlink_metadata(worktree.join(".git")).is_ok()
+        && fs::symlink_metadata(worktree.join(".GIT")).is_ok()
+}
+
 /// On a case-insensitive file system, paths that differ only in case name one
-/// file: observing both would save it twice and lose which spelling it had.
+/// file, whether or not either is on disk: observing both would save it twice
+/// and lose which spelling it had, and writing both would leave only one.
 fn refuse_case_collisions(paths: &[GitPath], validated: &[WorktreePath]) -> Result<(), String> {
     let mut seen: HashMap<String, (&GitPath, &[u8])> = HashMap::new();
     for (path, valid) in paths.iter().zip(validated) {
@@ -426,7 +434,9 @@ pub(super) fn observe_paths(
         .iter()
         .map(WorktreePath::new)
         .collect::<Result<Vec<_>, _>>()?;
-    if config_bool(worktree, "core.ignorecase", false)? {
+    // Git's setting can be stale, as in a repository copied from a
+    // case-sensitive system, so the file system is asked as well.
+    if config_bool(worktree, "core.ignorecase", false)? || folds_case(worktree) {
         refuse_case_collisions(paths, &validated)?;
     }
     let IndexListing {
@@ -3485,6 +3495,10 @@ mod tests {
     #[test]
     fn two_spellings_of_one_file_on_disk_are_refused() {
         let (_directory, path) = repository();
+        // Names that differ only in case may be refused by name alone first.
+        let refused_as_one_name = |error: &str| {
+            error.contains("spelled differently") || error.contains("differ only in letter case")
+        };
         // Even where Git is told names are case-sensitive, the file system
         // decides which spellings are one file.
         git(&path, &["config", "core.ignorecase", "false"]);
@@ -3499,7 +3513,7 @@ mod tests {
             }
             let paths = [git_path(stored.as_bytes()), git_path(other.as_bytes())];
             let error = observe_paths(&path, None, &paths, false).expect_err("one file");
-            assert!(error.contains("spelled differently"), "{error}");
+            assert!(refused_as_one_name(&error), "{error}");
         }
         // Hard links are separate names on purpose and stay allowed, and a
         // file having one does not hide another spelling of its own name.
@@ -3516,7 +3530,7 @@ mod tests {
                     git_path(other.as_bytes()),
                 ];
                 let error = observe_paths(&path, None, &paths, false).expect_err("one file");
-                assert!(error.contains("spelled differently"), "{error}");
+                assert!(refused_as_one_name(&error), "{error}");
             }
         }
         // A link is found without following it, even with a hard link of its
@@ -3536,7 +3550,7 @@ mod tests {
                         git_path(other.as_bytes()),
                     ];
                     let error = observe_paths(&path, None, &paths, false).expect_err("one link");
-                    assert!(error.contains("spelled differently"), "{error}");
+                    assert!(refused_as_one_name(&error), "{error}");
                 }
             }
             let paths = [
@@ -3544,6 +3558,23 @@ mod tests {
                 git_path(b"other-link"),
             ];
             observe_paths(&path, None, &paths, false).expect("hard-linked links");
+        }
+    }
+
+    #[test]
+    fn paths_differing_only_in_case_are_refused_where_the_file_system_folds_case() {
+        let (_directory, path) = repository();
+        // A setting copied from a case-sensitive system says nothing about
+        // this file system.
+        git(&path, &["config", "core.ignorecase", "false"]);
+        // Neither spelling is on disk, so only their names can tell.
+        let paths = [git_path(b"Gone.txt"), git_path(b"gone.txt")];
+        let observed = observe_paths(&path, None, &paths, false);
+        if path.join(".GIT").exists() {
+            let error = observed.expect_err("one name on this file system");
+            assert!(error.contains("differ only in letter case"), "{error}");
+        } else {
+            observed.expect("two names on this file system");
         }
     }
 
