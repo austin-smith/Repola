@@ -24,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 
 use super::command;
 use super::models::{
@@ -397,19 +398,64 @@ fn folds_case(worktree: &Path) -> bool {
         && fs::symlink_metadata(worktree.join(".GIT")).is_ok()
 }
 
-/// On a case-insensitive file system, paths that differ only in case name one
-/// file, whether or not either is on disk: observing both would save it twice
-/// and lose which spelling it had, and writing both would leave only one.
-fn refuse_case_collisions(paths: &[GitPath], validated: &[WorktreePath]) -> Result<(), String> {
+/// How the working copy's file system compares names.
+struct NameFolding {
+    case: bool,
+    /// The composed and decomposed forms of a name, such as `é` as one
+    /// character or as `e` and an accent, are one name.
+    normalization: bool,
+}
+
+fn name_folding(worktree: &Path) -> Result<NameFolding, String> {
+    Ok(NameFolding {
+        // Git's setting can be stale, as in a repository copied from a
+        // case-sensitive system, so the file system is asked as well.
+        case: config_bool(worktree, "core.ignorecase", false)? || folds_case(worktree),
+        // Every macOS file system, case-sensitive or not, compares names this
+        // way.
+        normalization: cfg!(target_os = "macos"),
+    })
+}
+
+/// Paths that are one name on the file system, whether or not either is on
+/// disk: observing both would save it twice and lose which spelling it had,
+/// and writing both would leave only one.
+fn refuse_name_collisions(
+    paths: &[GitPath],
+    validated: &[WorktreePath],
+    folding: &NameFolding,
+) -> Result<(), String> {
+    if !folding.case && !folding.normalization {
+        return Ok(());
+    }
+    let fold = |bytes: &[u8]| {
+        let mut name = String::from_utf8_lossy(bytes).into_owned();
+        if folding.case {
+            name = name.to_lowercase();
+        }
+        if folding.normalization {
+            name = name.nfc().collect();
+        }
+        name
+    };
     let mut seen: HashMap<String, (&GitPath, &[u8])> = HashMap::new();
     for (path, valid) in paths.iter().zip(validated) {
-        let folded = String::from_utf8_lossy(&valid.bytes).to_lowercase();
+        let folded = fold(&valid.bytes);
         match seen.get(&folded) {
             Some((other, bytes)) if *bytes != valid.bytes.as_slice() => {
-                return Err(format!(
-                    "{} and {} differ only in letter case, so they are one file on this file system and Repola cannot save them separately. Undo this change with Git instead.",
-                    other.display, path.display
-                ));
+                let only_case = String::from_utf8_lossy(bytes).to_lowercase()
+                    == String::from_utf8_lossy(&valid.bytes).to_lowercase();
+                return Err(if only_case {
+                    format!(
+                        "{} and {} differ only in letter case, so they are one file on this file system and Repola cannot save them separately. Undo this change with Git instead.",
+                        other.display, path.display
+                    )
+                } else {
+                    format!(
+                        "{} and {} are spelled differently but are one file on this file system, so Repola cannot save them separately. Undo this change with Git instead.",
+                        other.display, path.display
+                    )
+                });
             }
             Some(_) => {}
             None => {
@@ -434,11 +480,7 @@ pub(super) fn observe_paths(
         .iter()
         .map(WorktreePath::new)
         .collect::<Result<Vec<_>, _>>()?;
-    // Git's setting can be stale, as in a repository copied from a
-    // case-sensitive system, so the file system is asked as well.
-    if config_bool(worktree, "core.ignorecase", false)? || folds_case(worktree) {
-        refuse_case_collisions(paths, &validated)?;
-    }
+    refuse_name_collisions(paths, &validated, &name_folding(worktree)?)?;
     let IndexListing {
         entries: mut index,
         beneath,
@@ -3576,6 +3618,19 @@ mod tests {
         } else {
             observed.expect("two names on this file system");
         }
+    }
+
+    // Only macOS file systems compare names this way.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn composed_and_decomposed_names_are_one_name_even_when_neither_is_on_disk() {
+        let (_directory, path) = repository();
+        let paths = [
+            git_path("caf\u{e9}.txt".as_bytes()),
+            git_path("cafe\u{301}.txt".as_bytes()),
+        ];
+        let error = observe_paths(&path, None, &paths, false).expect_err("one name");
+        assert!(error.contains("spelled differently"), "{error}");
     }
 
     #[test]
