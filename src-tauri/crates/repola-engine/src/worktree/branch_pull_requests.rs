@@ -39,10 +39,9 @@ pub(crate) fn branch_pull_requests(
         return BranchPullRequests::Unsupported;
     };
     let location = RemoteLocation {
-        host: if location.over_ssh {
-            ssh_hostname(worktree, &location.host).unwrap_or(location.host)
-        } else {
-            location.host
+        host: match ssh_login(url) {
+            Some(login) => ssh_hostname(worktree, &login).unwrap_or(location.host),
+            None => location.host,
         },
         ..location
     };
@@ -153,25 +152,23 @@ fn ask(
     })
 }
 
-/// A remote URL's host and path, without user, port, or a `.git` suffix, and
-/// whether Git reaches it over SSH, where the host can be an alias.
+/// A remote URL's host and path, without user, port, or a `.git` suffix.
 #[derive(Debug, PartialEq)]
 struct RemoteLocation {
     host: String,
     path: Vec<String>,
-    over_ssh: bool,
 }
 
 fn parse_remote_url(url: &str) -> Option<RemoteLocation> {
-    let (authority, path, over_ssh) = match url.split_once("://") {
+    let (authority, path) = match url.split_once("://") {
         Some((scheme, rest)) => {
-            let over_ssh = match scheme.to_ascii_lowercase().as_str() {
-                "https" | "http" | "git" => false,
-                "ssh" | "git+ssh" | "ssh+git" => true,
-                _ => return None,
-            };
-            let (authority, path) = rest.split_once('/')?;
-            (authority, path, over_ssh)
+            if !matches!(
+                scheme.to_ascii_lowercase().as_str(),
+                "https" | "http" | "git" | "ssh" | "git+ssh" | "ssh+git"
+            ) {
+                return None;
+            }
+            rest.split_once('/')?
         }
         // `[user@]host:path`, the form scp uses. A slash before the colon, or a
         // drive letter, makes it a local path instead.
@@ -180,7 +177,7 @@ fn parse_remote_url(url: &str) -> Option<RemoteLocation> {
             if authority.contains('/') || authority.len() < 2 {
                 return None;
             }
-            (authority, path, true)
+            (authority, path)
         }
     };
     let host = authority
@@ -203,7 +200,6 @@ fn parse_remote_url(url: &str) -> Option<RemoteLocation> {
     (!path.is_empty()).then(|| RemoteLocation {
         host: host.to_ascii_lowercase(),
         path,
-        over_ssh,
     })
 }
 
@@ -226,9 +222,148 @@ fn percent_decode(segment: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-/// The host an SSH host name or alias connects to, as OpenSSH resolves it.
-fn ssh_hostname(worktree: &Path, host: &str) -> Option<String> {
-    let output = command::output_at(worktree, "ssh", ["-G", "--", host]).ok()?;
+/// The `[user@]host` and port Git passes to `ssh` to reach a remote. OpenSSH
+/// configuration can match on either, as in `Match user git`.
+#[derive(Debug, PartialEq)]
+struct SshLogin {
+    destination: String,
+    port: Option<String>,
+}
+
+/// How Git logs in to reach `url` over SSH, worked out as `parse_connect_url`,
+/// `get_host_and_port`, and `get_port` in Git's `connect.c` do, or `None` when
+/// Git does not use SSH for `url` or refuses its host.
+fn ssh_login(url: &str) -> Option<SshLogin> {
+    // `<transport>::<address>` goes to a remote helper, and Git refuses rsync.
+    let scheme_length = url
+        .bytes()
+        .enumerate()
+        .take_while(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (*index > 0 && matches!(byte, b'+' | b'-' | b'.'))
+        })
+        .count();
+    if url[scheme_length..].starts_with("::") || url.starts_with("rsync:") {
+        return None;
+    }
+    let (host, separator) = match url.split_once("://") {
+        Some((scheme, rest)) => {
+            if !matches!(scheme, "ssh" | "git+ssh" | "ssh+git") {
+                return None;
+            }
+            (git_url_decode(rest)?, '/')
+        }
+        None => {
+            let colon = url.find(':')?;
+            let local_path = url.find('/').is_some_and(|slash| slash < colon)
+                || (cfg!(windows) && colon == 1 && url.as_bytes()[0].is_ascii_alphabetic());
+            if local_path {
+                return None;
+            }
+            (url.to_string(), ':')
+        }
+    };
+    // The path starts at the first separator after a bracketed host.
+    let searched_from = bracketed(&host).map_or(0, |(_, close)| close);
+    let path_start = searched_from + host[searched_from..].find(separator)?;
+    let host_and_port = &host[..path_start];
+
+    let (mut destination, mut port) = match bracketed(host_and_port) {
+        Some((open, close)) => {
+            let host = format!(
+                "{}{}",
+                &host_and_port[..open],
+                &host_and_port[open + 1..close]
+            );
+            let port = host_and_port[close + 1..]
+                .split_once(':')
+                .map(|(_, port)| port)
+                .filter(|port| is_port(port));
+            (host, port.map(str::to_string))
+        }
+        None => match host_and_port.split_once(':') {
+            Some((host, port)) if is_port(port) => (host.to_string(), Some(port.to_string())),
+            Some((host, "")) => (host.to_string(), None),
+            _ => (host_and_port.to_string(), None),
+        },
+    };
+    if port.is_none() {
+        if let Some((host, found)) = destination.split_once(':') {
+            if is_port(found) {
+                port = Some(found.to_string());
+                destination = host.to_string();
+            }
+        }
+    }
+    // Git refuses a host that `ssh` would read as an option.
+    (!destination.starts_with('-')).then_some(SshLogin { destination, port })
+}
+
+/// Where `host` brackets an address, as in `[::1]` or `user@[::1]`: the
+/// positions of `[` and of the `]` that closes it.
+fn bracketed(host: &str) -> Option<(usize, usize)> {
+    let open = host.find("@[").map_or(0, |at| at + 1);
+    if !host[open..].starts_with('[') {
+        return None;
+    }
+    let close = open + 1 + host[open + 1..].find(']')?;
+    Some((open, close))
+}
+
+/// Whether Git reads `text` as a port: what `strtol` reads as a whole number
+/// from 0 through 65535, including leading whitespace and a sign.
+fn is_port(text: &str) -> bool {
+    let text = text.trim_start_matches([' ', '\t', '\n', '\u{b}', '\u{c}', '\r']);
+    let (negative, digits) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    match digits.parse::<u32>() {
+        Ok(0) => true,
+        Ok(value) => !negative && value < 65_536,
+        Err(_) => false,
+    }
+}
+
+/// Decodes `%XX` escapes as Git decodes a URL: an escape that is not two hex
+/// digits, or that encodes a NUL, stays as written. `None` when the result is
+/// not text.
+fn git_url_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escaped = (bytes[index] == b'%')
+            .then(|| text.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+            .filter(|value| *value != 0);
+        match escaped {
+            Some(value) => {
+                decoded.push(value);
+                index += 3;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// The host an SSH login connects to, as OpenSSH resolves its configuration
+/// for the same destination and port Git passes.
+fn ssh_hostname(worktree: &Path, login: &SshLogin) -> Option<String> {
+    let mut arguments = vec!["-G".to_string()];
+    if let Some(port) = &login.port {
+        arguments.extend(["-p".to_string(), port.clone()]);
+    }
+    arguments.extend(["--".to_string(), login.destination.clone()]);
+    let output = command::output_at(worktree, "ssh", &arguments).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -546,22 +681,21 @@ mod tests {
 
     #[test]
     fn parses_the_remote_url_forms_git_accepts() {
-        for (url, over_ssh) in [
-            ("https://github.com/octo/app.git", false),
-            ("https://user:token@github.com/octo/app", false),
-            ("https://github.com/octo/app/", false),
-            ("git://GitHub.com/octo/app.git", false),
-            ("ssh://git@github.com/octo/app.git", true),
-            ("ssh://git@github.com:22/octo/app.git", true),
-            ("git@github.com:octo/app.git", true),
-            ("github.com:octo/app", true),
+        for url in [
+            "https://github.com/octo/app.git",
+            "https://user:token@github.com/octo/app",
+            "https://github.com/octo/app/",
+            "git://GitHub.com/octo/app.git",
+            "ssh://git@github.com/octo/app.git",
+            "ssh://git@github.com:22/octo/app.git",
+            "git@github.com:octo/app.git",
+            "github.com:octo/app",
         ] {
             assert_eq!(
                 location(url),
                 RemoteLocation {
                     host: "github.com".into(),
                     path: vec!["octo".into(), "app".into()],
-                    over_ssh,
                 },
                 "{url}"
             );
@@ -581,6 +715,85 @@ mod tests {
             ["org", "My Project", "_git", "My Repo"]
         );
         assert_eq!(parse_remote_url("https://host/bad%zz/app"), None);
+    }
+
+    /// What Git reports it would pass to `ssh` for `url`, from its own
+    /// diagnostics, or `None` when it would not use SSH.
+    fn git_ssh_login(repository: &Path, url: &str) -> Option<SshLogin> {
+        let output =
+            command::git_at(repository, ["fetch-pack", "--diag-url", url]).expect("run fetch-pack");
+        let report = String::from_utf8_lossy(&output.stdout);
+        let field = |name: &str| {
+            report
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("Diag: {name}=")))
+                .map(str::to_string)
+        };
+        if !output.status.success() || field("protocol").as_deref() != Some("ssh") {
+            return None;
+        }
+        let destination = field("userandhost").expect("the user and host");
+        // Git checks this only once it runs `ssh`, after its diagnostics.
+        if destination.starts_with('-') {
+            return None;
+        }
+        Some(SshLogin {
+            destination,
+            port: field("port").filter(|port| port != "NONE"),
+        })
+    }
+
+    #[test]
+    fn logs_in_over_ssh_exactly_as_git_does() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        command::successful_git_at(temp.path(), ["init", "--quiet"]).expect("git init");
+        for url in [
+            "ssh://git@Alias:2222/octo/app.git",
+            "git+ssh://git@alias:22/octo/app",
+            "ssh+git://alias/octo/app",
+            "git@alias:octo/app.git",
+            "alias:octo/app",
+            "ssh://first.last%40corp@alias/octo/app",
+            "ssh://a%zzb/octo/app",
+            "ssh://a%00b/octo/app",
+            "ssh://alias:/octo/app",
+            "ssh://alias:99999/octo/app",
+            "ssh://alias:022/octo/app",
+            "ssh://alias:+22/octo/app",
+            "ssh://alias:-0/octo/app",
+            "ssh://alias:-1/octo/app",
+            "ssh://alias:%2022/octo/app",
+            "ssh://user:secret@alias/octo/app",
+            "ssh://git@[::1]:22/octo/app",
+            "ssh://git@[::1]x:22/octo/app",
+            "[alias:2222]:octo/app",
+            "git@[alias:2222]:octo/app",
+            "ssh://-oProxyCommand=x/octo/app",
+            "ssh://alias",
+            "https://github.com/octo/app.git",
+            "git://alias/octo/app",
+            "SSH://alias/octo/app",
+            "/srv/git/app.git",
+            "../app.git",
+            "c:octo/app",
+            "C:\\code\\app.git",
+        ] {
+            assert_eq!(ssh_login(url), git_ssh_login(temp.path(), url), "{url}");
+        }
+    }
+
+    #[test]
+    fn remote_helper_urls_do_not_use_ssh() {
+        // Git hands these to a remote helper before parsing them for SSH.
+        assert_eq!(ssh_login("alias::octo/app"), None);
+        assert_eq!(ssh_login("rsync:octo/app"), None);
+        assert_eq!(
+            ssh_login("git@alias:octo/app::x"),
+            Some(SshLogin {
+                destination: "git@alias".into(),
+                port: None,
+            })
+        );
     }
 
     #[test]
