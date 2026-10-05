@@ -22,6 +22,8 @@
 //!   `git branch -d` and `-D` make, read the way Git reads them, except the
 //!   one case described at [`state_branch`].
 //! - The branch is still a regular ref, not a symbolic one.
+//! - Each deletion still leaves unreachable exactly the commits the review
+//!   found.
 //! - Unless the deletion is forced, the reference the branch was found
 //!   contained in has not moved, as `git branch -d` requires.
 //! - The remote still pushes to the reviewed URL, and that URL does not name
@@ -114,12 +116,8 @@ enum RemoteTarget {
 /// Read-only repository state shared by every part of one deletion review.
 struct Inspection<'a> {
     worktree: &'a Path,
-    repository_path: &'a Path,
     git_dir: &'a Path,
-    /// Every stash entry, which keeps its commits reachable like a ref does.
-    stashes: &'a [String],
-    /// Every symbolic ref, by name, and the ref it points to.
-    symbolic_refs: &'a BTreeMap<String, String>,
+    reachability: &'a Reachability<'a>,
     refs: &'a BTreeMap<String, RefRecord>,
     occupancy: &'a BTreeMap<String, BranchUse>,
     snapshot: &'a WorkingCopySnapshot,
@@ -171,15 +169,12 @@ fn review(
     }
     let remotes = read_remotes(worktree)?;
     let occupancy = branches_in_use(&repository)?;
-    let stashes = stash_entries(worktree)?;
-    let symbolic_refs = symbolic_refs(worktree)?;
+    let reachability = Reachability::read(worktree, &repository.path)?;
 
     let inspection = Inspection {
         worktree,
-        repository_path: &repository.path,
         git_dir: &repository.git_dir,
-        stashes: &stashes,
-        symbolic_refs: &symbolic_refs,
+        reachability: &reachability,
         refs: &refs,
         occupancy: &occupancy,
         snapshot: &snapshot,
@@ -436,13 +431,8 @@ fn review(
 pub fn execute_branch_deletion(
     request: BranchDeletionExecutionRequest,
 ) -> Result<BranchDeletionResult, String> {
-    let Review {
-        plan,
-        local_commands,
-        merge_reference,
-        repository,
-        push_url,
-    } = review(request.request, request.expected.pull_requests.as_deref())?;
+    let reviewed = review(request.request, request.expected.pull_requests.as_deref())?;
+    let plan = &reviewed.plan;
     if let Some(blocker) = plan.blockers.first() {
         return Err(format!("The branch deletion is blocked: {blocker}"));
     }
@@ -480,20 +470,15 @@ pub fn execute_branch_deletion(
     let worktree = Path::new(&plan.worktree_path);
     let selected_remote = plan.remote.as_ref().filter(|_| plan.delete_remote);
     if let Some(remote) = selected_remote {
-        let url = push_url
+        let url = reviewed
+            .push_url
             .as_deref()
             .ok_or("The URL the remote deletion pushes to could not be identified.")?;
         confirm_not_remote_default(worktree, remote, url)?;
     }
 
     let local = match &plan.local {
-        Some(local) => Some(delete_local(
-            &repository,
-            worktree,
-            local,
-            &local_commands,
-            merge_reference.as_deref().filter(|_| !plan.requires_force),
-        )?),
+        Some(local) => Some(delete_local(&reviewed, local)?),
         None => None,
     };
 
@@ -502,7 +487,7 @@ pub fn execute_branch_deletion(
     let mut already_gone = false;
     let remote = match selected_remote.filter(|_| !local_unconfirmed) {
         Some(remote) => {
-            let deletion = delete_remote(worktree, remote, push_url.as_deref());
+            let deletion = delete_remote(&reviewed, remote);
             // Recreates the branch only while the remote has none, so it can
             // never move a branch someone made since.
             let lease = format!("--force-with-lease={}:", remote.remote_ref);
@@ -735,16 +720,13 @@ enum RemoteOutcome {
 ///
 /// The lease rejects the push in the same way whether the branch moved or is
 /// gone, so a rejection is followed by asking the remote which it was.
-fn delete_remote(
-    worktree: &Path,
-    remote: &RemoteBranchDeletion,
-    reviewed_url: Option<&str>,
-) -> RemoteDeletion {
+fn delete_remote(reviewed: &Review, remote: &RemoteBranchDeletion) -> RemoteDeletion {
+    let worktree = Path::new(&reviewed.plan.worktree_path);
     let failed = |output| RemoteDeletion {
         outcome: RemoteOutcome::Failed,
         output,
     };
-    let Some(url) = reviewed_url else {
+    let Some(url) = reviewed.push_url.as_deref() else {
         return failed(format!(
             "The URL {} pushes to could not be identified, so {} was not deleted.",
             remote.remote, remote.display_name
@@ -756,6 +738,17 @@ fn delete_remote(
             return failed(format!(
                 "{} no longer pushes to {}, so {} was not deleted. Review the deletion again.",
                 remote.remote, remote.push_url, remote.display_name
+            ))
+        }
+        Err(reason) => return failed(format!("{reason} {} was not deleted.", remote.display_name)),
+    }
+    let reviewed_loss = reviewed.plan.fingerprint.remote_reachability.as_deref();
+    match loss_unchanged(reviewed, &remote.expected_oid, reviewed_loss) {
+        Ok(true) => {}
+        Ok(false) => {
+            return failed(format!(
+                "The commits deleting {} would leave unreachable in this repository changed after this deletion was reviewed, so it was not deleted. Review the deletion again.",
+                remote.display_name
             ))
         }
         Err(reason) => return failed(format!("{reason} {} was not deleted.", remote.display_name)),
@@ -839,6 +832,35 @@ fn delete_remote(
             remote.remote_ref, remote.remote, remote.expected_oid
         )),
     }
+}
+
+/// Whether the deletion still leaves unreachable exactly the commits from `tip`
+/// the review found, whose evidence is `reviewed_loss`. Every ref the whole
+/// deletion removes counts as removed, as in the review.
+fn loss_unchanged(
+    reviewed: &Review,
+    tip: &str,
+    reviewed_loss: Option<&str>,
+) -> Result<bool, String> {
+    let plan = &reviewed.plan;
+    let local_ref = plan
+        .local
+        .as_ref()
+        .map(|local| format!("refs/heads/{}", local.name));
+    let tracking_ref = plan
+        .remote
+        .as_ref()
+        .filter(|_| plan.delete_remote)
+        .map(|remote| remote.tracking_ref.as_str());
+    let removed: Vec<&str> = local_ref
+        .as_deref()
+        .into_iter()
+        .chain(tracking_ref)
+        .collect();
+    let reachability =
+        Reachability::read(Path::new(&plan.worktree_path), &reviewed.repository.path)?;
+    let loss = exclusive_commits(&reachability, tip, &removed)?;
+    Ok(reviewed_loss == Some(loss.evidence.as_str()))
 }
 
 /// What `git push --porcelain` reported for deleting `reference`: deleted,
@@ -946,17 +968,22 @@ fn remote_tip(worktree: &Path, url: &str, reference: &str) -> Result<Option<Stri
 /// `update-ref` deletes the branch only at the reviewed tip, but checks nothing
 /// else `git branch` would, and the review can be seconds old by now, after
 /// asking the remote. So right before deleting, the branch must still be a
-/// regular ref that no worktree uses and, unless the deletion is forced, the
-/// `contained_in` reference must still be where the review found the branch
-/// contained in it.
+/// regular ref that no worktree uses, it must leave unreachable exactly the
+/// commits the review found, and, unless the deletion is forced, the reference
+/// the review found the branch contained in must not have moved.
 fn delete_local(
-    repository: &RepositoryContext,
-    worktree: &Path,
+    reviewed: &Review,
     local: &LocalBranchDeletion,
-    commands: &[Vec<String>],
-    contained_in: Option<&str>,
 ) -> Result<BranchDeletionStep, String> {
-    let (deletion, cleanup) = commands
+    let Review {
+        plan,
+        local_commands,
+        merge_reference,
+        repository,
+        ..
+    } = reviewed;
+    let worktree = Path::new(&plan.worktree_path);
+    let (deletion, cleanup) = local_commands
         .split_first()
         .ok_or_else(|| format!("No command was reviewed to delete {}.", local.name))?;
     let reference = format!("refs/heads/{}", local.name);
@@ -973,13 +1000,23 @@ fn delete_local(
             short_ref(&target)
         ));
     }
-    if let Some(merge_reference) = contained_in {
+    if let Some(merge_reference) = merge_reference.as_deref().filter(|_| !plan.requires_force) {
         if resolve(worktree, merge_reference)? != local.merge_reference_oid {
             return Err(format!(
                 "Nothing was deleted. {} moved after this deletion was reviewed, so {} may no longer be contained in it. Review the deletion again.",
                 local.merge_reference, local.name
             ));
         }
+    }
+    if !loss_unchanged(
+        reviewed,
+        &local.tip,
+        plan.fingerprint.local_reachability.as_deref(),
+    )? {
+        return Err(format!(
+            "Nothing was deleted. The commits deleting {} would leave unreachable changed after this deletion was reviewed. Review the deletion again.",
+            local.name
+        ));
     }
     // Read before the cleanup removes it, so the recovery can restore it.
     let configuration = branch_configuration(worktree, &local.name)?;
@@ -1684,7 +1721,7 @@ fn local_details(
     let local_ref = format!("refs/heads/{name}");
     let mut excluded = vec![local_ref.as_str()];
     excluded.extend(remote_tracking_deleted);
-    let exclusive = exclusive_commits(inspection, &record.oid, &excluded)?;
+    let exclusive = exclusive_commits(inspection.reachability, &record.oid, &excluded)?;
     let local = LocalBranchDeletion {
         name: name.to_string(),
         tip: record.oid.clone(),
@@ -1718,7 +1755,7 @@ fn remote_details(
     let local_ref = local_deleted.map(|name| format!("refs/heads/{name}"));
     let mut excluded = vec![candidate.tracking_ref.as_str()];
     excluded.extend(local_ref.as_deref());
-    let exclusive = exclusive_commits(inspection, &candidate.oid, &excluded)?;
+    let exclusive = exclusive_commits(inspection.reachability, &candidate.oid, &excluded)?;
     let tracked_by = inspection
         .refs
         .iter()
@@ -1799,6 +1836,28 @@ fn digest(value: &str) -> String {
         .collect()
 }
 
+/// What, besides the refs `git rev-list --all` reads, decides which commits a
+/// deletion leaves unreachable.
+struct Reachability<'a> {
+    worktree: &'a Path,
+    repository_path: &'a Path,
+    /// Every stash entry, which keeps its commits reachable like a ref does.
+    stashes: Vec<String>,
+    /// Every symbolic ref, by name, and the ref it points to.
+    symbolic_refs: BTreeMap<String, String>,
+}
+
+impl<'a> Reachability<'a> {
+    fn read(worktree: &'a Path, repository_path: &'a Path) -> Result<Self, String> {
+        Ok(Self {
+            worktree,
+            repository_path,
+            stashes: stash_entries(worktree)?,
+            symbolic_refs: symbolic_refs(worktree)?,
+        })
+    }
+}
+
 /// The commits a deletion would leave unreachable.
 struct Exclusive {
     count: u64,
@@ -1813,11 +1872,11 @@ struct Exclusive {
 /// list stops early, it also digests every ref, stash entry, and worktree HEAD
 /// that remains, which decide the commits it did not list.
 fn exclusive_commits(
-    inspection: &Inspection,
+    reachability: &Reachability,
     tip: &str,
     removed: &[&str],
 ) -> Result<Exclusive, String> {
-    let exclusions = exclusions(inspection, removed);
+    let exclusions = exclusions(reachability, removed);
     let mut args = vec![
         "rev-list".to_string(),
         format!("--max-count={}", EXCLUSIVE_COMMIT_LIMIT + 1),
@@ -1826,8 +1885,8 @@ fn exclusive_commits(
     ];
     args.extend(exclusions.iter().cloned());
     args.push("--all".to_string());
-    args.extend(inspection.stashes.iter().cloned());
-    let output = command::successful_git_at(inspection.worktree, &args)
+    args.extend(reachability.stashes.iter().cloned());
+    let output = command::successful_git_at(reachability.worktree, &args)
         .map_err(|error| error.to_string())?;
     let listed = String::from_utf8_lossy(&output.stdout);
     let commits: Vec<&str> = listed.lines().filter(|line| !line.is_empty()).collect();
@@ -1843,15 +1902,15 @@ fn exclusive_commits(
         let mut args = vec!["rev-parse".to_string()];
         args.extend(exclusions);
         args.push("--all".to_string());
-        let refs = command::successful_git_at(inspection.worktree, &args)
+        let refs = command::successful_git_at(reachability.worktree, &args)
             .map_err(|error| error.to_string())?;
         digest.update(b"remaining\n");
         digest.update(&refs.stdout);
-        for stash in inspection.stashes {
+        for stash in &reachability.stashes {
             digest.update(stash.as_bytes());
             digest.update(b"\n");
         }
-        for seed in list_worktrees(inspection.repository_path)? {
+        for seed in list_worktrees(reachability.repository_path)? {
             digest.update(seed.head.unwrap_or_default().as_bytes());
             digest.update(b"\n");
         }
@@ -1872,12 +1931,12 @@ fn exclusive_commits(
 /// at one of them, and the `refs/prefetch/` copies `git maintenance` keeps and
 /// prunes on its own. Ref names cannot contain glob characters, so each name
 /// matches only itself.
-fn exclusions(inspection: &Inspection, removed: &[&str]) -> Vec<String> {
+fn exclusions(reachability: &Reachability, removed: &[&str]) -> Vec<String> {
     let mut dangling: Vec<&str> = removed.to_vec();
     // Follow chains of symbolic refs until no more point at a removed ref.
     loop {
         let before = dangling.len();
-        for (name, target) in inspection.symbolic_refs {
+        for (name, target) in &reachability.symbolic_refs {
             if dangling.contains(&target.as_str()) && !dangling.contains(&name.as_str()) {
                 dangling.push(name);
             }
@@ -2440,14 +2499,7 @@ mod tests {
             &["update-ref", "refs/heads/contained", "HEAD~1"],
         );
         let local = reviewed.plan.local.as_ref().expect("local details");
-        delete_local(
-            &reviewed.repository,
-            Path::new(&reviewed.plan.worktree_path),
-            local,
-            &reviewed.local_commands,
-            reviewed.merge_reference.as_deref(),
-        )
-        .expect_err("the branch moved to an unreviewed commit");
+        delete_local(&reviewed, local).expect_err("the branch moved to an unreviewed commit");
         assert!(fixture.has_ref("refs/heads/contained"));
     }
 
@@ -2463,14 +2515,7 @@ mod tests {
         // not, and nothing after the review has checked which happened.
         commit(&fixture.repository, "HEAD moves after the review");
         let local = reviewed.plan.local.as_ref().expect("local details");
-        let error = delete_local(
-            &reviewed.repository,
-            Path::new(&reviewed.plan.worktree_path),
-            local,
-            &reviewed.local_commands,
-            reviewed.merge_reference.as_deref(),
-        )
-        .expect_err("the merge reference moved");
+        let error = delete_local(&reviewed, local).expect_err("the merge reference moved");
         assert!(
             error.contains("moved after this deletion was reviewed"),
             "{error}"
@@ -2641,14 +2686,8 @@ mod tests {
             &["symbolic-ref", "refs/heads/alias", "refs/heads/main"],
         );
         let local = reviewed.plan.local.as_ref().expect("local details");
-        let error = delete_local(
-            &reviewed.repository,
-            Path::new(&reviewed.plan.worktree_path),
-            local,
-            &reviewed.local_commands,
-            reviewed.merge_reference.as_deref(),
-        )
-        .expect_err("a branch that became symbolic is not deleted");
+        let error = delete_local(&reviewed, local)
+            .expect_err("a branch that became symbolic is not deleted");
         assert!(error.contains("symbolic ref to main"), "{error}");
         assert!(fixture.has_ref("refs/heads/alias"));
         assert!(fixture.has_ref("refs/heads/main"));
@@ -3045,11 +3084,7 @@ mod tests {
         );
 
         let remote = reviewed.plan.remote.as_ref().expect("remote details");
-        let deletion = delete_remote(
-            Path::new(&reviewed.plan.worktree_path),
-            remote,
-            reviewed.push_url.as_deref(),
-        );
+        let deletion = delete_remote(&reviewed, remote);
         assert!(matches!(deletion.outcome, RemoteOutcome::Failed));
         assert!(
             deletion.output.contains("no longer pushes to"),
@@ -3132,16 +3167,82 @@ mod tests {
             &["worktree", "add", path(&linked), "late"],
         );
         let local = reviewed.plan.local.as_ref().expect("local details");
-        let error = delete_local(
-            &reviewed.repository,
-            Path::new(&reviewed.plan.worktree_path),
-            local,
-            &reviewed.local_commands,
-            None,
-        )
-        .expect_err("the branch is checked out by now");
+        let error = delete_local(&reviewed, local).expect_err("the branch is checked out by now");
         assert!(error.contains("checked out"), "{error}");
         assert!(fixture.has_ref("refs/heads/late"));
+    }
+
+    #[test]
+    fn a_local_branch_is_kept_once_its_loss_grows_after_review() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["switch", "--create", "feature"]);
+        commit(&fixture.repository, "kept by keeper at review");
+        git(&fixture.repository, &["branch", "keeper"]);
+        git(&fixture.repository, &["switch", "main"]);
+        let reviewed =
+            review(fixture.request("refs/heads/feature", true, false), None).expect("review");
+        let local = reviewed.plan.local.as_ref().expect("local details");
+        assert_eq!(local.exclusive_commit_count, 0);
+
+        git(
+            &fixture.repository,
+            &["branch", "--delete", "--force", "keeper"],
+        );
+        let error = delete_local(&reviewed, local).expect_err("the loss grew after review");
+        assert!(error.contains("would leave unreachable changed"), "{error}");
+        assert!(fixture.has_ref("refs/heads/feature"));
+    }
+
+    #[test]
+    fn a_remote_branch_is_kept_once_its_loss_grows_after_review() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["switch", "--create", "topic"]);
+        commit(&fixture.repository, "kept by the local branch at review");
+        git(&fixture.repository, &["push", "origin", "topic"]);
+        git(&fixture.repository, &["switch", "main"]);
+        let reviewed = review(
+            fixture.request("refs/remotes/origin/topic", false, true),
+            None,
+        )
+        .expect("review");
+        let remote = reviewed.plan.remote.as_ref().expect("remote details");
+        assert_eq!(remote.exclusive_commit_count, 0);
+
+        git(
+            &fixture.repository,
+            &["branch", "--delete", "--force", "topic"],
+        );
+        let deletion = delete_remote(&reviewed, remote);
+        assert!(matches!(deletion.outcome, RemoteOutcome::Failed));
+        assert!(
+            deletion.output.contains("would leave unreachable"),
+            "{}",
+            deletion.output
+        );
+        assert!(fixture.remote_has_branch("topic"));
+    }
+
+    #[test]
+    fn a_symbolic_ref_left_dangling_by_the_local_deletion_does_not_stop_the_remote_one() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["switch", "--create", "lonely"]);
+        commit(&fixture.repository, "only on lonely");
+        git(
+            &fixture.repository,
+            &["push", "--set-upstream", "origin", "lonely"],
+        );
+        git(&fixture.repository, &["switch", "main"]);
+        git(
+            &fixture.repository,
+            &["symbolic-ref", "refs/heads/alias", "refs/heads/lonely"],
+        );
+
+        let plan = fixture.plan("refs/heads/lonely", true, true);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        let result = execute(&plan, Some("lonely")).expect("delete both copies");
+        let remote = result.remote.expect("remote step");
+        assert!(remote.succeeded, "{}", remote.output);
+        assert!(!fixture.remote_has_branch("lonely"));
     }
 
     /// The full ref names `branches_in_progress` finds in `directory`.
