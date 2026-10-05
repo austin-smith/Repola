@@ -30,6 +30,7 @@ sha2 = "0.11"
 notify = "8"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 unicode-normalization = "0.1.25"
+caseless = "0.2.2"
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { version = "10.0.1", default-features = false, features = ["std", "job-object", "creation-flags"] }

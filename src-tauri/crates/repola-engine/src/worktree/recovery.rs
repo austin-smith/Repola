@@ -22,6 +22,7 @@ use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use caseless::Caseless;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
@@ -311,14 +312,44 @@ impl WorktreePath {
 }
 
 /// Matches the names Git refuses as path components: `.git` in any case, with
-/// the trailing dots and spaces Windows ignores, and its short-name alias.
+/// the trailing dots and spaces Windows ignores and the characters HFS+
+/// ignores, and its short-name alias.
 fn names_git_directory(component: &[u8]) -> bool {
-    let end = component
-        .iter()
-        .rposition(|byte| !matches!(byte, b'.' | b' '))
-        .map_or(0, |index| index + 1);
-    let trimmed = &component[..end];
-    trimmed.eq_ignore_ascii_case(b".git") || trimmed.eq_ignore_ascii_case(b"git~1")
+    let visible: String = String::from_utf8_lossy(component)
+        .chars()
+        .filter(|&character| !ignored_by_hfs(character))
+        .collect();
+    let trimmed = visible.trim_end_matches(['.', ' ']);
+    trimmed.eq_ignore_ascii_case(".git") || trimmed.eq_ignore_ascii_case("git~1")
+}
+
+/// Invisible formatting characters HFS+ leaves out when it compares names.
+fn ignored_by_hfs(character: char) -> bool {
+    matches!(
+        character,
+        '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}'
+    )
+}
+
+/// The forms under which a file system that ignores case may find a name, so
+/// names sharing either are taken as one. File systems differ: APFS and
+/// Linux's case-insensitive folders apply Unicode case folding, under which
+/// `ß` is `ss`; NTFS, exFAT, and ZFS uppercase one character at a time, under
+/// which `ı` is `i`; HFS+ also ignores some invisible characters.
+fn case_forms(name: &str) -> [String; 2] {
+    let visible = || name.chars().filter(|&character| !ignored_by_hfs(character));
+    let folded = visible().nfd().default_case_fold().nfd().collect();
+    let uppercased = visible()
+        .nfd()
+        .map(|character| {
+            let mut upper = character.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(upper), None) => upper,
+                _ => character,
+            }
+        })
+        .collect();
+    [folded, uppercased]
 }
 
 #[cfg(windows)]
@@ -548,38 +579,37 @@ fn refuse_name_collisions(
     if !folding.case && !folding.normalization {
         return Ok(());
     }
-    let fold = |bytes: &[u8]| {
-        let mut name = String::from_utf8_lossy(bytes).into_owned();
+    let forms = |bytes: &[u8]| {
+        let name = String::from_utf8_lossy(bytes);
         if folding.case {
-            name = name.to_lowercase();
+            case_forms(&name).to_vec()
+        } else {
+            vec![name.nfd().collect()]
         }
-        if folding.normalization {
-            name = name.nfc().collect();
-        }
-        name
     };
-    let mut seen: HashMap<String, (&GitPath, &[u8])> = HashMap::new();
+    let mut seen: HashMap<(usize, String), (&GitPath, &[u8])> = HashMap::new();
     for (path, valid) in paths.iter().zip(validated) {
-        let folded = fold(&valid.bytes);
-        match seen.get(&folded) {
-            Some((other, bytes)) if *bytes != valid.bytes.as_slice() => {
-                let only_case = String::from_utf8_lossy(bytes).to_lowercase()
-                    == String::from_utf8_lossy(&valid.bytes).to_lowercase();
-                return Err(if only_case {
-                    format!(
-                        "{} and {} differ only in letter case, so they are one file on this file system and Repola cannot save them separately. Undo this change with Git instead.",
-                        other.display, path.display
-                    )
-                } else {
-                    format!(
-                        "{} and {} are spelled differently but are one file on this file system, so Repola cannot save them separately. Undo this change with Git instead.",
-                        other.display, path.display
-                    )
-                });
-            }
-            Some(_) => {}
-            None => {
-                seen.insert(folded, (path, &valid.bytes));
+        for form in forms(&valid.bytes).into_iter().enumerate() {
+            match seen.get(&form) {
+                Some((other, bytes)) if *bytes != valid.bytes.as_slice() => {
+                    // Only letters from A to Z are one in either case on every
+                    // file system that ignores case.
+                    return Err(if bytes.eq_ignore_ascii_case(&valid.bytes) {
+                        format!(
+                            "{} and {} differ only in letter case, so they are one file on this file system and Repola cannot save them separately. Undo this change with Git instead.",
+                            other.display, path.display
+                        )
+                    } else {
+                        format!(
+                            "{} and {} are spelled differently but this file system may take them as one name, so Repola cannot save them separately. Undo this change with Git instead.",
+                            other.display, path.display
+                        )
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(form, (path, &valid.bytes));
+                }
             }
         }
     }
@@ -922,18 +952,20 @@ fn entry_identity(
             .map_err(|error| error.to_string())?;
         folder_listings.insert(folder.clone(), names);
     }
-    let wanted = name.to_string_lossy().to_lowercase();
-    let stored = folder_listings[&folder]
+    let listing = &folder_listings[&folder];
+    if listing.iter().any(|stored| stored == name) {
+        return Ok(vec![folder.join(name).into_os_string()]);
+    }
+    // The file system found the name under another spelling, so the folder
+    // stores it under a name sharing one of its forms. Any that does counts.
+    let wanted = case_forms(&name.to_string_lossy());
+    Ok(listing
         .iter()
-        .find(|stored| stored.as_os_str() == name)
-        .or_else(|| {
-            folder_listings[&folder]
-                .iter()
-                .find(|stored| stored.to_string_lossy().to_lowercase() == wanted)
-        });
-    Ok(stored
+        .filter(|stored| {
+            let forms = case_forms(&stored.to_string_lossy());
+            forms[0] == wanted[0] || forms[1] == wanted[1]
+        })
         .map(|stored| folder.join(stored).into_os_string())
-        .into_iter()
         .collect())
 }
 
@@ -3955,6 +3987,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn names_one_file_system_takes_as_one_share_a_case_form() {
+        let one = |left: &str, right: &str| {
+            let (left, right) = (case_forms(left), case_forms(right));
+            left[0] == right[0] || left[1] == right[1]
+        };
+        for (left, right) in [
+            // One name on APFS and in Linux's case-insensitive folders.
+            ("\u{3c3}", "\u{3c2}"),
+            ("\u{df}", "ss"),
+            ("\u{1e9e}", "\u{df}"),
+            ("\u{17f}", "s"),
+            ("\u{fb00}", "ff"),
+            ("\u{1f80}", "\u{1f88}"),
+            ("\u{10400}", "\u{10428}"),
+            ("\u{130}", "i\u{307}"),
+            ("\u{e9}", "E\u{301}"),
+            // One name where each character is uppercased, as on NTFS.
+            ("\u{131}", "i"),
+            ("\u{cd}", "\u{131}\u{301}"),
+            ("\u{3c2}", "\u{3a3}"),
+            // One name on HFS+.
+            ("a\u{200c}b", "ab"),
+            ("\u{feff}x", "X"),
+        ] {
+            assert!(one(left, right), "{left} and {right}");
+        }
+        for (left, right) in [("a", "b"), ("\u{df}", "s"), ("\u{130}", "i"), ("1", "2")] {
+            assert!(!one(left, right), "{left} and {right}");
+        }
+    }
+
+    #[test]
+    fn names_any_file_system_ignoring_case_takes_as_one_are_refused() {
+        let (_directory, path) = repository();
+        git(&path, &["config", "core.ignorecase", "true"]);
+        // Neither spelling is on disk, so only their names can tell.
+        for (left, right) in [("\u{3c3}.txt", "\u{3c2}.txt"), ("stra\u{df}e", "STRASSE")] {
+            let paths = [git_path(left.as_bytes()), git_path(right.as_bytes())];
+            let error = observe_paths(&path, None, &paths, false).expect_err("one name");
+            assert!(error.contains("may take them as one name"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_spelling_the_file_system_finds_is_the_entry_it_stores() {
+        let (_directory, path) = repository();
+        fs::write(path.join("\u{3c3}.txt"), b"one file\n").expect("write");
+        let other = path.join("\u{3c2}.txt");
+        let Ok(metadata) = fs::symlink_metadata(&other) else {
+            // This file system tells the spellings apart.
+            return;
+        };
+        let mut listings = HashMap::new();
+        let stored = entry_identity(
+            &path.join("\u{3c3}.txt"),
+            &fs::symlink_metadata(path.join("\u{3c3}.txt")).expect("stored"),
+            &mut listings,
+        )
+        .expect("stored identity");
+        let found = entry_identity(&other, &metadata, &mut listings).expect("identity");
+        assert!(found.iter().any(|identity| stored.contains(identity)));
+    }
+
     // Only macOS file systems compare names this way.
     #[cfg(target_os = "macos")]
     #[test]
@@ -4032,7 +4128,16 @@ mod tests {
 
     #[test]
     fn git_directory_names_are_recognized_in_every_spelling() {
-        for name in [".git", ".GIT", ".Git. ", ".git...", "git~1", "GIT~1"] {
+        for name in [
+            ".git",
+            ".GIT",
+            ".Git. ",
+            ".git...",
+            "git~1",
+            "GIT~1",
+            ".g\u{200c}it",
+            "\u{feff}.GIT",
+        ] {
             assert!(names_git_directory(name.as_bytes()), "{name}");
         }
         for name in [".github", "git", ".gitignore", "x.git"] {
