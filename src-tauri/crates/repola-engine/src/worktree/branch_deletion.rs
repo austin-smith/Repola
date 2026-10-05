@@ -716,7 +716,7 @@ fn delete_remote(
     }
     let output = match command::git_at(worktree, remote_deletion_args(remote)) {
         Ok(output) => output,
-        Err(error) if interrupted(&error) => {
+        Err(error) if may_have_run(&error) => {
             return RemoteDeletion {
                 outcome: RemoteOutcome::Unconfirmed,
                 output: format!(
@@ -870,12 +870,15 @@ fn remote_has(worktree: &Path, remote: &str, reference: &str) -> Result<bool, St
     Err(combined_output(&output.stdout, &output.stderr))
 }
 
-/// Whether a command stopped by cancellation or its deadline, which leaves
-/// whatever it was doing possibly done.
-fn interrupted(error: &command::CommandError) -> bool {
+/// Whether a command failed after it may already have done its work: stopped
+/// by cancellation or its deadline, or finished with more output than the
+/// command layer keeps.
+fn may_have_run(error: &command::CommandError) -> bool {
     matches!(
         error,
-        command::CommandError::Cancelled { .. } | command::CommandError::Timeout { .. }
+        command::CommandError::Cancelled { .. }
+            | command::CommandError::Timeout { .. }
+            | command::CommandError::OutputTooLarge { .. }
     )
 }
 
@@ -945,7 +948,7 @@ fn delete_local(
     let output = match command::git_at(worktree, deletion) {
         Ok(output) => output,
         // Restoring a branch that still exists is refused, so it is safe to offer.
-        Err(error) if interrupted(&error) => {
+        Err(error) if may_have_run(&error) => {
             return Ok(BranchDeletionStep {
                 target: local.name.clone(),
                 deleted_oid: local.tip.clone(),
@@ -3582,6 +3585,39 @@ mod tests {
         assert_eq!(remote.recovery_commands.len(), 1);
         // The hook held the push back, so the remote kept the branch here.
         assert!(fixture.remote_has_branch("slow"));
+    }
+
+    #[test]
+    fn a_push_with_more_output_than_kept_is_reported_as_unconfirmed() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "noisy"]);
+        git(&fixture.repository, &["push", "origin", "noisy"]);
+        let plan = fixture.plan("refs/remotes/origin/noisy", false, true);
+        // The hook lets the push go ahead after writing more than the command
+        // layer keeps, so the push runs to the end and still fails to report.
+        let hooks = fixture.repository.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).expect("hooks directory");
+        let script = hooks.join("pre-push");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nhead -c 34000000 /dev/zero >&2\nexit 0\n",
+        )
+        .expect("write hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("make the hook executable");
+        }
+
+        let result = execute(&plan, None).expect("an unreported push is not a refusal");
+        let remote = result.remote.as_ref().expect("remote step");
+        assert!(remote.unconfirmed, "{}", remote.output);
+        assert!(remote.output.contains("more than"), "{}", remote.output);
+        assert!(
+            !fixture.remote_has_branch("noisy"),
+            "the push did delete it"
+        );
     }
 
     #[test]
