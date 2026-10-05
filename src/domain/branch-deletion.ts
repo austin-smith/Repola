@@ -145,7 +145,12 @@ export function pullRequestConsequence(provider: RemoteProvider, count: number):
 /** Why the review asks for the typed branch name before deleting. */
 export function confirmationReasons(plan: BranchDeletionPlan): string[] {
   const reasons: string[] = [];
-  if (plan.requiresForce) reasons.push("This forced deletion discards commits that no other ref contains.");
+  const { local } = plan;
+  if (plan.requiresForce && local) {
+    reasons.push(local.exclusiveCommitCount > 0
+      ? "This forced deletion discards commits that no other ref contains."
+      : `git branch -d would refuse, because ${local.name} is not contained in ${local.mergeReference}.`);
+  }
   const remote = plan.deleteRemote ? plan.remote : null;
   if (remote && remote.exclusiveCommitCount > 0) reasons.push("Commits on the remote branch exist in no ref that remains after this deletion.");
   const pulls = openPullRequests(plan).length;

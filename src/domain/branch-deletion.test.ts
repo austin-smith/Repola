@@ -290,6 +290,10 @@ describe("open pull requests", () => {
       "This forced deletion discards commits that no other ref contains.",
       "2 open pull requests use the remote branch.",
     ]);
+    // Every commit is on another ref; only Git's upstream check asks for force.
+    expect(confirmationReasons(plan({ requiresForce: true, local: local(0) }))).toEqual([
+      "git branch -d would refuse, because feature is not contained in origin/feature.",
+    ]);
     expect(confirmationReasons(plan({ deleteRemote: true, remote: remote({ status: "checked", provider: "azureDevOps", pulls: [], moreThanListed: true }) }))).toEqual([
       "The provider has more open pull requests than Repola lists.",
     ]);
