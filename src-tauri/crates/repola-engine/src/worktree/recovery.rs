@@ -288,6 +288,12 @@ impl WorktreePath {
             {
                 return Err(unsafe_path());
             }
+            if !stored_as_named(component) {
+                return Err(format!(
+                    "{} cannot be stored under that name on Windows, so Repola will not change it. Rename it with Git on a system that allows the name.",
+                    path.display
+                ));
+            }
             components.push(os_string_from_path_bytes(component.to_vec())?);
         }
         Ok(Self { bytes, components })
@@ -317,6 +323,57 @@ fn has_platform_separator(component: &[u8]) -> bool {
 #[cfg(not(windows))]
 fn has_platform_separator(_component: &[u8]) -> bool {
     false
+}
+
+/// Whether this platform stores a path component under exactly that name.
+#[cfg(windows)]
+fn stored_as_named(component: &[u8]) -> bool {
+    !invalid_on_windows(component)
+}
+
+#[cfg(not(windows))]
+fn stored_as_named(_component: &[u8]) -> bool {
+    true
+}
+
+/// Whether Windows cannot store a path component as itself: it drops a
+/// trailing dot or space, forbids some characters, and reserves device names
+/// such as `NUL` and `COM1`, with or without an extension.
+#[cfg(any(windows, test))]
+fn invalid_on_windows(component: &[u8]) -> bool {
+    if component
+        .last()
+        .is_some_and(|byte| matches!(byte, b'.' | b' '))
+    {
+        return true;
+    }
+    let forbidden = |byte: &u8| {
+        *byte < 0x20 || matches!(byte, b'<' | b'>' | b':' | b'"' | b'\\' | b'|' | b'?' | b'*')
+    };
+    if component.iter().any(forbidden) {
+        return true;
+    }
+    let stem = component
+        .split(|byte| *byte == b'.')
+        .next()
+        .unwrap_or(component);
+    let end = stem
+        .iter()
+        .rposition(|byte| *byte != b' ')
+        .map_or(0, |index| index + 1);
+    let stem = stem[..end].to_ascii_uppercase();
+    let numbered = |prefix: &[u8]| {
+        stem.strip_prefix(prefix).is_some_and(|number| {
+            matches!(number, [b'1'..=b'9'])
+                // Superscript one, two, and three count as digits too.
+                || matches!(number, [0xc2, 0xb9] | [0xc2, 0xb2] | [0xc2, 0xb3])
+        })
+    };
+    matches!(
+        stem.as_slice(),
+        b"CON" | b"PRN" | b"AUX" | b"NUL" | b"CONIN$" | b"CONOUT$"
+    ) || numbered(b"COM")
+        || numbered(b"LPT")
 }
 
 /// Joins `path` onto the worktree without following any symbolic link.
@@ -3778,6 +3835,39 @@ mod tests {
         ];
         let error = observe_paths(&path, None, &paths, false).expect_err("one name");
         assert!(error.contains("spelled differently"), "{error}");
+    }
+
+    #[test]
+    fn names_windows_cannot_store_as_themselves_are_recognized() {
+        for name in [
+            "file.",
+            "file ",
+            "nul",
+            "NUL.txt",
+            "con .log",
+            "Aux",
+            "com1",
+            "LPT9.dat",
+            "com\u{b9}",
+            "conin$",
+            "a<b",
+            "what?",
+            "star*",
+            "tab\tname",
+        ] {
+            assert!(invalid_on_windows(name.as_bytes()), "{name}");
+        }
+        for name in [
+            "file",
+            "nullable",
+            "console.txt",
+            "com10",
+            "lpt",
+            "auxiliary",
+            "a.b",
+        ] {
+            assert!(!invalid_on_windows(name.as_bytes()), "{name}");
+        }
     }
 
     #[test]
