@@ -649,6 +649,12 @@ struct ParentChain {
     permissions: Vec<u32>,
 }
 
+/// A folder's entries: their names, and on Unix their inodes.
+#[cfg(unix)]
+type FolderListing = Vec<(OsString, u64)>;
+#[cfg(windows)]
+type FolderListing = Vec<OsString>;
+
 /// What names one entry on disk, so two paths sharing any of these are one
 /// entry under two spellings. On Unix it is the real path, which on macOS is
 /// spelled as the folder stores the name, and, for a folder or a file with one
@@ -658,16 +664,45 @@ struct ParentChain {
 fn entry_identity(
     location: &Path,
     metadata: &fs::Metadata,
-    _folder_listings: &mut HashMap<PathBuf, Vec<OsString>>,
+    folder_listings: &mut HashMap<PathBuf, FolderListing>,
 ) -> Result<Vec<OsString>, String> {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{DirEntryExt, MetadataExt};
     let mut identities = Vec::new();
-    if !metadata.file_type().is_symlink() {
-        let real = dunce::canonicalize(location)
-            .map_err(|error| format!("{} could not be inspected: {error}", location.display()))?;
+    let mut real_path = |real: PathBuf| {
         let mut identity = OsString::from("path:");
         identity.push(real);
         identities.push(identity);
+    };
+    if !metadata.file_type().is_symlink() {
+        real_path(
+            dunce::canonicalize(location).map_err(|error| {
+                format!("{} could not be inspected: {error}", location.display())
+            })?,
+        );
+    } else if let (Some(parent), Some(name)) = (location.parent(), location.file_name()) {
+        // Resolving a link would follow it, so its real path is its folder's
+        // and the name stored there: the one asked for if it is stored as is,
+        // or else each name stored for the link's own inode.
+        let folder = dunce::canonicalize(parent)
+            .map_err(|error| format!("{} could not be inspected: {error}", parent.display()))?;
+        if !folder_listings.contains_key(&folder) {
+            let mut listing = Vec::new();
+            for entry in fs::read_dir(&folder)
+                .map_err(|error| format!("{} could not be read: {error}", folder.display()))?
+            {
+                let entry = entry.map_err(|error| error.to_string())?;
+                listing.push((entry.file_name(), entry.ino()));
+            }
+            folder_listings.insert(folder.clone(), listing);
+        }
+        let listing = &folder_listings[&folder];
+        if listing.iter().any(|(stored, _)| stored == name) {
+            real_path(folder.join(name));
+        } else {
+            for (stored, _) in listing.iter().filter(|(_, inode)| *inode == metadata.ino()) {
+                real_path(folder.join(stored));
+            }
+        }
     }
     if metadata.is_dir() || metadata.nlink() == 1 {
         identities.push(OsString::from(format!(
@@ -687,7 +722,7 @@ fn entry_identity(
 fn entry_identity(
     location: &Path,
     _metadata: &fs::Metadata,
-    folder_listings: &mut HashMap<PathBuf, Vec<OsString>>,
+    folder_listings: &mut HashMap<PathBuf, FolderListing>,
 ) -> Result<Vec<OsString>, String> {
     let (Some(parent), Some(name)) = (location.parent(), location.file_name()) else {
         return Ok(Vec::new());
@@ -3452,6 +3487,32 @@ mod tests {
                 let error = observe_paths(&path, None, &paths, false).expect_err("one file");
                 assert!(error.contains("spelled differently"), "{error}");
             }
+        }
+        // A link is found without following it, even with a hard link of its
+        // own.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("target", path.join("caf\u{e9}-link")).expect("symlink");
+            fs::hard_link(path.join("caf\u{e9}-link"), path.join("other-link")).expect("link");
+            assert!(fs::symlink_metadata(path.join("other-link"))
+                .expect("hard link")
+                .file_type()
+                .is_symlink());
+            for other in ["CAF\u{c9}-LINK", "cafe\u{301}-link"] {
+                if fs::symlink_metadata(path.join(other)).is_ok() {
+                    let paths = [
+                        git_path("caf\u{e9}-link".as_bytes()),
+                        git_path(other.as_bytes()),
+                    ];
+                    let error = observe_paths(&path, None, &paths, false).expect_err("one link");
+                    assert!(error.contains("spelled differently"), "{error}");
+                }
+            }
+            let paths = [
+                git_path("caf\u{e9}-link".as_bytes()),
+                git_path(b"other-link"),
+            ];
+            observe_paths(&path, None, &paths, false).expect("hard-linked links");
         }
     }
 
