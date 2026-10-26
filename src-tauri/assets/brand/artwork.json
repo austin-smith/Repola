@@ -1,0 +1,10 @@
+{
+  "canvasSize": 1024,
+  "tile": { "x": 100, "y": 100, "size": 824 },
+  "foreground": "repola-r.png",
+  "backgrounds": {
+    "stable": "stable-background.png",
+    "nightly": "stable-background.png",
+    "development": "blueprint-background.png"
+  }
+}

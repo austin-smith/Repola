@@ -1,7 +1,9 @@
 param(
     [ValidateSet('prepare', 'sign', 'verify', 'verify-installer')]
     [string]$Operation,
-    [string[]]$FilePath
+    [string[]]$FilePath,
+    [ValidatePattern('^[a-z0-9-]+$')]
+    [string]$DesktopBinaryName = 'repola'
 )
 
 Set-StrictMode -Version Latest
@@ -50,7 +52,7 @@ function Assert-WindowsSignature([string]$Path) {
     Invoke-SigningTool -Arguments @('verify', '/pa', '/all', '/tw', $resolved)
 }
 
-function Assert-WindowsInstaller([string]$Path) {
+function Assert-WindowsInstaller([string]$Path, [ValidatePattern('^[a-z0-9-]+$')][string]$BinaryName = 'repola') {
     $resolved = (Resolve-Path -LiteralPath $Path).Path
     Assert-WindowsSignature $resolved
     $directory = Join-Path (Get-RequiredSigningEnvironment 'RUNNER_TEMP') "repola-installer-verification-$([Guid]::NewGuid())"
@@ -58,7 +60,7 @@ function Assert-WindowsInstaller([string]$Path) {
     try {
         & 7z x '-y' "-o$directory" '--' $resolved
         if ($LASTEXITCODE -ne 0) { throw "Installer extraction failed with exit code $LASTEXITCODE." }
-        $applications = @(Get-ChildItem -LiteralPath $directory -Recurse -File -Filter 'repola.exe')
+        $applications = @(Get-ChildItem -LiteralPath $directory -Recurse -File -Filter "$BinaryName.exe")
         if ($applications.Count -ne 1) { throw "Expected one packaged desktop executable; found $($applications.Count)." }
         Assert-WindowsSignature $applications[0].FullName
     } finally {
@@ -108,7 +110,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         if (-not $FilePath -or $FilePath.Count -eq 0) { throw 'Specify at least one file to sign or verify.' }
         foreach ($file in $FilePath) {
             if ($Operation -eq 'sign') { Sign-WindowsFile $file }
-            elseif ($Operation -eq 'verify-installer') { Assert-WindowsInstaller $file }
+            elseif ($Operation -eq 'verify-installer') { Assert-WindowsInstaller $file $DesktopBinaryName }
             else { Assert-WindowsSignature $file }
         }
     }

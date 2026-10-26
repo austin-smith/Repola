@@ -128,10 +128,11 @@ describe("isolated signing keychain", () => {
 });
 
 describe("final macOS installer verification", () => {
-  async function releaseFixture() {
+  async function releaseFixture(name = "Repola") {
     const options = await fixture();
     const bundleDirectory = join(options.environment.RUNNER_TEMP, "bundle");
     await mkdir(join(bundleDirectory, "dmg"), { recursive: true });
+    await mkdir(join(bundleDirectory, "macos", `${name}.app`), { recursive: true });
     await writeFile(join(bundleDirectory, "dmg", "Repola.dmg"), "dmg fixture");
     return { ...options, bundleDirectory, environment: { ...options.environment, REPOLA_TARGET: "aarch64-apple-darwin", APPLE_API_KEY_PATH: join(options.directory, "AuthKey.p8"), APPLE_API_KEY: secrets.APPLE_API_KEY_ID, APPLE_API_ISSUER: secrets.APPLE_API_ISSUER_ID } };
   }
@@ -159,6 +160,19 @@ describe("final macOS installer verification", () => {
     options.run.mockImplementation(async (program, args) => args[0] === "notarytool" ? '{"status":"Invalid","id":"failed-submission"}' : normalRun(program, args));
     await expect(verifyMacosRelease(options)).rejects.toThrow(/not accepted.*failed-submission/);
     expect(options.run.mock.calls.some(([, args]) => args[0] === "stapler" && args[1] === "staple")).toBe(false);
+  });
+
+  it.each(["Repola (Nightly)", "Repola (Dev)"])("verifies the %s bundle using its exact path", async (name) => {
+    const options = await releaseFixture(name);
+    await verifyMacosRelease(options);
+    expect(options.run).toHaveBeenCalledWith("codesign", ["--verify", "--deep", "--strict", join(options.bundleDirectory, "macos", `${name}.app`)]);
+  });
+
+  it("rejects ambiguous app bundles before running verification", async () => {
+    const options = await releaseFixture();
+    await mkdir(join(options.bundleDirectory, "macos", "Repola (Nightly).app"));
+    await expect(verifyMacosRelease(options)).rejects.toThrow(/exactly one macOS application/);
+    expect(options.run).not.toHaveBeenCalled();
   });
 
   it("stops before notarization when the app fails Gatekeeper assessment", async () => {

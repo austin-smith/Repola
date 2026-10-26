@@ -46,6 +46,26 @@ export function isToggleSelectedChangesShortcut(event: SelectAllShortcutEvent): 
     && event.key === " ";
 }
 
+/**
+ * Limits a selection to the listed rows, so filtered-out rows are never acted
+ * on. When the active row is hidden, the first listed selected row takes over,
+ * or else the first listed row, keeping the preview on a visible change.
+ */
+export function restrictChangeSelection(ids: readonly string[], current: ChangeSelection): ChangeSelection {
+  const listed = new Set(ids);
+  const activeListed = current.activeId === null || listed.has(current.activeId);
+  const anchorListed = current.anchorId === null || listed.has(current.anchorId);
+  if (activeListed && anchorListed && [...current.selectedIds].every((id) => listed.has(id))) return current;
+
+  const selectedIds = new Set(ids.filter((id) => current.selectedIds.has(id)));
+  if (activeListed) {
+    return { selectedIds, activeId: current.activeId, anchorId: anchorListed ? current.anchorId : current.activeId };
+  }
+  const activeId = ids.find((id) => selectedIds.has(id)) ?? null;
+  if (activeId === null) return singleChangeSelection(ids[0] ?? null);
+  return { selectedIds, activeId, anchorId: anchorListed ? current.anchorId : activeId };
+}
+
 export function selectAllChanges(ids: readonly string[], current: ChangeSelection): ChangeSelection {
   const selectedIds = new Set(ids);
   const activeId = current.activeId !== null && selectedIds.has(current.activeId)

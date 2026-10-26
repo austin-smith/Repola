@@ -143,7 +143,7 @@ describe("CommitMessageSettings", () => {
     mocks.loadTextGenerationStatus.mockResolvedValueOnce(ready)
       .mockImplementationOnce(() => new Promise((_, reject) => { rejectRefresh = reject; }));
     render(<CommitMessageSettings machine={machine} selection={null} disabled={false} onChange={vi.fn()} />);
-    const model = await screen.findByRole("button", { name: /^Model / });
+    const model = await screen.findByRole("button", { name: "Model Test model" });
     fireEvent.click(screen.getByRole("button", { name: "Check Codex again" }));
     expect(screen.getByRole("button", { name: /^Model / })).toBe(model);
     expect(screen.queryByRole("status", { name: "Loading Codex settings" })).not.toBeInTheDocument();
@@ -193,7 +193,7 @@ describe("CommitMessageSettings", () => {
       models: [{ ...ready.models[0], defaultReasoningEffort: "low", supportedReasoningEfforts: [{ reasoningEffort: "low", description: "" }] }],
     });
     render(<CommitMessageSettings machine={machine} selection={null} disabled={false} onChange={vi.fn()} />);
-    const model = await screen.findByRole("button", { name: /^Model / });
+    const model = await screen.findByRole("button", { name: "Model Test model" });
     const reasoning = screen.getByRole("combobox", { name: "Reasoning" });
     const row = model.closest('[data-slot="field-group"]');
     expect(row).toBe(reasoning.closest('[data-slot="field-group"]'));
@@ -202,7 +202,7 @@ describe("CommitMessageSettings", () => {
 
   it("preserves the reasoning column when the model has no reasoning options", async () => {
     render(<CommitMessageSettings machine={machine} selection={null} disabled={false} onChange={vi.fn()} />);
-    const model = await screen.findByRole("button", { name: /^Model / });
+    const model = await screen.findByRole("button", { name: "Model Test model" });
     expect(model.closest('[data-slot="field-group"]')).toHaveClass("grid-cols-1");
     expect(model.closest('[data-slot="field-group"]')).toHaveClass("@sm/field-group:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]");
     expect(screen.getByRole("combobox", { name: "Reasoning" })).toBeDisabled();

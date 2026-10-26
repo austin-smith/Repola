@@ -1,6 +1,6 @@
 # Releasing Repola
 
-Stable tags (`vX.Y.Z`) create drafts. Nightlies (`X.Y.Z-nightly.<run-number>`) publish daily at 09:17 UTC or through **Release → Run workflow → main → Publish nightly**. Unchanged nightlies are skipped. Both channels require passing three-platform CI at the source commit on `main`.
+Stable tags (`vX.Y.Z`) create drafts. Nightlies (`X.Y.Z-nightly.YYYYMMDD.N`, for example `0.1.0-nightly.20261005.1`) use the workflow run's UTC date and a sequence starting at 1 for each date and base version. Saved build metadata reserves numbers for unpublished or failed builds; reruns reuse the reservation while that artifact remains available. Nightlies publish daily at 09:17 UTC or through **Release → Run workflow → main → Publish nightly**. Unchanged nightlies are skipped. Both channels require passing three-platform CI at the source commit on `main`.
 
 Desktop releases support macOS arm64 (DMG), Linux x64 (AppImage and Debian package), and Windows x64 (NSIS), with matching agents for each target plus Linux arm64.
 
@@ -33,7 +33,9 @@ Generate the updater key with `pnpm tauri signer generate -w <private-key-path>`
 
 Feeds are `https://austin-smith.github.io/Repola/updates/stable.json` and `https://austin-smith.github.io/Repola/updates/nightly.json`.
 
-Both channels share application identity and settings. Switch by installing the desired channel. Back up settings before installing an older version.
+Stable installs as **Repola**, nightly as **Repola (Nightly)**, and local or manual installer builds as **Repola (Dev)**. Each has a separate application identity and settings profile, so they can be installed side by side. Development builds have no update feed.
+
+Stable retains existing data and imports legacy Git In Here settings. Existing nightly installs shared Stable's profile; the next nightly update starts a separate, empty profile. Add repositories explicitly in each new profile.
 
 ## Recovery
 

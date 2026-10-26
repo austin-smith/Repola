@@ -1,5 +1,12 @@
 # Repola contributor guide
 
+## Working principles
+
+- Understand the real constraint and choose the smallest system that makes correct behavior unsurprising. Fight scope creep.
+- Add documentation only when a maintainer would get something wrong without it; omit explanations already clear from the code.
+- Test meaningful logic or observable behavior; avoid assertions that merely check wiring or mirror the implementation.
+- Keep implementation plans, research notes, and agent scratch files outside the worktree.
+
 ## Product principles
 
 - Treat every destructive Git or filesystem operation as safety-critical.

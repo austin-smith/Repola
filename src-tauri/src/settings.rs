@@ -164,13 +164,21 @@ pub fn migrate_legacy_app_data<R: Runtime>(app: &AppHandle<R>) -> Result<(), Set
         .path()
         .app_data_dir()
         .map_err(|error| SettingsError::Migration(error.to_string()))?;
+    migrate_legacy_profile(&app.config().identifier, &current)
+}
+
+fn migrate_legacy_profile(identifier: &str, current: &Path) -> Result<(), SettingsError> {
+    // Development and nightly profiles must never import the production registry or audit log.
+    if identifier != "net.crapshack.repola" {
+        return Ok(());
+    }
     let Some(parent) = current.parent() else {
         return Err(SettingsError::Migration(format!(
             "{} has no parent directory",
             current.display()
         )));
     };
-    migrate_known_files(&parent.join(LEGACY_APP_IDENTIFIER), &current)
+    migrate_known_files(&parent.join(LEGACY_APP_IDENTIFIER), current)
 }
 
 fn migrate_known_files(legacy: &Path, current: &Path) -> Result<(), SettingsError> {
@@ -960,6 +968,31 @@ mod tests {
             serde_json::json!({ "local": ["/Users/example/Developer"] }),
         );
         assert!(read_registered_repositories(&store, LOCAL_MACHINE_ID).is_empty());
+    }
+
+    #[test]
+    fn only_stable_imports_the_legacy_repository_registry_and_audit_log() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let legacy = temp.path().join(LEGACY_APP_IDENTIFIER);
+        std::fs::create_dir_all(&legacy).expect("legacy directory");
+        std::fs::write(legacy.join(STORE_FILE), "legacy settings").expect("legacy settings");
+        std::fs::write(legacy.join("actions.jsonl"), "legacy audit").expect("legacy audit");
+
+        for identifier in ["net.crapshack.repola.dev", "net.crapshack.repola.nightly"] {
+            let profile = temp.path().join(identifier);
+            migrate_legacy_profile(identifier, &profile).expect("isolated profile");
+            assert!(!profile.exists());
+        }
+        let stable = temp.path().join("net.crapshack.repola");
+        migrate_legacy_profile("net.crapshack.repola", &stable).expect("stable migration");
+        assert_eq!(
+            std::fs::read_to_string(stable.join(STORE_FILE)).expect("stable settings"),
+            "legacy settings"
+        );
+        assert_eq!(
+            std::fs::read_to_string(stable.join("actions.jsonl")).expect("stable audit"),
+            "legacy audit"
+        );
     }
 
     #[test]

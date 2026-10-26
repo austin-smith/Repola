@@ -8,7 +8,9 @@ use super::models::{
     FileChangeKind, FileDiff, HistoryPage, HistoryRequest, ImageVersion, ReflogEntry,
     ReflogRequest,
 };
-use super::working_copy::{empty_tree, git_path, path_from_token, truncate_file_patch};
+use super::working_copy::{
+    empty_tree, git_path, literal_pathspec, path_from_token, truncate_file_patch,
+};
 
 const MAX_HISTORY_PAGE: u16 = 100;
 const MAX_REFLOG_PAGE: u16 = 500;
@@ -211,7 +213,7 @@ pub fn commit_file_diff(request: CommitFileDiffRequest) -> Result<FileDiff, Stri
         OsString::from(&request.commit),
         OsString::from("--"),
     ];
-    patch_args.extend(paths.iter().cloned());
+    patch_args.extend(paths.iter().map(literal_pathspec));
     let mut numstat_args = vec![
         OsString::from("diff"),
         OsString::from("--numstat"),
@@ -219,7 +221,7 @@ pub fn commit_file_diff(request: CommitFileDiffRequest) -> Result<FileDiff, Stri
         OsString::from(&request.commit),
         OsString::from("--"),
     ];
-    numstat_args.extend(paths);
+    numstat_args.extend(paths.iter().map(literal_pathspec));
     let patch =
         command::successful_git_at(&worktree, patch_args).map_err(|error| error.to_string())?;
     let numstat =
@@ -568,6 +570,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn committed_glob_named_file_diffs_exclude_their_neighbours() {
+        let repository = image_repository();
+        std::fs::write(repository.path().join("[x].txt"), "selected\n").unwrap();
+        std::fs::write(repository.path().join("x.txt"), "neighbour\n").unwrap();
+        let commit = commit_image_files(repository.path());
+        let path = repository.path().to_string_lossy().into_owned();
+        let diff = commit_file_diff(CommitFileDiffRequest {
+            repository_path: path.clone(),
+            worktree_path: path,
+            commit,
+            path: git_path(b"[x].txt"),
+        })
+        .unwrap();
+        assert!(diff.patch.contains("+selected"));
+        assert!(!diff.patch.contains("neighbour"));
     }
 
     #[test]

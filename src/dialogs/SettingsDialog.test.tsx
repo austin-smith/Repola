@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/components/theme-provider";
 import { SettingsDialog } from "./SettingsDialog";
@@ -34,8 +34,8 @@ const machines = [
   },
 ];
 
-function renderSettings() {
-  return render(<ThemeProvider storageKey="test-theme"><SettingsDialog machines={machines} selectedMachineId="local" busy={false}
+function renderSettings(profiles = machines) {
+  return render(<ThemeProvider storageKey="test-theme"><SettingsDialog machines={profiles} selectedMachineId="local" busy={false}
     onClose={vi.fn()} onRemoveMachine={async () => true} onMoveMachine={async () => undefined}
     onSaveMachine={async () => true} onTestMachine={async () => null} /></ThemeProvider>);
 }
@@ -120,18 +120,18 @@ describe("SettingsDialog", () => {
     if (!ai || !tools) throw new Error("Settings sections missing");
     const signing = within(tools).getByRole("checkbox", { name: "Sign commits by default using Git configuration" });
     const save = within(tools).getByRole("button", { name: "Save preferences" });
-    fireEvent.click(within(ai).getByRole("button", { name: "Claude" }));
-    await waitFor(() => expect(preferenceMocks.saveAppPreferences).toHaveBeenCalledTimes(1));
+    await act(async () => fireEvent.click(within(ai).getByRole("button", { name: "Claude" })));
+    expect(preferenceMocks.saveAppPreferences).toHaveBeenCalledTimes(1);
     fireEvent.click(signing);
     expect(tools.querySelector('[data-slot="spinner"]')).toBeNull();
     await act(async () => rejectSave(new Error("Cannot save AI settings")));
     expect(signing).toBeChecked();
     expect(within(ai).getByRole("button", { name: "Codex" })).toHaveAttribute("aria-pressed", "true");
     expect(within(ai).getByRole("alert")).toHaveTextContent("Cannot save AI settings");
-    fireEvent.click(save);
-    await waitFor(() => expect(preferenceMocks.saveAppPreferences).toHaveBeenLastCalledWith(expect.objectContaining({
+    await act(async () => fireEvent.click(save));
+    expect(preferenceMocks.saveAppPreferences).toHaveBeenLastCalledWith(expect.objectContaining({
       defaultSignCommits: true, textGenerationSelections: {},
-    })));
+    }));
   });
 
   it("keeps controls enabled during rapid switches and rolls back to the last successful save", async () => {
@@ -226,24 +226,11 @@ describe("SettingsDialog", () => {
   });
 
   it("shows Codex readiness for the selected machine", async () => {
-    render(
-      <ThemeProvider storageKey="test-theme">
-        <SettingsDialog
-          machines={machines}
-          selectedMachineId="local"
-          busy={false}
-          onClose={() => undefined}
-          onRemoveMachine={async () => true}
-          onMoveMachine={async () => undefined}
-          onSaveMachine={async () => true}
-          onTestMachine={async () => null}
-        />
-      </ThemeProvider>,
-    );
+    await act(async () => { renderSettings(); });
 
     expect(screen.getByRole("heading", { name: "AI" })).toBeInTheDocument();
     expect(screen.queryByText("Integrations")).not.toBeInTheDocument();
-    expect(await screen.findByText("GPT-5.6-Luna")).toBeInTheDocument();
+    expect(screen.getByText("GPT-5.6-Luna")).toBeInTheDocument();
     expect(screen.queryByText(/Ready on/)).not.toBeInTheDocument();
     expect(screen.getByText("Low")).toBeInTheDocument();
     expect(screen.queryByText("Fast and affordable agentic coding model.")).not.toBeInTheDocument();
@@ -252,60 +239,34 @@ describe("SettingsDialog", () => {
   });
 
   it("persists an explicit commit-message model for the selected machine", async () => {
-    render(
-      <ThemeProvider storageKey="test-theme">
-        <SettingsDialog
-          machines={machines}
-          selectedMachineId="local"
-          busy={false}
-          onClose={() => undefined}
-          onRemoveMachine={async () => true}
-          onMoveMachine={async () => undefined}
-          onSaveMachine={async () => true}
-          onTestMachine={async () => null}
-        />
-      </ThemeProvider>,
-    );
+    await act(async () => { renderSettings(); });
 
-    const selectedModel = await screen.findByText("GPT-5.6-Luna");
-    const modelTrigger = selectedModel.closest("button");
+    const modelTrigger = screen.getByText("GPT-5.6-Luna").closest("button");
     expect(modelTrigger).not.toBeNull();
     if (!modelTrigger) throw new Error("model trigger not found");
-    fireEvent.click(modelTrigger);
-    const option = await screen.findByRole("menuitemradio", { name: "GPT-5.6-Sol" });
-    fireEvent.pointerDown(option, { button: 0 });
-    fireEvent.pointerUp(option, { button: 0 });
-    fireEvent.click(option, { button: 0 });
+    await act(async () => fireEvent.click(modelTrigger));
+    const option = screen.getByRole("menuitemradio", { name: "GPT-5.6-Sol" });
+    await act(async () => {
+      fireEvent.pointerDown(option, { button: 0 });
+      fireEvent.pointerUp(option, { button: 0 });
+      fireEvent.click(option, { button: 0 });
+    });
 
-    await waitFor(() => expect(preferenceMocks.saveAppPreferences).toHaveBeenCalledWith(expect.objectContaining({
+    expect(preferenceMocks.saveAppPreferences).toHaveBeenCalledWith(expect.objectContaining({
       textGenerationSelections: { local: { provider: "codex", selections: { codex: { model: "gpt-5.6-sol", reasoningEffort: "low" } } } },
-    })));
+    }));
   });
 
   it("keeps older and specialized Codex models out of the normal picker", async () => {
-    render(
-      <ThemeProvider storageKey="test-theme">
-        <SettingsDialog
-          machines={machines}
-          selectedMachineId="local"
-          busy={false}
-          onClose={() => undefined}
-          onRemoveMachine={async () => true}
-          onMoveMachine={async () => undefined}
-          onSaveMachine={async () => true}
-          onTestMachine={async () => null}
-        />
-      </ThemeProvider>,
-    );
+    await act(async () => { renderSettings(); });
 
-    const selectedModel = await screen.findByText("GPT-5.6-Luna");
-    const modelTrigger = selectedModel.closest("button");
+    const modelTrigger = screen.getByText("GPT-5.6-Luna").closest("button");
     expect(modelTrigger).not.toBeNull();
     if (!modelTrigger) throw new Error("model trigger not found");
-    fireEvent.click(modelTrigger);
+    await act(async () => fireEvent.click(modelTrigger));
     expect(screen.queryByRole("menuitemradio", { name: "GPT-5.4" })).not.toBeInTheDocument();
-    fireEvent.click(await screen.findByRole("menuitem", { name: "More models…" }));
-    expect(await screen.findByRole("menuitemradio", { name: "GPT-5.4" })).toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByRole("menuitem", { name: "More models…" })));
+    expect(screen.getByRole("menuitemradio", { name: "GPT-5.4" })).toBeInTheDocument();
   });
 
   it("changes the theme from the Appearance section", () => {
@@ -330,30 +291,15 @@ describe("SettingsDialog", () => {
   });
 
   it("shows detected applications with human labels and falls back from an unavailable preference", async () => {
-    render(
-      <ThemeProvider storageKey="test-theme">
-        <SettingsDialog
-          machines={machines.slice(0, 1)}
-          selectedMachineId="local"
-          busy={false}
-          onClose={() => undefined}
-          onRemoveMachine={async () => true}
-          onMoveMachine={async () => undefined}
-          onSaveMachine={async () => true}
-          onTestMachine={async () => null}
-        />
-      </ThemeProvider>,
-    );
+    await act(async () => { renderSettings(machines.slice(0, 1)); });
 
-    const editorValue = await screen.findByText("Cursor");
-    const terminalValue = await screen.findByText("Ghostty");
-    const editor = editorValue.closest("button");
+    const editor = screen.getByText("Cursor").closest("button");
     expect(editor).not.toBeNull();
-    expect(terminalValue.closest("button")).not.toBeNull();
+    expect(screen.getByText("Ghostty").closest("button")).not.toBeNull();
     if (!editor) throw new Error("editor trigger not found");
 
-    fireEvent.click(editor);
-    expect(await screen.findByRole("option", { name: "Visual Studio Code" })).toBeInTheDocument();
+    await act(async () => fireEvent.click(editor));
+    expect(screen.getByRole("option", { name: "Visual Studio Code" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Xcode" })).toBeInTheDocument();
     expect(screen.queryByRole("option", { name: "Zed" })).not.toBeInTheDocument();
   });

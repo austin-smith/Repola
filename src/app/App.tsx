@@ -80,6 +80,7 @@ import {
 import { RepositoryProvider, type RepositoryContextValue } from "../workspace/context";
 import { AppSidebar, type MachineConnection } from "../workspace/AppSidebar";
 import { RepositoryToolbar } from "../workspace/RepositoryToolbar";
+import { HistoryWorkbench } from "../workspace/lazy";
 import { WorktreeDetails, type PullState } from "../workspace/WorktreeDetails";
 import { PaneResizeHandle } from "../workspace/PaneResizeHandle";
 import { LazyDialog } from "../workspace/LazyDialog";
@@ -90,7 +91,6 @@ import { useWorkspaceRefresh } from "./useWorkspaceRefresh";
 import { mergeRefresh } from "../domain/refresh-merge";
 
 const ChangesWorkbench = lazy(() => import("../workspace/ChangesWorkbench").then((module) => ({ default: module.ChangesWorkbench })));
-const HistoryWorkbench = lazy(() => import("../workspace/HistoryWorkbench").then((module) => ({ default: module.HistoryWorkbench })));
 
 function WorkbenchLoading({ label }: { label: string }) {
   return (
