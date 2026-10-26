@@ -1,11 +1,13 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChangesWorkbench } from "./ChangesWorkbench";
-import type { GeneratedCommitMessage, WorkingCopySnapshot } from "../ipc/types";
+import type { FileDiff, GeneratedCommitMessage, WorkingCopySnapshot } from "../ipc/types";
+import { changeDiffKey, exactDiffDisplay } from "../domain/diff-cache";
 
 const ipc = vi.hoisted(() => ({
   fetchWorkingCopy: vi.fn(), generateCommitMessage: vi.fn(), synchronizeWorkingCopy: vi.fn(),
-  watchWorktree: vi.fn(), unwatchWorktree: vi.fn(), onWorktreeChanged: vi.fn(),
+  commitWorkingCopy: vi.fn(),
+  observeCache: vi.fn(),
 }));
 vi.mock("../ipc/worktrees", () => ipc);
 vi.mock("../ipc/app-preferences", () => ({
@@ -16,12 +18,28 @@ vi.mock("../ipc/app-preferences", () => ({
   loadExternalTools: async () => ({ editors: [], terminals: [] }),
 }));
 vi.mock("../app/environment", () => ({ usePathSeparator: () => "/" }));
-vi.mock("./context", () => ({ useWorkingCopy: () => ({
+const context = vi.hoisted(() => ({
   machineId: "local", machineKind: "local", machineOs: null,
   repository: { path: "/repo" }, worktree: { id: "main", path: "/repo" },
-}) }));
+  statusRevision: 0, workingCopySnapshot: undefined as WorkingCopySnapshot | undefined,
+  gitRevision: 0,
+  refreshPending: false, waitForRefresh: undefined as (() => Promise<void>) | undefined,
+}));
+vi.mock("./context", () => ({ useWorkingCopy: () => context }));
+let workbench: ReturnType<typeof render>;
+function renderWorkbench() {
+  workbench = render(<ChangesWorkbench />);
+  return workbench;
+}
+function refreshWorkbench() {
+  context.statusRevision += 1;
+  workbench.rerender(<ChangesWorkbench />);
+}
 vi.mock("./lazy", () => ({
-  InlineFileDiff: ({ selectionDisabled }: { selectionDisabled: boolean }) => <input type="checkbox" aria-label="Select diff line" disabled={selectionDisabled} />,
+  InlineFileDiff: ({ selectionDisabled, cache }: { selectionDisabled: boolean; cache: Map<string, FileDiff> }) => {
+    ipc.observeCache(cache);
+    return <input type="checkbox" aria-label="Select diff line" disabled={selectionDisabled} />;
+  },
   DiscardDialog: ({ change, onBusyChange }: { change: { path: { display: string } } | null; onBusyChange: (busy: boolean) => void }) => (
     <div role="dialog" aria-label="Discard review">
       {change ? change.path.display : "every change"}
@@ -29,7 +47,13 @@ vi.mock("./lazy", () => ({
       <button type="button" onClick={() => onBusyChange(false)}>End discard</button>
     </div>
   ),
-  DiscardedChangesDialog: ({ initialPointId }: { initialPointId: string | null }) => <div role="dialog" aria-label="Discarded changes">{initialPointId ?? "no point"}</div>,
+  DiscardedChangesDialog: ({ initialPointId, onBusyChange }: { initialPointId: string | null; onBusyChange: (busy: boolean) => void }) => (
+    <div role="dialog" aria-label="Discarded changes">
+      {initialPointId ?? "no point"}
+      <button type="button" onClick={() => onBusyChange(true)}>Start restore</button>
+      <button type="button" onClick={() => onBusyChange(false)}>End restore</button>
+    </div>
+  ),
 }));
 
 const snapshot: WorkingCopySnapshot = {
@@ -46,9 +70,117 @@ describe("commit-message generation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     ipc.fetchWorkingCopy.mockResolvedValue(snapshot);
-    ipc.watchWorktree.mockResolvedValue(undefined);
-    ipc.unwatchWorktree.mockResolvedValue(undefined);
-    ipc.onWorktreeChanged.mockResolvedValue(() => undefined);
+    context.statusRevision = 0;
+    context.gitRevision = 0;
+    context.workingCopySnapshot = undefined;
+    context.refreshPending = false;
+    context.waitForRefresh = undefined;
+  });
+
+  it("uses coordinator snapshots without a duplicate status read and preserves a draft", async () => {
+    context.workingCopySnapshot = snapshot;
+    renderWorkbench();
+    await screen.findByRole("button", { name: "Generate commit message" });
+    fireEvent.change(screen.getByPlaceholderText("Summary (required)"), { target: { value: "keep this draft" } });
+    context.workingCopySnapshot = { ...snapshot, branch: "renamed" };
+    await act(async () => refreshWorkbench());
+    expect(ipc.fetchWorkingCopy).not.toHaveBeenCalled();
+    expect(screen.getByPlaceholderText("Summary (required)")).toHaveValue("keep this draft");
+    expect(screen.getByRole("button", { name: "Commit 1 file to renamed" })).toBeEnabled();
+  });
+
+  it("ignores unrelated context renders", async () => {
+    renderWorkbench();
+    await screen.findByRole("button", { name: "Generate commit message" });
+    await act(async () => workbench.rerender(<ChangesWorkbench />));
+    expect(ipc.fetchWorkingCopy).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { label: "Commit author name", value: "Author without email", error: "Enter both an author name and email address, or leave both blank to use Git configuration." },
+    { label: "Co-authors", value: "Malformed co-author", error: "Each co-author must use the format Name <email@example.com>, one per line." },
+    { label: "Additional trailers", value: "Malformed trailer", error: "Trailers must use the format Key: value, one per line." },
+  ])("keeps refreshing after invalid $label input prevents a commit", async ({ label, value, error }) => {
+    context.workingCopySnapshot = snapshot;
+    renderWorkbench();
+    await screen.findByRole("button", { name: "Generate commit message" });
+    fireEvent.change(screen.getByPlaceholderText("Summary (required)"), { target: { value: "keep this draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Author, co-authors, trailers, and signing…" }));
+    fireEvent.change(screen.getByLabelText(label), { target: { value } });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Commit 1 file to main" })));
+    expect(screen.getByText(error)).toBeInTheDocument();
+    expect(ipc.commitWorkingCopy).not.toHaveBeenCalled();
+
+    context.workingCopySnapshot = { ...snapshot, changes: [] };
+    await act(async () => refreshWorkbench());
+    expect(screen.getByText("No local changes")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Summary (required)")).toHaveValue("keep this draft");
+    expect(ipc.fetchWorkingCopy).not.toHaveBeenCalled();
+  });
+
+  it("invalidates an in-flight diff cache on metadata revision without changing the draft", async () => {
+    context.workingCopySnapshot = snapshot;
+    renderWorkbench();
+    await screen.findByRole("button", { name: "Generate commit message" });
+    await screen.findByRole("checkbox", { name: "Select diff line" });
+    const original = ipc.observeCache.mock.calls[ipc.observeCache.mock.calls.length - 1][0] as Map<string, FileDiff>;
+    fireEvent.change(screen.getByPlaceholderText("Summary (required)"), { target: { value: "keep draft" } });
+    context.gitRevision++;
+    await act(async () => workbench.rerender(<ChangesWorkbench />));
+    const updated = ipc.observeCache.mock.calls[ipc.observeCache.mock.calls.length - 1][0] as Map<string, FileDiff>;
+    expect(updated).not.toBe(original);
+    expect(screen.getByPlaceholderText("Summary (required)")).toHaveValue("keep draft");
+    expect(ipc.fetchWorkingCopy).not.toHaveBeenCalled();
+  });
+
+  it.each([".gitattributes", "nested/.gitattributes"])("invalidates cached patches after a missed %s change recovered through status", async (path) => {
+    const attribute = { ...snapshot.changes[0], id: path, path: { display: path, token: path }, worktreeStamp: "attributes-before" };
+    context.workingCopySnapshot = { ...snapshot, changes: [...snapshot.changes, attribute] };
+    renderWorkbench();
+    await screen.findByRole("button", { name: "Generate commit message" });
+    await screen.findByRole("checkbox", { name: "Select diff line" });
+    const original = ipc.observeCache.mock.calls[ipc.observeCache.mock.calls.length - 1][0] as Map<string, FileDiff>;
+    original.set(changeDiffKey(snapshot.changes[0], 0, exactDiffDisplay), {} as FileDiff);
+    context.workingCopySnapshot = { ...snapshot, changes: [...snapshot.changes, { ...attribute, worktreeStamp: "attributes-after" }] };
+    await act(async () => refreshWorkbench());
+    const updated = ipc.observeCache.mock.calls[ipc.observeCache.mock.calls.length - 1][0] as Map<string, FileDiff>;
+    expect(updated.size).toBe(0);
+    expect(updated).not.toBe(original);
+  });
+
+  it.each([false, true])("waits for coordinator validation before applying generation (changed: %s)", async (changed) => {
+    context.workingCopySnapshot = snapshot;
+    let complete!: (message: GeneratedCommitMessage) => void;
+    let validate!: () => void;
+    ipc.generateCommitMessage.mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
+    const validation = new Promise<void>((resolve) => { validate = resolve; });
+    context.waitForRefresh = () => validation;
+    renderWorkbench();
+    fireEvent.click(await screen.findByRole("button", { name: "Generate commit message" }));
+    context.refreshPending = true;
+    await act(async () => workbench.rerender(<ChangesWorkbench />));
+    await act(async () => complete({ subject: "validated message", body: "" }));
+    expect(screen.getByPlaceholderText("Summary (required)")).toHaveValue("");
+    expect(screen.getByPlaceholderText("Summary (required)")).toBeDisabled();
+    context.workingCopySnapshot = changed ? { ...snapshot, head: "different" } : snapshot;
+    context.refreshPending = false;
+    await act(async () => refreshWorkbench());
+    await act(async () => validate());
+    expect(screen.getByPlaceholderText("Summary (required)")).toHaveValue(changed ? "" : "validated message");
+    expect(ipc.fetchWorkingCopy).not.toHaveBeenCalled();
+  });
+
+  it("applies the queued status revision after a mutation settles", async () => {
+    let complete!: (value: { snapshot: WorkingCopySnapshot; output: string }) => void;
+    ipc.synchronizeWorkingCopy.mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
+    context.workingCopySnapshot = { ...snapshot, remote: "origin", upstream: "origin/main", behind: 1 };
+    renderWorkbench();
+    fireEvent.click(await screen.findByRole("button", { name: "Pull 1" }));
+    context.workingCopySnapshot = { ...snapshot, branch: "latest" };
+    await act(async () => refreshWorkbench());
+    await act(async () => complete({ snapshot: { ...snapshot, branch: "mutation" }, output: "" }));
+    expect(screen.getByRole("button", { name: "Commit 1 file to latest" })).toBeInTheDocument();
+    expect(ipc.fetchWorkingCopy).not.toHaveBeenCalled();
   });
 
   it("fills the commit form from the generated subject and body", async () => {
@@ -56,7 +188,7 @@ describe("commit-message generation", () => {
       subject: "improve commit generation",
       body: "- use standard Git terminology",
     } satisfies GeneratedCommitMessage);
-    render(<ChangesWorkbench />);
+    renderWorkbench();
     const generate = await screen.findByRole("button", { name: "Generate commit message" });
     await act(async () => fireEvent.click(generate));
     expect(screen.getByPlaceholderText("Summary (required)")).toHaveValue("improve commit generation");
@@ -74,19 +206,37 @@ describe("commit-message generation", () => {
     expect(screen.getByRole("dialog", { name: "Discard review" })).toHaveTextContent("every change");
   });
 
-  it("holds refreshes back while a discard runs and reloads once it ends", async () => {
-    let notify!: (event: { machineId: string }) => void;
-    ipc.onWorktreeChanged.mockImplementation(async (listener) => { notify = listener; return () => undefined; });
-    await act(async () => { render(<ChangesWorkbench />); });
+  it("holds coordinated snapshots back while a discard runs and applies them once it ends", async () => {
+    context.workingCopySnapshot = snapshot;
+    await act(async () => { renderWorkbench(); });
+    fireEvent.change(screen.getByPlaceholderText("Summary (required)"), { target: { value: "keep discard draft" } });
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "More change actions" })));
     await act(async () => fireEvent.click(screen.getByRole("menuitem", { name: "Discard all changes…" })));
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Start discard" })));
-    const loads = ipc.fetchWorkingCopy.mock.calls.length;
-    await act(async () => notify({ machineId: "local" }));
-    expect(ipc.fetchWorkingCopy).toHaveBeenCalledTimes(loads);
-    // Whether the discard succeeded or failed, the working copy loads again.
+    context.workingCopySnapshot = { ...snapshot, changes: [] };
+    await act(async () => refreshWorkbench());
+    expect(screen.queryByText("No local changes")).not.toBeInTheDocument();
+    // Both success and failure settle the busy state before accepting refreshes.
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "End discard" })));
-    expect(ipc.fetchWorkingCopy).toHaveBeenCalledTimes(loads + 1);
+    expect(screen.getByText("No local changes")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Summary (required)")).toHaveValue("keep discard draft");
+    expect(ipc.fetchWorkingCopy).not.toHaveBeenCalled();
+  });
+
+  it("queues recovery snapshots while restoring and preserves the commit draft", async () => {
+    context.workingCopySnapshot = snapshot;
+    await act(async () => { renderWorkbench(); });
+    fireEvent.change(screen.getByPlaceholderText("Summary (required)"), { target: { value: "keep recovery draft" } });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "More change actions" })));
+    await act(async () => fireEvent.click(screen.getByRole("menuitem", { name: "Discarded changes…" })));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Start restore" })));
+    context.workingCopySnapshot = { ...snapshot, branch: "restored", head: "restored-head" };
+    await act(async () => refreshWorkbench());
+    expect(screen.getByRole("button", { name: "Commit 1 file to main" })).toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "End restore" })));
+    expect(screen.getByRole("button", { name: "Commit 1 file to restored" })).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Summary (required)")).toHaveValue("keep recovery draft");
+    expect(ipc.fetchWorkingCopy).not.toHaveBeenCalled();
   });
 
   it("opens the recovery point a discard's toast asks for, but not another working copy's", async () => {
@@ -119,7 +269,7 @@ describe("commit-message generation", () => {
   it("locks selection, offers cancellation, and ignores a late cancelled response", async () => {
     let complete!: (message: GeneratedCommitMessage) => void;
     ipc.generateCommitMessage.mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
-    render(<ChangesWorkbench />);
+    renderWorkbench();
     const generate = await screen.findByRole("button", { name: "Generate commit message" });
     const summary = screen.getByPlaceholderText("Summary (required)");
     fireEvent.change(summary, { target: { value: "my existing message" } });
@@ -141,7 +291,7 @@ describe("commit-message generation", () => {
 
   it("aborts generation when the workbench is closed", async () => {
     ipc.generateCommitMessage.mockImplementation(() => new Promise(() => undefined));
-    const view = render(<ChangesWorkbench />);
+    const view = renderWorkbench();
     fireEvent.click(await screen.findByRole("button", { name: "Generate commit message" }));
     const signal = ipc.generateCommitMessage.mock.calls[0][2] as AbortSignal;
     view.unmount();
@@ -157,7 +307,7 @@ describe("commit-message generation", () => {
     let complete!: (message: GeneratedCommitMessage) => void;
     ipc.generateCommitMessage.mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
     ipc.synchronizeWorkingCopy.mockResolvedValue({ snapshot: { ...snapshot, head: "new-head" }, output: "" });
-    render(<ChangesWorkbench />);
+    renderWorkbench();
     const generate = await screen.findByRole("button", { name: "Generate commit message" });
     const summary = screen.getByPlaceholderText("Summary (required)");
     fireEvent.change(summary, { target: { value: "existing message" } });
@@ -172,11 +322,9 @@ describe("commit-message generation", () => {
   });
 
   it("refreshes external changes and cancels generation instead of applying a message for the old selection", async () => {
-    let notify!: (event: { machineId: string }) => void;
-    ipc.onWorktreeChanged.mockImplementation(async (listener) => { notify = listener; return () => undefined; });
     let complete!: (message: GeneratedCommitMessage) => void;
     ipc.generateCommitMessage.mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
-    render(<ChangesWorkbench />);
+    renderWorkbench();
     const generate = await screen.findByRole("button", { name: "Generate commit message" });
     const summary = screen.getByPlaceholderText("Summary (required)");
     fireEvent.change(summary, { target: { value: "existing message" } });
@@ -185,7 +333,7 @@ describe("commit-message generation", () => {
     const changed = { ...snapshot, changes: [...snapshot.changes, { ...snapshot.changes[0], id: "new-file", path: { display: "new-file", token: "new-file" } }] };
     ipc.fetchWorkingCopy.mockResolvedValue(changed);
     await act(async () => {
-      notify({ machineId: "local" });
+      refreshWorkbench();
     });
     await screen.findByText("new-file");
     expect(signal.aborted).toBe(true);
@@ -197,11 +345,11 @@ describe("commit-message generation", () => {
   });
 
   it("cancels generation when a previously started reload discovers a changed selection", async () => {
-    render(<ChangesWorkbench />);
+    renderWorkbench();
     const generate = await screen.findByRole("button", { name: "Generate commit message" });
     let reload!: (value: WorkingCopySnapshot) => void;
     ipc.fetchWorkingCopy.mockImplementationOnce(() => new Promise((resolve) => { reload = resolve; }));
-    fireEvent(window, new Event("focus"));
+    refreshWorkbench();
     await waitFor(() => expect(ipc.fetchWorkingCopy).toHaveBeenCalledTimes(2));
     let complete!: (message: GeneratedCommitMessage) => void;
     ipc.generateCommitMessage.mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
@@ -214,13 +362,13 @@ describe("commit-message generation", () => {
     expect(screen.getByPlaceholderText("Summary (required)")).toHaveValue("");
   });
 
-  it("does not cancel generation for a focus refresh with an unchanged snapshot", async () => {
+  it("does not cancel generation for a coordinated refresh with an unchanged snapshot", async () => {
     let complete!: (message: GeneratedCommitMessage) => void;
     ipc.generateCommitMessage.mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
-    render(<ChangesWorkbench />);
+    renderWorkbench();
     fireEvent.click(await screen.findByRole("button", { name: "Generate commit message" }));
     const signal = ipc.generateCommitMessage.mock.calls[0][2] as AbortSignal;
-    await act(async () => fireEvent(window, new Event("focus")));
+    await act(async () => refreshWorkbench());
     expect(ipc.fetchWorkingCopy).toHaveBeenCalledTimes(2);
     expect(signal.aborted).toBe(false);
     await act(async () => complete({ subject: "change file", body: "" }));
@@ -229,11 +377,11 @@ describe("commit-message generation", () => {
   });
 
   it("waits for a pending refresh before applying a completed generation", async () => {
-    render(<ChangesWorkbench />);
+    renderWorkbench();
     const generate = await screen.findByRole("button", { name: "Generate commit message" });
     let reload!: (value: WorkingCopySnapshot) => void;
     ipc.fetchWorkingCopy.mockImplementationOnce(() => new Promise((resolve) => { reload = resolve; }));
-    fireEvent(window, new Event("focus"));
+    refreshWorkbench();
     await waitFor(() => expect(ipc.fetchWorkingCopy).toHaveBeenCalledTimes(2));
     ipc.generateCommitMessage.mockResolvedValue({ subject: "outdated message", body: "" });
     await act(async () => fireEvent.click(generate));
@@ -248,11 +396,11 @@ describe("commit-message generation", () => {
   });
 
   it("can cancel while a completed generation waits for snapshot validation", async () => {
-    render(<ChangesWorkbench />);
+    renderWorkbench();
     const generate = await screen.findByRole("button", { name: "Generate commit message" });
     let reload!: (value: WorkingCopySnapshot) => void;
     ipc.fetchWorkingCopy.mockImplementationOnce(() => new Promise((resolve) => { reload = resolve; }));
-    fireEvent(window, new Event("focus"));
+    refreshWorkbench();
     await waitFor(() => expect(ipc.fetchWorkingCopy).toHaveBeenCalledTimes(2));
     ipc.generateCommitMessage.mockResolvedValue({ subject: "cancelled message", body: "" });
     await act(async () => fireEvent.click(generate));
@@ -264,13 +412,13 @@ describe("commit-message generation", () => {
   });
 
   it.each([false, true])("discards generation on refresh failure (provider finished first: %s)", async (providerFinishedFirst) => {
-    render(<ChangesWorkbench />);
+    renderWorkbench();
     const generate = await screen.findByRole("button", { name: "Generate commit message" });
     let rejectReload!: (error: Error) => void;
     let complete!: (message: GeneratedCommitMessage) => void;
     ipc.fetchWorkingCopy.mockImplementationOnce(() => new Promise((_, reject) => { rejectReload = reject; }));
     ipc.generateCommitMessage.mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
-    fireEvent(window, new Event("focus"));
+    refreshWorkbench();
     await waitFor(() => expect(ipc.fetchWorkingCopy).toHaveBeenCalledTimes(2));
     fireEvent.click(generate);
     const message = { subject: "unverified message", body: "" };
@@ -302,6 +450,7 @@ describe("change type filter", () => {
   const renderWorkbench = async () => {
     let view!: ReturnType<typeof render>;
     await act(async () => { view = render(<ChangesWorkbench />); });
+    workbench = view;
     return view;
   };
 
@@ -321,9 +470,11 @@ describe("change type filter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     ipc.fetchWorkingCopy.mockResolvedValue(mixed);
-    ipc.watchWorktree.mockResolvedValue(undefined);
-    ipc.unwatchWorktree.mockResolvedValue(undefined);
-    ipc.onWorktreeChanged.mockResolvedValue(() => undefined);
+    context.statusRevision = 0;
+    context.gitRevision = 0;
+    context.workingCopySnapshot = undefined;
+    context.refreshPending = false;
+    context.waitForRefresh = undefined;
   });
 
   it("offers no type filter when every change has the same type", async () => {
@@ -374,14 +525,12 @@ describe("change type filter", () => {
   });
 
   it("stops filtering by a type once a refresh removes its last file", async () => {
-    let notify!: (event: { machineId: string }) => void;
-    ipc.onWorktreeChanged.mockImplementation(async (listener) => { notify = listener; return () => undefined; });
     const { container } = await renderWorkbench();
     await chooseType("Deleted (1)");
     expect(listedIds(container)).toEqual(["old.txt"]);
 
-    ipc.fetchWorkingCopy.mockResolvedValue({ ...mixed, changes: mixed.changes.filter((entry) => entry.kind !== "deleted") });
-    await act(async () => notify({ machineId: "local" }));
+    context.workingCopySnapshot = { ...mixed, changes: mixed.changes.filter((entry) => entry.kind !== "deleted") };
+    await act(async () => refreshWorkbench());
     expect(listedIds(container)).toEqual(["src/app.ts", "new.txt"]);
     await openTypeMenu();
     expect(screen.queryByRole("menuitemcheckbox", { name: /^Deleted/ })).not.toBeInTheDocument();

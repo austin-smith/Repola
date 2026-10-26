@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::operation;
@@ -18,6 +19,16 @@ use super::models::{
 pub enum ScanError {
     #[error("The worktree scan was cancelled.")]
     Cancelled,
+}
+
+/// All inventory inspection shares two workers instead of saturating Rayon's
+/// global pool with Git processes on machines with many CPU cores.
+pub(crate) fn with_inspection_workers<T: Send>(execute: impl FnOnce() -> T + Send) -> T {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    match POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(2).build().ok()) {
+        Some(pool) => pool.install(execute),
+        None => execute(),
+    }
 }
 
 pub fn scan(request: ScanRequest) -> Result<ScanResult, ScanError> {
@@ -83,25 +94,27 @@ where
     });
 
     let operation_token = operation::current_operation();
-    let mut worktrees: Vec<WorktreeRecord> = work_items
-        .par_iter()
-        .filter_map(|(repository, seed)| {
-            if operation_token.is_cancelled() {
-                return None;
-            }
-            let record = operation::with_operation(operation_token.clone(), || {
-                inspect_worktree_shallow(repository, seed)
-            });
-            emit(ScanEvent::Worktree {
-                record: Box::new(record.clone()),
-            });
-            Some(record)
-        })
-        .collect();
+    let mut worktrees: Vec<WorktreeRecord> = with_inspection_workers(|| {
+        work_items
+            .par_iter()
+            .filter_map(|(repository, seed)| {
+                if operation_token.is_cancelled() {
+                    return None;
+                }
+                let record = operation::with_operation(operation_token.clone(), || {
+                    inspect_worktree_shallow(repository, seed)
+                });
+                emit(ScanEvent::Worktree {
+                    record: Box::new(record.clone()),
+                });
+                Some(record)
+            })
+            .collect()
+    });
     if operation_token.is_cancelled() {
         return Err(ScanError::Cancelled);
     }
-    worktrees.par_iter_mut().for_each(|record| {
+    worktrees.iter_mut().for_each(|record| {
         if operation_token.is_cancelled() {
             return;
         }
@@ -176,7 +189,7 @@ where
     Ok(result)
 }
 
-fn inspect_registered_repository(
+pub(crate) fn inspect_registered_repository(
     path: &str,
 ) -> Result<(RepositoryContext, Vec<WorktreeSeed>), String> {
     validate_repository_path(path)?;
@@ -221,23 +234,24 @@ pub(crate) fn repository_context(path: &Path) -> Result<RepositoryContext, Strin
         .file_name()
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned());
-    let git_dir_output = command::successful_git_at(
+    let git_dir_output = command::successful_inspection_git_at(
         path,
         ["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
     .map_err(|error| error.to_string())?;
     let git_dir = PathBuf::from(String::from_utf8_lossy(&git_dir_output.stdout).trim());
-    let remote_url = command::git_at(path, ["config", "--get", "remote.origin.url"])
+    let remote_url = command::inspection_git_at(path, ["config", "--get", "remote.origin.url"])
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .filter(|value| !value.is_empty());
     let provider = remote_provider(remote_url.as_deref());
-    let default_target = command::git_at(path, ["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|value| !value.is_empty());
+    let default_target =
+        command::inspection_git_at(path, ["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|value| !value.is_empty());
 
     Ok(RepositoryContext {
         name,
@@ -250,8 +264,11 @@ pub(crate) fn repository_context(path: &Path) -> Result<RepositoryContext, Strin
 }
 
 pub(crate) fn list_worktrees(repository: &Path) -> Result<Vec<WorktreeSeed>, String> {
-    let output = command::successful_git_at(repository, ["worktree", "list", "--porcelain", "-z"])
-        .map_err(|error| error.to_string())?;
+    let output = command::successful_inspection_git_at(
+        repository,
+        ["worktree", "list", "--porcelain", "-z"],
+    )
+    .map_err(|error| error.to_string())?;
     Ok(parse_worktree_porcelain(&output.stdout))
 }
 

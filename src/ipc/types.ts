@@ -35,7 +35,7 @@ export interface AgentInfo {
   architecture: string;
   gitVersion: string | null;
   maximumFrameBytes: number;
-  capabilities: ("repositoryDiscovery" | "worktreeInventory" | "workingCopy" | "history" | "synchronization" | "branches" | "repositoryManagement" | "worktreeManagement" | "stashes" | "providerIntegration" | "textGeneration")[];
+  capabilities: ("repositoryDiscovery" | "worktreeInventory" | "workspaceRefresh" | "worktreeMeasurement" | "workingCopy" | "history" | "synchronization" | "branches" | "repositoryManagement" | "worktreeManagement" | "stashes" | "providerIntegration" | "textGeneration")[];
 }
 
 export type WorkspaceView = "changes" | "history" | "worktrees";
@@ -707,3 +707,65 @@ export type ScanEvent =
   | { type: "worktree"; record: WorktreeRecord }
   | { type: "size"; id: string; sizeBytes: number | null; sizeIncomplete: boolean; lastActivityAtMs: number | null }
   | { type: "done"; result: ScanResult };
+
+export interface RefreshRequest {
+  repositoryPaths: string[];
+  worktreePaths: string[] | null;
+  workingCopy: { repositoryPath: string; worktreePath: string } | null;
+  refreshMetadata?: boolean;
+}
+
+export interface RefreshError {
+  repositoryPath: string;
+  worktreePath: string | null;
+  message: string;
+}
+
+export interface RepositoryGitSignature {
+  repositoryPath: string;
+  signature: string;
+}
+
+export interface RefreshResult {
+  refreshedAtMs: number;
+  repositories: RepositorySummary[];
+  memberships: WorktreeRecord[];
+  worktrees: WorktreeRecord[];
+  successfulRepositoryPaths: string[];
+  errors: RefreshError[];
+  gitSignatures: RepositoryGitSignature[];
+  workingCopy: WorkingCopySnapshot | null;
+}
+
+export interface WorktreeMeasurement {
+  repositoryPath: string;
+  worktreePath: string;
+  sizeBytes: number | null;
+  sizeIncomplete: boolean;
+  lastActivityAtMs: number | null;
+}
+
+export interface WorkspaceWatchTarget {
+  repositoryPath: string;
+  worktreePath: string;
+}
+
+export interface WatchCoverageError {
+  path: string;
+  message: string;
+}
+
+export interface WorkspaceWatchResult {
+  supported: boolean;
+  active: boolean;
+  subscriptionId: string;
+  coverageErrors: WatchCoverageError[];
+}
+
+export interface WorkspaceChangedEvent {
+  machineId: string;
+  subscriptionId: string;
+  repositoryPaths: string[];
+  worktreePaths: string[];
+  kind: "files" | "git" | "inventory" | "overflow";
+}

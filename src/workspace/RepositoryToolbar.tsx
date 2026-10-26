@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   ChevronRightIcon,
   DatabaseIcon,
@@ -70,7 +70,7 @@ export function RepositoryToolbar({
           <WorktreePicker worktrees={worktrees} onWorktreeChange={onWorktreeChange} />
           <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
         {repository && worktree ? (
-          <BranchControl key={`${repository.path}\0${worktree.id}\0${worktree.head ?? ""}`} />
+          <BranchControl key={`${repository.path}\0${worktree.id}`} />
         ) : (
           <span className="text-sm text-muted-foreground">No branch</span>
         )}
@@ -249,24 +249,28 @@ function WorktreePicker({
 }
 
 function BranchControl() {
-  const { machineId, repository, worktree, refreshWorkspace: onChanged, showChanges: onNeedsResolution } = useWorkingCopy();
+  const { machineId, repository, worktree, gitRevision, registerRefreshConsumer, refreshWorkspace: onChanged, showChanges: onNeedsResolution } = useWorkingCopy();
   const [branches, setBranches] = useState<BranchInfo[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [dialogKind, setDialogKind] = useState<"create" | "rename" | null>(null);
   const [branchName, setBranchName] = useState("");
+  const [branchReview, setBranchReview] = useState<{ head: string | null; branch: string | null } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [historyActionsOpen, setHistoryActionsOpen] = useState(false);
+  const [historyActions, setHistoryActions] = useState<{ targets: HistoryTarget[]; branch: string | null } | null>(null);
   const [tagsOpen, setTagsOpen] = useState(false);
+  const pendingBranches = useRef<Promise<void> | null>(null);
+  useEffect(() => registerRefreshConsumer?.(() => pendingBranches.current ?? Promise.resolve()), [registerRefreshConsumer]);
 
   useEffect(() => {
+    if (busy) return;
     const controller = new AbortController();
-    void loadBranches(machineId, repository.path, worktree.path, controller.signal)
-      .then(setBranches)
+    pendingBranches.current = loadBranches(machineId, repository.path, worktree.path, controller.signal)
+      .then((next) => { if (!controller.signal.aborted) setBranches(next); })
       .catch((cause: unknown) => {
         if (!controller.signal.aborted) setError(toMessage(cause));
       });
     return () => controller.abort();
-  }, [machineId, repository.path, worktree.id, worktree.path, worktree.head]);
+  }, [busy, gitRevision, machineId, repository.path, worktree.id, worktree.path, worktree.head, worktree.branch]);
 
   const current = branches?.find((branch) => branch.current && !branch.remote) ?? null;
   const localBranches = branches?.filter((branch) => !branch.remote) ?? [];
@@ -289,6 +293,9 @@ function BranchControl() {
     setBusy(true);
     setError(null);
     try {
+      if (dialogKind && branchReview && (branchReview.head !== worktree.head || branchReview.branch !== worktree.branch)) {
+        throw new Error("The current branch changed while this dialog was open. Close it and review the branch action again.");
+      }
       const result = await mutateBranch(
         machineId,
         repository.path,
@@ -296,7 +303,8 @@ function BranchControl() {
         kind,
         name,
         startPoint,
-        worktree.head,
+        dialogKind && branchReview ? branchReview.head : worktree.head,
+        dialogKind && branchReview ? branchReview.branch : worktree.branch,
       );
       setBranches(result.branches);
       setDialogKind(null);
@@ -324,6 +332,7 @@ function BranchControl() {
 
   const openDialog = (kind: "create" | "rename") => {
     setError(null);
+    setBranchReview({ head: worktree.head, branch: worktree.branch });
     setBranchName(kind === "rename" ? current?.name ?? "" : "");
     setDialogKind(kind);
   };
@@ -385,7 +394,7 @@ function BranchControl() {
               <DropdownMenuLabel>Branch actions</DropdownMenuLabel>
               <DropdownMenuItem onClick={() => openDialog("create")}><PlusIcon aria-hidden="true" />Create branch…</DropdownMenuItem>
               <DropdownMenuItem disabled={current === null} onClick={() => openDialog("rename")}><PencilIcon aria-hidden="true" />Rename current branch…</DropdownMenuItem>
-              <DropdownMenuItem disabled={current === null || historyTargets.length === 0} onClick={() => setHistoryActionsOpen(true)}><GitMergeIcon aria-hidden="true" />Merge or rebase…</DropdownMenuItem>
+              <DropdownMenuItem disabled={current === null || historyTargets.length === 0} onClick={() => setHistoryActions({ targets: historyTargets, branch: current?.name ?? null })}><GitMergeIcon aria-hidden="true" />Merge or rebase…</DropdownMenuItem>
               <DropdownMenuItem disabled={worktree.head === null} onClick={() => setTagsOpen(true)}><TagIcon aria-hidden="true" />Tags…</DropdownMenuItem>
             </DropdownMenuGroup>
           </DropdownMenuContent>
@@ -397,8 +406,8 @@ function BranchControl() {
               <DialogTitle>{dialogKind === "rename" ? "Rename branch" : "Create a branch"}</DialogTitle>
               <DialogDescription>
                 {dialogKind === "rename"
-                  ? `Rename ${current?.name ?? "the current branch"}. Git will preserve its commits and upstream configuration.`
-                  : `Create a branch from ${current?.name ?? shortSha(worktree.head)} and check it out in this worktree.`}
+                  ? `Rename ${branchReview?.branch ?? "the current branch"}. Git will preserve its commits and upstream configuration.`
+                  : `Create a branch from ${branchReview?.branch ?? shortSha(branchReview?.head ?? null)} and check it out in this worktree.`}
               </DialogDescription>
             </DialogHeader>
             <Field>
@@ -424,17 +433,17 @@ function BranchControl() {
           </form>
         </DialogContent>
       </Dialog>
-      {historyActionsOpen ? (
-        <LazyDialog onClose={() => setHistoryActionsOpen(false)}>
+      {historyActions ? (
+        <LazyDialog onClose={() => setHistoryActions(null)}>
           <HistoryMutationDialog
             machineId={machineId}
             repository={repository}
             worktree={worktree}
             kinds={["merge", "squashMerge", "rebase"]}
-            targets={historyTargets}
+            targets={historyActions.targets}
             initialKind="merge"
-            title={`Update ${current?.name ?? "current branch"}`}
-            onClose={() => setHistoryActionsOpen(false)}
+            title={`Update ${historyActions.branch ?? "current branch"}`}
+            onClose={() => setHistoryActions(null)}
             onCompleted={async (result, kind, target) => {
               await onChanged();
               setBranches(await loadBranches(machineId, repository.path, worktree.path));

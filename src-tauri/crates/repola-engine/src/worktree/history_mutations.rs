@@ -20,6 +20,9 @@ pub fn mutate_history(request: HistoryMutationRequest) -> Result<HistoryMutation
                 .into(),
         );
     }
+    if before.branch != request.expected_branch {
+        return Err("The working-copy branch changed after this history action was reviewed. Refresh and review it again.".into());
+    }
     if before.operation.is_some() {
         return Err(
             "Finish or abort the in-progress Git operation before starting another history action."
@@ -213,6 +216,7 @@ mod tests {
             kind,
             target,
             expected_head: snapshot.head.clone(),
+            expected_branch: snapshot.branch.clone(),
             expected_changes: snapshot
                 .changes
                 .iter()
@@ -302,5 +306,88 @@ mod tests {
             assert!(args.iter().any(|argument| argument == target));
             assert!(!args.iter().any(|argument| argument.is_empty()));
         }
+    }
+
+    #[test]
+    fn reset_rejects_a_branch_switch_at_the_same_head_without_changing_refs_or_files() {
+        let repository = repository();
+        let base = snapshot(&repository).head.unwrap();
+        std::fs::write(repository.path().join("second.txt"), "second\n").unwrap();
+        command::successful_git_at(repository.path(), ["add", "."]).unwrap();
+        command::successful_git_at(repository.path(), ["commit", "-m", "second"]).unwrap();
+        let reviewed = snapshot(&repository);
+        command::successful_git_at(repository.path(), ["switch", "--create", "other"]).unwrap();
+        let refs_before = command::successful_git_at(
+            repository.path(),
+            [
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+            ],
+        )
+        .unwrap()
+        .stdout;
+        for kind in [
+            HistoryMutationKind::ResetSoft,
+            HistoryMutationKind::ResetMixed,
+            HistoryMutationKind::ResetHard,
+        ] {
+            let error = mutate_history(request(&reviewed, kind, base.clone()))
+                .expect_err("Same-HEAD branch switches must invalidate the review");
+            assert!(error.contains("branch changed"), "{error}");
+            let after = snapshot(&repository);
+            assert_eq!(after.head, reviewed.head);
+            assert_eq!(after.branch.as_deref(), Some("other"));
+            assert!(after.changes.is_empty());
+            assert_eq!(
+                std::fs::read_to_string(repository.path().join("second.txt")).unwrap(),
+                "second\n"
+            );
+            let refs_after = command::successful_git_at(
+                repository.path(),
+                [
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname)",
+                    "refs/heads",
+                ],
+            )
+            .unwrap()
+            .stdout;
+            assert_eq!(refs_after, refs_before);
+        }
+    }
+
+    #[test]
+    fn detached_review_is_checked_exactly_and_can_reset_only_while_still_detached() {
+        let repository = repository();
+        let attached = snapshot(&repository);
+        let mut missing_branch = request(
+            &attached,
+            HistoryMutationKind::ResetSoft,
+            attached.head.clone().unwrap(),
+        );
+        missing_branch.expected_branch = None;
+        assert!(mutate_history(missing_branch)
+            .unwrap_err()
+            .contains("branch changed"));
+        command::successful_git_at(repository.path(), ["checkout", "--detach", "HEAD"]).unwrap();
+        let detached = snapshot(&repository);
+        assert!(detached.branch.is_none());
+        let stale_attached = request(
+            &attached,
+            HistoryMutationKind::ResetSoft,
+            attached.head.clone().unwrap(),
+        );
+        assert!(mutate_history(stale_attached)
+            .unwrap_err()
+            .contains("branch changed"));
+        let result = mutate_history(request(
+            &detached,
+            HistoryMutationKind::ResetSoft,
+            detached.head.clone().unwrap(),
+        ))
+        .unwrap();
+        assert!(result.snapshot.branch.is_none());
+        assert_eq!(result.snapshot.head, detached.head);
     }
 }

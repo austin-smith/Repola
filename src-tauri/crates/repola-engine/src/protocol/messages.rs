@@ -8,18 +8,19 @@ use crate::worktree::{
     CreateWorktreeResult, DeleteRecoveryPointsRequest, DiffDisplayOptions, DiscardPlan,
     DiscardPlanRequest, DiscardRequest, DiscardResult, FileDiff, FileDiffRequest,
     GenerateCommitMessageRequest, GeneratedCommitMessage, HistoryMutationRequest,
-    HistoryMutationResult, HistoryPage, HistoryRequest, PullRequestEvidence,
-    PullRequestMutationRequest, PullRequestMutationResult, RecoveryFileDiff,
+    HistoryMutationResult, HistoryPage, HistoryRequest, MeasureWorktreeRequest,
+    PullRequestEvidence, PullRequestMutationRequest, PullRequestMutationResult, RecoveryFileDiff,
     RecoveryFileDiffRequest, RecoveryPointList, RecoveryPointRequest, RecoveryRestorePlan,
-    RecoveryRestoreRequest, RecoveryRestoreResult, ReflogEntry, ReflogRequest,
-    RepositoryOperationMutationResult, RepositoryOperationRequest, RepositoryOperationResult,
-    ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry,
-    StashMutationRequest, StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo,
-    TagMutationRequest, TagMutationResult, TagRequest, TextGenerationStatus, UndoCommitRequest,
-    UndoCommitResult, WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges,
+    RecoveryRestoreRequest, RecoveryRestoreResult, ReflogEntry, ReflogRequest, RefreshRequest,
+    RefreshResult, RepositoryOperationMutationResult, RepositoryOperationRequest,
+    RepositoryOperationResult, ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult,
+    SetFileStagingRequest, StashEntry, StashMutationRequest, StashMutationResult, StashRequest,
+    SyncRequest, SyncResult, TagInfo, TagMutationRequest, TagMutationResult, TagRequest,
+    TextGenerationStatus, UndoCommitRequest, UndoCommitResult, WorkingCopyRequest,
+    WorkingCopySnapshot, WorktreeChanges, WorktreeMeasurement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 21;
+pub const PROTOCOL_VERSION: u16 = 22;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,6 +54,12 @@ pub enum AgentRequest {
     },
     ScanWorktrees {
         request: ScanRequest,
+    },
+    RefreshWorktrees {
+        request: RefreshRequest,
+    },
+    MeasureWorktree {
+        request: MeasureWorktreeRequest,
     },
     ResolveRepository {
         path: String,
@@ -225,6 +232,12 @@ pub enum AgentResult {
     ScanWorktrees {
         result: ScanResult,
     },
+    RefreshWorktrees {
+        result: Box<RefreshResult>,
+    },
+    WorktreeMeasurement {
+        measurement: WorktreeMeasurement,
+    },
     RepositoryResolved {
         repository_path: String,
     },
@@ -350,6 +363,8 @@ pub struct AgentInfo {
 pub enum AgentCapability {
     RepositoryDiscovery,
     WorktreeInventory,
+    WorkspaceRefresh,
+    WorktreeMeasurement,
     WorkingCopy,
     History,
     Synchronization,
@@ -455,7 +470,7 @@ mod tests {
         let json = serde_json::to_string(&request).expect("serialize request");
         assert_eq!(
             json,
-            r#"{"protocolVersion":21,"requestId":"golden-1","request":{"type":"handshake","clientVersion":"0.1.0","minimumProtocolVersion":21,"maximumProtocolVersion":21}}"#
+            r#"{"protocolVersion":22,"requestId":"golden-1","request":{"type":"handshake","clientVersion":"0.1.0","minimumProtocolVersion":22,"maximumProtocolVersion":22}}"#
         );
 
         let with_future_field = json.replace(
@@ -540,7 +555,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&file).expect("serialize discard"),
             format!(
-                r#"{{"protocolVersion":21,"requestId":"golden-2","request":{{"type":"discard","request":{{"repositoryPath":"/repo","worktreePath":"/repo","target":{{"kind":"file","path":{{"display":"a.txt","token":"612e747874"}},"scope":"unstaged"}},"fingerprint":"{}"}}}}}}"#,
+                r#"{{"protocolVersion":22,"requestId":"golden-2","request":{{"type":"discard","request":{{"repositoryPath":"/repo","worktreePath":"/repo","target":{{"kind":"file","path":{{"display":"a.txt","token":"612e747874"}},"scope":"unstaged"}},"fingerprint":"{}"}}}}}}"#,
                 "f".repeat(64)
             )
         );
