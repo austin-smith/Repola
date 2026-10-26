@@ -77,7 +77,7 @@ describe("updater coordinator", () => {
 
   it("closes a cross-channel offer before it can become installable", async () => {
     vi.stubEnv("VITE_REPOLA_RELEASE_CHANNEL", "stable");
-    const update = { version: "0.2.0-nightly.123", close: vi.fn(async () => undefined) };
+    const update = { version: "0.2.0-nightly.20260930.123", close: vi.fn(async () => undefined) };
     mocks.check.mockResolvedValue(update);
     const updater = await import("./updater");
     await updater.checkForUpdates();

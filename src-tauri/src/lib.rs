@@ -26,15 +26,17 @@ use worktree::{
     BranchMutationResult, BranchRequest, CloneRepositoryRequest, CommitChangedFile,
     CommitFileDiffRequest, CommitFilesRequest, CommitRequest, CommitResult, ConflictFile,
     ConflictFileRequest, CreateRepositoryRequest, CreateWorktreeRequest, CreateWorktreeResult,
-    DiscardAllRequest, DiscardFileRequest, FileDiff, FileDiffRequest, GenerateCommitMessageRequest,
-    GeneratedCommitMessage, HistoryMutationRequest, HistoryMutationResult, HistoryPage,
-    HistoryRequest, PullRequestEvidence, PullRequestMutationRequest, PullRequestMutationResult,
-    ReflogEntry, ReflogRequest, RepositoryOperationMutationResult, RepositoryOperationRequest,
-    RepositoryOperationResult, ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult,
-    SetFileStagingRequest, StashEntry, StashMutationRequest, StashMutationResult, StashRequest,
-    SyncRequest, SyncResult, TagInfo, TagMutationRequest, TagMutationResult, TagRequest,
-    TextGenerationStatus, UndoCommitRequest, UndoCommitResult, WorkingCopyRequest,
-    WorkingCopySnapshot, WorktreeChanges, WorktreeWatcher,
+    DeleteRecoveryPointsRequest, DiscardPlan, DiscardPlanRequest, DiscardRequest, DiscardResult,
+    FileDiff, FileDiffRequest, GenerateCommitMessageRequest, GeneratedCommitMessage,
+    HistoryMutationRequest, HistoryMutationResult, HistoryPage, HistoryRequest,
+    PullRequestEvidence, PullRequestMutationRequest, PullRequestMutationResult, RecoveryFileDiff,
+    RecoveryFileDiffRequest, RecoveryPointList, RecoveryPointRequest, RecoveryRestorePlan,
+    RecoveryRestoreRequest, RecoveryRestoreResult, ReflogEntry, ReflogRequest,
+    RepositoryOperationMutationResult, RepositoryOperationRequest, RepositoryOperationResult,
+    ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry,
+    StashMutationRequest, StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo,
+    TagMutationRequest, TagMutationResult, TagRequest, TextGenerationStatus, UndoCommitRequest,
+    UndoCommitResult, WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges, WorktreeWatcher,
 };
 
 const WORKTREE_CHANGED_EVENT: &str = "repola://worktree-changed";
@@ -561,13 +563,13 @@ async fn load_conflict_file(
 }
 
 #[tauri::command]
-async fn discard_file(
+async fn plan_discard(
     app: tauri::AppHandle,
     operations: tauri::State<'_, OperationRegistry>,
     machine_id: String,
     operation_id: String,
-    request: DiscardFileRequest,
-) -> Result<WorkingCopySnapshot, String> {
+    request: DiscardPlanRequest,
+) -> Result<DiscardPlan, String> {
     let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
     let token = operations.begin(&operation_id)?;
     let request_id = operation_id.clone();
@@ -575,10 +577,37 @@ async fn discard_file(
         match execute_on_machine(
             &machine,
             request_id,
-            AgentRequest::DiscardFile { request },
+            AgentRequest::PlanDiscard { request },
             token,
         )? {
-            AgentResult::WorkingCopyUpdated { snapshot } => Ok(snapshot),
+            AgentResult::DiscardPlan { plan } => Ok(plan),
+            _ => Err("The Repola agent returned an unexpected response.".to_string()),
+        }
+    })
+    .await;
+    operations.finish(&operation_id);
+    result.map_err(|error| format!("Discard planning task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn discard_changes(
+    app: tauri::AppHandle,
+    operations: tauri::State<'_, OperationRegistry>,
+    machine_id: String,
+    operation_id: String,
+    request: DiscardRequest,
+) -> Result<DiscardResult, String> {
+    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+    let token = operations.begin(&operation_id)?;
+    let request_id = operation_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        match execute_on_machine(
+            &machine,
+            request_id,
+            AgentRequest::Discard { request },
+            token,
+        )? {
+            AgentResult::Discarded { result } => Ok(*result),
             _ => Err("The Repola agent returned an unexpected response.".to_string()),
         }
     })
@@ -588,13 +617,13 @@ async fn discard_file(
 }
 
 #[tauri::command]
-async fn discard_all(
+async fn load_recovery_points(
     app: tauri::AppHandle,
     operations: tauri::State<'_, OperationRegistry>,
     machine_id: String,
     operation_id: String,
-    request: DiscardAllRequest,
-) -> Result<WorkingCopySnapshot, String> {
+    request: WorkingCopyRequest,
+) -> Result<RecoveryPointList, String> {
     let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
     let token = operations.begin(&operation_id)?;
     let request_id = operation_id.clone();
@@ -602,16 +631,124 @@ async fn discard_all(
         match execute_on_machine(
             &machine,
             request_id,
-            AgentRequest::DiscardAll { request },
+            AgentRequest::RecoveryPoints { request },
             token,
         )? {
-            AgentResult::WorkingCopyUpdated { snapshot } => Ok(snapshot),
+            AgentResult::RecoveryPoints { list } => Ok(list),
             _ => Err("The Repola agent returned an unexpected response.".to_string()),
         }
     })
     .await;
     operations.finish(&operation_id);
-    result.map_err(|error| format!("Discard-all task failed: {error}"))?
+    result.map_err(|error| format!("Recovery-point loading task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn plan_recovery_restore(
+    app: tauri::AppHandle,
+    operations: tauri::State<'_, OperationRegistry>,
+    machine_id: String,
+    operation_id: String,
+    request: RecoveryPointRequest,
+) -> Result<RecoveryRestorePlan, String> {
+    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+    let token = operations.begin(&operation_id)?;
+    let request_id = operation_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        match execute_on_machine(
+            &machine,
+            request_id,
+            AgentRequest::PlanRecoveryRestore { request },
+            token,
+        )? {
+            AgentResult::RecoveryRestorePlan { plan } => Ok(plan),
+            _ => Err("The Repola agent returned an unexpected response.".to_string()),
+        }
+    })
+    .await;
+    operations.finish(&operation_id);
+    result.map_err(|error| format!("Restore planning task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn restore_recovery_point(
+    app: tauri::AppHandle,
+    operations: tauri::State<'_, OperationRegistry>,
+    machine_id: String,
+    operation_id: String,
+    request: RecoveryRestoreRequest,
+) -> Result<RecoveryRestoreResult, String> {
+    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+    let token = operations.begin(&operation_id)?;
+    let request_id = operation_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        match execute_on_machine(
+            &machine,
+            request_id,
+            AgentRequest::RestoreRecoveryPoint { request },
+            token,
+        )? {
+            AgentResult::RecoveryRestored { result } => Ok(*result),
+            _ => Err("The Repola agent returned an unexpected response.".to_string()),
+        }
+    })
+    .await;
+    operations.finish(&operation_id);
+    result.map_err(|error| format!("Restore task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn load_recovery_file_diff(
+    app: tauri::AppHandle,
+    operations: tauri::State<'_, OperationRegistry>,
+    machine_id: String,
+    operation_id: String,
+    request: RecoveryFileDiffRequest,
+) -> Result<RecoveryFileDiff, String> {
+    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+    let token = operations.begin(&operation_id)?;
+    let request_id = operation_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        match execute_on_machine(
+            &machine,
+            request_id,
+            AgentRequest::RecoveryFileDiff { request },
+            token,
+        )? {
+            AgentResult::RecoveryFileDiff { diff } => Ok(diff),
+            _ => Err("The Repola agent returned an unexpected response.".to_string()),
+        }
+    })
+    .await;
+    operations.finish(&operation_id);
+    result.map_err(|error| format!("Recovery preview task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn delete_recovery_points(
+    app: tauri::AppHandle,
+    operations: tauri::State<'_, OperationRegistry>,
+    machine_id: String,
+    operation_id: String,
+    request: DeleteRecoveryPointsRequest,
+) -> Result<(), String> {
+    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+    let token = operations.begin(&operation_id)?;
+    let request_id = operation_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        match execute_on_machine(
+            &machine,
+            request_id,
+            AgentRequest::DeleteRecoveryPoints { request },
+            token,
+        )? {
+            AgentResult::RecoveryPointsDeleted => Ok(()),
+            _ => Err("The Repola agent returned an unexpected response.".to_string()),
+        }
+    })
+    .await;
+    operations.finish(&operation_id);
+    result.map_err(|error| format!("Recovery-point deletion task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1322,6 +1459,7 @@ impl BranchDeletionFailure {
             HostError::AgentUnavailable { .. }
             | HostError::AgentVersionMismatch { .. }
             | HostError::Timeout { .. }
+            | HostError::Unconfirmed { .. }
             | HostError::Cancelled(_)
             | HostError::Transport(_)
             | HostError::Protocol(_) => Self::unknown(error),
@@ -1699,8 +1837,8 @@ pub fn run() {
             commit_file_diff,
             create_repository,
             create_worktree,
-            discard_all,
-            discard_file,
+            delete_recovery_points,
+            discard_changes,
             execute_branch_deletion,
             execute_worktree_action,
             file_diff,
@@ -1717,6 +1855,8 @@ pub fn run() {
             load_branches,
             load_conflict_file,
             load_registered_repositories,
+            load_recovery_file_diff,
+            load_recovery_points,
             load_stashes,
             load_tags,
             load_workspace_context,
@@ -1728,12 +1868,15 @@ pub fn run() {
             mutate_branch,
             mutate_stash,
             mutate_tag,
+            plan_discard,
+            plan_recovery_restore,
             prepare_branch_deletion,
             prepare_worktree_action,
             remove_machine,
             register_repository,
             resolve_conflict,
             resolve_dropped_repository,
+            restore_recovery_point,
             save_app_preferences,
             save_workspace_context,
             save_window_state,

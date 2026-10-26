@@ -21,5 +21,7 @@ export const BulkActionDialog = lazy(() =>
   import("../dialogs/BulkActionDialog").then((module) => ({ default: module.BulkActionDialog })),
 );
 export const ReflogDialog = lazy(() => import("../dialogs/ReflogDialog"));
+export const DiscardDialog = lazy(() => import("../dialogs/DiscardDialog"));
+export const DiscardedChangesDialog = lazy(() => import("../dialogs/DiscardedChangesDialog"));
 export const ConflictResolutionDialog = lazy(() => import("../dialogs/ConflictResolutionDialog"));
 export const PullRequestDialog = lazy(() => import("../dialogs/PullRequestDialog"));

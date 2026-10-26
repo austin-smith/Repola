@@ -11,9 +11,14 @@ export const targets = [
 ];
 
 export function parseVersion(version) {
-  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-nightly\.([1-9]\d*))?$/.exec(version);
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-nightly\.([1-9]\d{7})\.([1-9]\d*))?$/.exec(version);
   if (!match || match[0] !== version) throw new Error(`Unsupported release version: ${version}.`);
-  return { core: match.slice(1, 4).map(BigInt), nightly: match[4] ? BigInt(match[4]) : null };
+  if (match[4]) {
+    const date = `${match[4].slice(0, 4)}-${match[4].slice(4, 6)}-${match[4].slice(6, 8)}`;
+    const timestamp = Date.parse(`${date}T00:00:00Z`);
+    if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString().slice(0, 10) !== date) throw new Error(`Invalid nightly date: ${match[4]}.`);
+  }
+  return { core: match.slice(1, 4).map(BigInt), nightly: match[4] ? [BigInt(match[4]), BigInt(match[5])] : null };
 }
 
 export function compareVersions(left, right) {
@@ -22,10 +27,13 @@ export function compareVersions(left, right) {
   for (let index = 0; index < 3; index++) {
     if (a.core[index] !== b.core[index]) return a.core[index] > b.core[index] ? 1 : -1;
   }
-  if (a.nightly === b.nightly) return 0;
+  if (a.nightly === null && b.nightly === null) return 0;
   if (a.nightly === null) return 1;
   if (b.nightly === null) return -1;
-  return a.nightly > b.nightly ? 1 : -1;
+  for (let index = 0; index < 2; index++) {
+    if (a.nightly[index] !== b.nightly[index]) return a.nightly[index] > b.nightly[index] ? 1 : -1;
+  }
+  return 0;
 }
 
 export function validateRelease(release) {
@@ -79,10 +87,11 @@ export function githubClient(token = process.env.GH_TOKEN, fetcher = fetch) {
     if (binary) return Buffer.from(await response.arrayBuffer());
     return response.status === 204 ? null : response.json();
   };
-  const list = async (path) => {
+  const list = async (path, { key } = {}) => {
     const entries = [];
     for (let page = 1; ; page++) {
-      const batch = await request(`${path}${path.includes("?") ? "&" : "?"}per_page=100&page=${page}`);
+      const response = await request(`${path}${path.includes("?") ? "&" : "?"}per_page=100&page=${page}`);
+      const batch = key ? response[key] : response;
       entries.push(...batch);
       if (batch.length < 100) return entries;
     }

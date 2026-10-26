@@ -13,7 +13,8 @@ export async function createDraft(client, directory) {
   if (!tagRef) await client.request("/git/refs", { method: "POST", body: { ref: `refs/tags/${release.tag}`, sha: release.sha } });
   const tagCommit = await client.request(`/commits/${release.tag}`);
   if (tagCommit.sha !== release.sha) throw new Error("Release tag points at a different commit; it will not be moved.");
-  let draft = await client.request(`/releases/tags/${release.tag}`, { missing: true });
+  const releases = await client.list("/releases");
+  let draft = releases.find((entry) => entry.tag_name === release.tag);
   if (draft && !draft.draft) throw new Error("Published release assets cannot be overwritten.");
   if (draft && draft.prerelease !== (release.channel === "nightly")) throw new Error("Existing draft has a different release channel.");
   if (draft) {
@@ -23,7 +24,7 @@ export async function createDraft(client, directory) {
       if (JSON.stringify(previous) !== JSON.stringify(release)) throw new Error("Existing draft belongs to a different build. Publish it or use a new version.");
     }
   } else {
-    const previous = publishedReleases(await client.list("/releases"), release.channel)[0];
+    const previous = publishedReleases(releases, release.channel)[0];
     const notes = await client.request("/releases/generate-notes", { method: "POST", body: { tag_name: release.tag, target_commitish: release.sha, ...(previous ? { previous_tag_name: previous.tag_name } : {}) } });
     draft = await client.request("/releases", { method: "POST", body: { tag_name: release.tag, target_commitish: release.sha, name: `Repola ${release.version}`, body: notes.body, draft: true, prerelease: release.channel === "nightly" } });
   }
@@ -39,7 +40,8 @@ export async function publishRelease(client, tag, channel, directory, feedDirect
   if (!tag || !["stable", "nightly"].includes(channel) || !directory || !feedDirectory) {
     throw new Error("Publication requires a tag, stable/nightly channel, artifact directory, and feed directory.");
   }
-  const githubRelease = await client.request(`/releases/tags/${encodeURIComponent(tag)}`);
+  const githubRelease = (await client.list("/releases")).find((entry) => entry.tag_name === tag);
+  if (!githubRelease) throw new Error(`Release ${tag} was not found.`);
   const release = await downloadRelease(client, githubRelease, directory);
   if (release.channel !== channel) throw new Error("Publication workflow channel does not match the release.");
   const source = await client.request(`/commits/${encodeURIComponent(tag)}`);
