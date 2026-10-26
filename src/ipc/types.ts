@@ -345,6 +345,108 @@ export interface ConflictFile {
 }
 export type DiscardScope = "unstaged" | "all";
 
+/** What a discard covers. Every discard is planned, then executed against the plan's fingerprint. */
+export type DiscardTarget =
+  | { kind: "file"; path: GitPath; scope: DiscardScope }
+  | { kind: "all" };
+
+export type DiscardEffect = "restoreCommitted" | "restoreStaged" | "remove" | "unstage" | "restoreCommittedStaged";
+
+/** One path a discard changes. A rename is two entries: its new name and its original one. */
+export interface DiscardPlanEntry {
+  path: GitPath;
+  effect: DiscardEffect;
+  /** A file is at the path now. */
+  onDisk: boolean;
+  /** The index has an entry for the path now. */
+  tracked: boolean;
+}
+
+export type KeptChangeReason = "submodule" | "nestedRepository" | "fileFolderConflict";
+
+/** A change a discard leaves alone because it cannot save everything discarding it would replace. */
+export interface KeptChange {
+  path: GitPath;
+  reason: KeptChangeReason;
+}
+
+export interface DiscardPlan {
+  target: DiscardTarget;
+  /** Paths the discard changes beyond `entries`, which lists as many as fit in one response. */
+  omitted: number;
+  /** Paths left alone beyond `kept`. */
+  keptOmitted: number;
+  entries: DiscardPlanEntry[];
+  kept: KeptChange[];
+  /** Working-tree bytes the recovery point adds to the repository's object store. */
+  backupBytes: number;
+  fingerprint: string;
+}
+
+export interface DiscardResult {
+  recoveryPoint: RecoveryPoint;
+}
+
+export type RecoveryPointKind = "discardFile" | "discardAll" | "restore";
+
+/** Content Repola saved under `refs/repola/discarded/` before discarding or overwriting it. */
+export interface RecoveryPoint {
+  /** The full reference name. */
+  id: string;
+  /** The tree the reference points at. */
+  oid: string;
+  kind: RecoveryPointKind;
+  summary: string;
+  /** RFC 3339 UTC timestamp. */
+  createdAt: string;
+  worktreePath: string;
+  head: string | null;
+  pathCount: number;
+  /** The first saved paths, for display; `pathCount` is authoritative. */
+  paths: GitPath[];
+  storedBytes: number;
+}
+
+/** The newest recovery points that fit in one response, and how many older ones were left out. */
+export interface RecoveryPointList {
+  points: RecoveryPoint[];
+  omitted: number;
+}
+
+export interface RecoveryPointReference {
+  id: string;
+  oid: string;
+}
+
+export type RestoreEffect = "unchanged" | "create" | "replace" | "remove" | "createFolder" | "folderPermissions";
+
+export interface RecoveryRestoreEntry {
+  path: GitPath;
+  worktree: RestoreEffect;
+  indexChanges: boolean;
+}
+
+export interface RecoveryRestorePlan {
+  point: RecoveryPoint;
+  /** As many entries as fit in one response. */
+  entries: RecoveryRestoreEntry[];
+  /** Saved paths the restore covers beyond `entries`. */
+  omitted: number;
+  fingerprint: string;
+}
+
+export interface RecoveryRestoreResult {
+  /** The recovery point holding what the restore replaced, when there was anything. */
+  replaced: RecoveryPoint | null;
+}
+
+/** The change restoring one saved path would make to the working tree. */
+export interface RecoveryFileDiff {
+  patch: string;
+  binary: boolean;
+  truncated: boolean;
+}
+
 export interface WorkingCopySnapshot {
   repositoryPath: string;
   worktreePath: string;

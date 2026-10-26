@@ -18,6 +18,12 @@ const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const STANDARD_TIMEOUT: Duration = Duration::from_secs(120);
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Planning a discard or restore hashes working-copy content of any size.
+const RECOVERY_PLAN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Discarding and restoring save and rewrite content of any size. Ending the
+/// session does not stop the agent, so running out of time is reported as
+/// unconfirmed rather than failed.
+const RECOVERY_CHANGE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const EXIT_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 pub(super) fn execute<F>(
@@ -185,7 +191,9 @@ where
     if exchange.answered
         || matches!(
             exchange.result,
-            Err(HostError::Timeout { .. } | HostError::Cancelled(_))
+            Err(HostError::Timeout { .. }
+                | HostError::Unconfirmed { .. }
+                | HostError::Cancelled(_))
         )
     {
         return exchange;
@@ -279,14 +287,20 @@ where
         if token.is_cancelled() {
             break unanswered(Err(HostError::Cancelled(machine.name.clone())), delivered);
         }
-        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
-            break unanswered(
-                Err(HostError::Timeout {
+        let limit = phase_timeout(timeout, pending_input.is_some());
+        let Some(remaining) = limit.checked_sub(started.elapsed()) else {
+            let error = if delivered && changes_working_copy(&request.request) {
+                HostError::Unconfirmed {
                     machine: machine.name.clone(),
-                    seconds: timeout.as_secs(),
-                }),
-                delivered,
-            );
+                    minutes: limit.as_secs() / 60,
+                }
+            } else {
+                HostError::Timeout {
+                    machine: machine.name.clone(),
+                    seconds: limit.as_secs(),
+                }
+            };
+            break unanswered(Err(error), delivered);
         };
         let response = match responses.recv_timeout(remaining.min(Duration::from_millis(100))) {
             Ok(Ok(Some(response))) => response,
@@ -466,8 +480,13 @@ fn validate_handshake(
         | AgentRequest::SetFileStaging { .. }
         | AgentRequest::ResolveConflict { .. }
         | AgentRequest::ConflictFile { .. }
-        | AgentRequest::DiscardFile { .. }
-        | AgentRequest::DiscardAll { .. }
+        | AgentRequest::PlanDiscard { .. }
+        | AgentRequest::Discard { .. }
+        | AgentRequest::RecoveryPoints { .. }
+        | AgentRequest::PlanRecoveryRestore { .. }
+        | AgentRequest::RestoreRecoveryPoint { .. }
+        | AgentRequest::RecoveryFileDiff { .. }
+        | AgentRequest::DeleteRecoveryPoints { .. }
         | AgentRequest::ApplyPatchHunk { .. }
         | AgentRequest::MutateRepositoryOperation { .. }
         | AgentRequest::Commit { .. }
@@ -507,8 +526,35 @@ fn validate_handshake(
     Ok(())
 }
 
+/// How long the exchange may run so far: an agent that has not answered the
+/// handshake gets the handshake's time whatever the request is.
+fn phase_timeout(timeout: Duration, awaiting_handshake: bool) -> Duration {
+    if awaiting_handshake {
+        timeout.min(HANDSHAKE_TIMEOUT)
+    } else {
+        timeout
+    }
+}
+
+/// Requests that change files or recovery points, which the agent finishes
+/// even after Repola stops waiting.
+fn changes_working_copy(request: &AgentRequest) -> bool {
+    matches!(
+        request,
+        AgentRequest::Discard { .. }
+            | AgentRequest::RestoreRecoveryPoint { .. }
+            | AgentRequest::DeleteRecoveryPoints { .. }
+    )
+}
+
 fn operation_timeout(request: &AgentRequest) -> Duration {
     match request {
+        AgentRequest::Discard { .. } | AgentRequest::RestoreRecoveryPoint { .. } => {
+            RECOVERY_CHANGE_TIMEOUT
+        }
+        AgentRequest::PlanDiscard { .. } | AgentRequest::PlanRecoveryRestore { .. } => {
+            RECOVERY_PLAN_TIMEOUT
+        }
         AgentRequest::Handshake { .. } => HANDSHAKE_TIMEOUT,
         AgentRequest::ScanWorktrees { .. } => SCAN_TIMEOUT,
         AgentRequest::GenerateCommitMessage { request } => {
@@ -535,8 +581,9 @@ fn operation_timeout(request: &AgentRequest) -> Duration {
         | AgentRequest::SetFileStaging { .. }
         | AgentRequest::ResolveConflict { .. }
         | AgentRequest::ConflictFile { .. }
-        | AgentRequest::DiscardFile { .. }
-        | AgentRequest::DiscardAll { .. }
+        | AgentRequest::RecoveryPoints { .. }
+        | AgentRequest::RecoveryFileDiff { .. }
+        | AgentRequest::DeleteRecoveryPoints { .. }
         | AgentRequest::ApplyPatchHunk { .. }
         | AgentRequest::MutateRepositoryOperation { .. }
         | AgentRequest::Commit { .. }
@@ -610,6 +657,12 @@ pub(super) fn arguments_for_command(
         OsString::from("ClearAllForwardings=yes"),
         OsString::from("-o"),
         OsString::from("ConnectTimeout=15"),
+        // A connection that stops answering is noticed within a minute, even
+        // for requests that wait hours.
+        OsString::from("-o"),
+        OsString::from("ServerAliveInterval=15"),
+        OsString::from("-o"),
+        OsString::from("ServerAliveCountMax=4"),
     ];
     if let Some(port) = ssh.port {
         arguments.push(OsString::from("-p"));
@@ -713,6 +766,10 @@ mod tests {
                 "ClearAllForwardings=yes",
                 "-o",
                 "ConnectTimeout=15",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=4",
                 "-p",
                 "2222",
                 "-l",
@@ -740,6 +797,51 @@ mod tests {
         let input = vec![b'x'; MAX_DIAGNOSTIC_BYTES + 10_000];
         let result = bounded_diagnostics(input.as_slice());
         assert_eq!(result.len(), MAX_DIAGNOSTIC_BYTES);
+    }
+
+    #[test]
+    fn changes_wait_long_but_never_on_an_unanswered_handshake() {
+        use crate::worktree::{
+            DeleteRecoveryPointsRequest, DiscardRequest, DiscardTarget, RecoveryPointReference,
+            RecoveryRestoreRequest,
+        };
+        let point = RecoveryPointReference {
+            id: "refs/repola/discarded/x".into(),
+            oid: "0".repeat(40),
+        };
+        let discard = AgentRequest::Discard {
+            request: DiscardRequest {
+                repository_path: "repo".into(),
+                worktree_path: "repo".into(),
+                target: DiscardTarget::All,
+                fingerprint: String::new(),
+            },
+        };
+        let restore = AgentRequest::RestoreRecoveryPoint {
+            request: RecoveryRestoreRequest {
+                repository_path: "repo".into(),
+                worktree_path: "repo".into(),
+                point: point.clone(),
+                fingerprint: String::new(),
+            },
+        };
+        let delete = AgentRequest::DeleteRecoveryPoints {
+            request: DeleteRecoveryPointsRequest {
+                repository_path: "repo".into(),
+                worktree_path: "repo".into(),
+                points: vec![point],
+            },
+        };
+        for request in [&discard, &restore, &delete] {
+            assert_eq!(
+                phase_timeout(operation_timeout(request), true),
+                HANDSHAKE_TIMEOUT
+            );
+            assert!(changes_working_copy(request));
+        }
+        assert_eq!(operation_timeout(&discard), RECOVERY_CHANGE_TIMEOUT);
+        assert_eq!(operation_timeout(&restore), RECOVERY_CHANGE_TIMEOUT);
+        assert_eq!(operation_timeout(&delete), STANDARD_TIMEOUT);
     }
 
     #[test]

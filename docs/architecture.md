@@ -55,6 +55,10 @@ The desktop process owns application settings, machine profiles, operation coord
 - Standard worktree removal never adds `--force`; branch deletion is an independent follow-up action.
 - A command allowlist is implemented as typed operations. There is no generic remote shell endpoint.
 
+## Recovery points
+
+Every discard, and every restore that overwrites content, first saves what it changes as a recovery point: a Git tree named by `refs/repola/discarded/<id>` in the repository's common Git directory, so recovery works the same over SSH and never depends on a desktop trash. Recovery points stay until the user deletes them and never appear as branches, tags, or history, but `git push --mirror` (or any refspec matching `refs/repola/*`) would publish them to a remote.
+
 ## Persistence and migration
 
 Settings use typed, defensively decoded keys with explicit legacy migrations. Machine profiles contain SSH configuration references (host alias, optional user/port), never key material or passphrases. The local store persists machine-scoped roots and the last machine/repository/worktree/view position; Git and the remote filesystem remain authoritative.
