@@ -1,36 +1,20 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BulkActionDialog, type BulkItem, type BulkStage } from "./BulkActionDialog";
-import type { ActionPlan } from "../ipc/types";
+import type { BranchDeletionResult, BranchDeletionStep } from "../ipc/types";
 
-// BulkActionDialog is presentational: preflight (prepareWorktreeAction per
-// item) and sequential execution live in App.tsx's reviewBulkRemoval /
-// executeBulk, which feed `items` and `stage` back into this dialog. These
+// BulkActionDialog is presentational: preflight (one review per item) and
+// sequential execution live in App.tsx's reviewBulkRemoval,
+// reviewBulkBranchDeletion, and executeBulk, which feed `items` and `stage` back into this dialog. These
 // tests pin down the contract the dialog exposes for that flow.
-
-function plan(worktreePath: string, warnings: string[] = []): ActionPlan {
-  return {
-    kind: "remove",
-    title: "Remove Worktree",
-    summary: "Git will remove the linked directory and retain its branch.",
-    repositoryPath: "/tmp/repository",
-    worktreePath,
-    branch: null,
-    expectedHead: "1234567890abcdef",
-    commandDisplay: `git worktree remove -- ${worktreePath}`,
-    affectedPaths: [worktreePath],
-    warnings,
-    confirmationText: "REMOVE",
-    destructive: true,
-  };
-}
 
 const ready = (key: string, warnings?: string[]): BulkItem => ({
   key,
   title: key,
   subtitle: `/tmp/${key}`,
   sizeLabel: "12 MiB",
-  plan: plan(`/tmp/${key}`, warnings),
+  command: `git worktree remove -- /tmp/${key}`,
+  warnings: warnings ?? [],
   error: null,
   done: false,
 });
@@ -39,7 +23,8 @@ const blocked = (key: string, error: string): BulkItem => ({
   key,
   title: key,
   subtitle: `/tmp/${key}`,
-  plan: null,
+  command: null,
+  warnings: [],
   error,
   done: false,
 });
@@ -142,7 +127,7 @@ describe("BulkActionDialog", () => {
       { ...ready("beta"), error: "fatal: worktree is locked" },
       { ...ready("gamma"), done: true },
     ];
-    const { onCancel, onFollowUp } = renderDialog("done", items, "Delete 2 integrated branches");
+    const { onCancel, onFollowUp } = renderDialog("done", items, "Review 2 branch deletions…");
 
     expect(screen.getByText("2 completed · 1 not completed")).toBeInTheDocument();
     expect(screen.queryByLabelText("Type REMOVE to confirm")).not.toBeInTheDocument();
@@ -151,10 +136,85 @@ describe("BulkActionDialog", () => {
     expect(within(rows[1]).getByText("Failed")).toBeInTheDocument();
     expect(within(rows[1]).getByText("fatal: worktree is locked")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Delete 2 integrated branches" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review 2 branch deletions…" }));
     expect(onFollowUp).toHaveBeenCalledOnce();
     // The dialog also renders an icon-only "Close" (X); target the footer button by its visible text.
     fireEvent.click(screen.getAllByRole("button", { name: "Close" }).find((button) => button.textContent === "Close")!);
     expect(onCancel).toHaveBeenCalledOnce();
+  });
+
+  it("marks an interrupted item as unconfirmed rather than failed", () => {
+    const items = [
+      { ...ready("alpha"), done: true },
+      { ...ready("beta"), error: "The SSH connection closed. The deletion may have completed anyway.", unconfirmed: true },
+    ];
+    renderDialog("done", items);
+
+    expect(screen.getByText("1 completed · 0 not completed · 1 unconfirmed")).toBeInTheDocument();
+    const rows = screen.getAllByRole("listitem");
+    expect(within(rows[1]).getByText("Unconfirmed")).toBeInTheDocument();
+    expect(within(rows[1]).queryByText("Failed")).not.toBeInTheDocument();
+    expect(within(rows[1]).getByText(/may have completed anyway/)).toBeInTheDocument();
+  });
+
+  it("reports what each finished branch deletion left to do and how to restore it", () => {
+    const step = (warning: string | null, finishCommands: string[]): BranchDeletionStep => ({
+      target: "feature",
+      deletedOid: "a".repeat(40),
+      succeeded: true,
+      unconfirmed: false,
+      output: "",
+      warning,
+      finishCommands,
+      recoveryCommands: ["git branch -- feature aaaa"],
+    });
+    const deletion = (local: BranchDeletionStep): BranchDeletionResult => ({
+      message: "Deleted local branch feature.",
+      local,
+      remote: null,
+      auditPath: null,
+      auditWarning: null,
+    });
+    const items = [
+      { ...ready("alpha"), done: true, deletion: deletion(step(null, [])) },
+      {
+        ...ready("beta"),
+        done: true,
+        deletion: deletion(step("feature was deleted, but its configuration was not removed.", ["git config --local --remove-section branch.feature"])),
+      },
+    ];
+    renderDialog("done", items);
+
+    const rows = screen.getAllByRole("listitem");
+    expect(within(rows[0]).getByText("Done")).toBeInTheDocument();
+    expect(within(rows[0]).getByText("To restore: git branch -- feature aaaa")).toBeInTheDocument();
+    expect(within(rows[1]).getByText("Done with warnings")).toBeInTheDocument();
+    expect(within(rows[1]).getByText(/To finish: git config --local --remove-section branch\.feature/)).toBeInTheDocument();
+    expect(within(rows[1]).getByText(/To restore: git branch -- feature aaaa/)).toBeInTheDocument();
+  });
+
+  it("marks a branch deletion interrupted after it started as unconfirmed, with how to restore it", () => {
+    const deletion: BranchDeletionResult = {
+      message: "Repola could not confirm whether local branch feature was deleted.",
+      local: {
+        target: "feature",
+        deletedOid: "a".repeat(40),
+        succeeded: false,
+        unconfirmed: true,
+        output: "git was cancelled. The deletion had started, so feature may have been deleted, and its configuration was kept.",
+        warning: null,
+        finishCommands: [],
+        recoveryCommands: ["git branch -- feature aaaa"],
+      },
+      remote: null,
+      auditPath: null,
+      auditWarning: null,
+    };
+    renderDialog("done", [{ ...ready("alpha"), deletion, unconfirmed: true, error: deletion.message }]);
+
+    expect(screen.getByText("0 completed · 0 not completed · 1 unconfirmed")).toBeInTheDocument();
+    const row = screen.getAllByRole("listitem")[0];
+    expect(within(row).getByText("Unconfirmed")).toBeInTheDocument();
+    expect(within(row).getByText(/To restore: git branch -- feature aaaa/)).toBeInTheDocument();
   });
 });
