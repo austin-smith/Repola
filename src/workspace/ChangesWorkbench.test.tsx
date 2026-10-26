@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChangesWorkbench } from "./ChangesWorkbench";
 import type { FileDiff, GeneratedCommitMessage, WorkingCopySnapshot } from "../ipc/types";
-import { changeDiffKey } from "../domain/diff-cache";
+import { changeDiffKey, exactDiffDisplay } from "../domain/diff-cache";
 
 const ipc = vi.hoisted(() => ({
   fetchWorkingCopy: vi.fn(), generateCommitMessage: vi.fn(), synchronizeWorkingCopy: vi.fn(),
@@ -11,7 +11,10 @@ const ipc = vi.hoisted(() => ({
 }));
 vi.mock("../ipc/worktrees", () => ipc);
 vi.mock("../ipc/app-preferences", () => ({
-  loadAppPreferences: async () => ({ defaultSignCommits: false, editorId: null }),
+  loadAppPreferences: async () => ({
+    defaultSignCommits: false, editorId: null,
+    diff: { hideWhitespaceInChanges: false, hideWhitespaceInHistory: false },
+  }),
   loadExternalTools: async () => ({ editors: [], terminals: [] }),
 }));
 vi.mock("../app/environment", () => ({ usePathSeparator: () => "/" }));
@@ -137,7 +140,7 @@ describe("commit-message generation", () => {
     await screen.findByRole("button", { name: "Generate commit message" });
     await screen.findByRole("checkbox", { name: "Select diff line" });
     const original = ipc.observeCache.mock.calls[ipc.observeCache.mock.calls.length - 1][0] as Map<string, FileDiff>;
-    original.set(changeDiffKey(snapshot.changes[0], 0), {} as FileDiff);
+    original.set(changeDiffKey(snapshot.changes[0], 0, exactDiffDisplay), {} as FileDiff);
     context.workingCopySnapshot = { ...snapshot, changes: [...snapshot.changes, { ...attribute, worktreeStamp: "attributes-after" }] };
     await act(async () => refreshWorkbench());
     const updated = ipc.observeCache.mock.calls[ipc.observeCache.mock.calls.length - 1][0] as Map<string, FileDiff>;

@@ -89,33 +89,53 @@ function ScrollHost({ children }: { children: (scrollElement: HTMLDivElement | n
   );
 }
 
-function renderDiff(selection: FileCommitSelection, overrides: Partial<FileChange> = {}, cache = new Map<string, FileDiff>(), diffKey = "key-1", selectionDisabled = false) {
+function renderDiff(selection: FileCommitSelection, overrides: Partial<FileChange> = {}, cache = new Map<string, FileDiff>(), diffKey = "key-1", selectionDisabled = false, hideWhitespace = false) {
   const onSelectionChange = vi.fn();
-  const tree = (diffCache: Map<string, FileDiff>, key: string, changeOverrides: Partial<FileChange>) => (
+  const onHideWhitespaceChange = vi.fn();
+  const tree = (diffCache: Map<string, FileDiff>, key: string, changeOverrides: Partial<FileChange>, hidden: boolean) => (
     <ThemeProvider storageKey="test-theme">
-      <ScrollHost>
-        {(scrollElement) => (
-          <InlineFileDiff
-            machineId="local"
-            repositoryPath="/tmp/repola"
-            worktreePath="/tmp/repola"
-            change={{ ...change, ...changeOverrides }}
-            diffKey={key}
-            cache={diffCache}
-            scrollElement={scrollElement}
-            selection={selection}
-            selectionDisabled={selectionDisabled}
-            onSelectionChange={onSelectionChange}
-          />
+      <ControlsHost>
+        {(controlsElement) => (
+          <ScrollHost>
+            {(scrollElement) => (
+              <InlineFileDiff
+                machineId="local"
+                repositoryPath="/tmp/repola"
+                worktreePath="/tmp/repola"
+                change={{ ...change, ...changeOverrides }}
+                diffKey={key}
+                cache={diffCache}
+                scrollElement={scrollElement}
+                selection={selection}
+                selectionDisabled={selectionDisabled}
+                onSelectionChange={onSelectionChange}
+                hideWhitespace={hidden}
+                onHideWhitespaceChange={onHideWhitespaceChange}
+                controlsElement={controlsElement}
+              />
+            )}
+          </ScrollHost>
         )}
-      </ScrollHost>
+      </ControlsHost>
     </ThemeProvider>
   );
-  const { rerender } = render(tree(cache, diffKey, overrides));
+  const { rerender } = render(tree(cache, diffKey, overrides, hideWhitespace));
   return {
     onSelectionChange,
-    rerenderWith: (next: Map<string, FileDiff>, key: string, changeOverrides: Partial<FileChange> = overrides) => rerender(tree(next, key, changeOverrides)),
+    onHideWhitespaceChange,
+    rerenderWith: (next: Map<string, FileDiff>, key: string, changeOverrides: Partial<FileChange> = overrides, hidden = hideWhitespace) => rerender(tree(next, key, changeOverrides, hidden)),
   };
+}
+
+/** Stands in for the owner's header, where the diff's controls render. */
+function ControlsHost({ children }: { children: (controlsElement: HTMLDivElement | null) => React.ReactNode }) {
+  const [controlsElement, setControlsElement] = useState<HTMLDivElement | null>(null);
+  return (
+    <>
+      <div ref={setControlsElement} data-testid="diff-controls" />
+      {children(controlsElement)}
+    </>
+  );
 }
 
 const hunkCheckboxes = () => screen.getAllByRole("checkbox", { name: /hunk from commit/ });
@@ -143,7 +163,7 @@ describe("InlineFileDiff", () => {
     renderDiff(includeAllChanges);
     const groups = await screen.findAllByRole("group", { name: "Select changed lines" });
     expect(groups).toHaveLength(2);
-    expect(ipc.fetchFileDiff).toHaveBeenCalledExactlyOnceWith("local", "/tmp/repola", "/tmp/repola", change.path, expect.any(AbortSignal));
+    expect(ipc.fetchFileDiff).toHaveBeenCalledExactlyOnceWith("local", "/tmp/repola", "/tmp/repola", change.path, { ignoreWhitespace: false }, expect.any(AbortSignal));
     expect(hunkCheckboxes().map((box) => box.getAttribute("aria-checked"))).toEqual(["true", "true"]);
     expect(lineCheckboxes(groups[0]).map((box) => box.getAttribute("aria-label"))).toEqual([
       "Select deleted line 2",
@@ -319,5 +339,89 @@ describe("InlineFileDiff", () => {
     ipc.fetchFileDiff.mockRejectedValue(new Error("fatal: bad object"));
     renderDiff(includeAllChanges);
     expect(await screen.findByRole("alert")).toHaveTextContent("fatal: bad object");
+  });
+
+  describe("hidden whitespace", () => {
+    const filtered: FileDiff = { ...diff, hunks: [], stagedHunks: [], unstagedHunks: [] };
+
+    it("loads the filtered diff read-only and explains why lines cannot be selected", async () => {
+      ipc.fetchFileDiff.mockResolvedValue(filtered);
+      const { onSelectionChange } = renderDiff(includeAllChanges, {}, new Map(), "key-1", false, true);
+      expect(await screen.findByTestId("patch-diff")).toBeInTheDocument();
+      expect(ipc.fetchFileDiff).toHaveBeenCalledExactlyOnceWith("local", "/tmp/repola", "/tmp/repola", change.path, { ignoreWhitespace: true }, expect.any(AbortSignal));
+      expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+      expect(await screen.findByRole("status")).toHaveTextContent("a patch built from a whitespace-filtered diff can’t be applied safely");
+      expect(screen.queryByText(/still included/)).not.toBeInTheDocument();
+      expect(onSelectionChange).not.toHaveBeenCalled();
+    });
+
+    it("says a kept line selection is hidden but still included, and shows whitespace on request", async () => {
+      ipc.fetchFileDiff.mockResolvedValue(filtered);
+      const partial: FileCommitSelection = { kind: "partial", hunks: [{ expectedPatch: hunks[0].patch, selectedLineIndices: [1] }] };
+      const { onHideWhitespaceChange, onSelectionChange } = renderDiff(partial, {}, new Map(), "key-1", false, true);
+      expect(await screen.findByText("Some lines selected for the commit are hidden here, but they are still included.")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Show whitespace" }));
+      expect(onHideWhitespaceChange).toHaveBeenCalledExactlyOnceWith(false);
+      expect(screen.getByRole("button", { name: /^Diff options/ })).toHaveFocus();
+      expect(onSelectionChange).not.toHaveBeenCalled();
+    });
+
+    it("keeps the exact diff read-only while its filtered form loads", async () => {
+      const { rerenderWith } = renderDiff(includeAllChanges);
+      await screen.findAllByRole("group", { name: "Select changed lines" });
+      ipc.fetchFileDiff.mockReturnValue(new Promise(() => undefined));
+      rerenderWith(new Map([["key-1", diff]]), "key-1-hidden", {}, true);
+      expect(screen.queryByRole("group", { name: "Select changed lines" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+      expect(screen.getByTestId("patch-diff")).toBeInTheDocument();
+      expect(screen.getByText("Whitespace changes are hidden")).toBeInTheDocument();
+    });
+
+    it("explains a file whose only changes are whitespace", async () => {
+      ipc.fetchFileDiff.mockResolvedValue({ ...filtered, patch: "" });
+      const { onHideWhitespaceChange } = renderDiff(includeAllChanges, {}, new Map(), "key-1", false, true);
+      expect(await screen.findByText("Only whitespace changes found")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Show whitespace" }));
+      expect(onHideWhitespaceChange).toHaveBeenCalledExactlyOnceWith(false);
+    });
+
+    it("offers the whitespace choice for text diffs only, and never traps a truncated diff", async () => {
+      const { onHideWhitespaceChange } = renderDiff(includeAllChanges);
+      const trigger = await within(screen.getByTestId("diff-controls")).findByRole("button", { name: "Diff options" });
+      fireEvent.click(trigger);
+      fireEvent.click(await screen.findByRole("menuitemradio", { name: "Hide" }));
+      expect(onHideWhitespaceChange).toHaveBeenCalledExactlyOnceWith(true);
+      cleanup();
+
+      ipc.fetchFileDiff.mockResolvedValue({ ...diff, binary: true, hunks: [], unstagedHunks: [] });
+      renderDiff(includeAllChanges);
+      expect(await screen.findByText("Binary file changed")).toBeInTheDocument();
+      expect(screen.getByTestId("diff-controls")).toBeEmptyDOMElement();
+      cleanup();
+
+      ipc.fetchFileDiff.mockResolvedValue({ ...diff, truncated: true, hunks: [], unstagedHunks: [] });
+      renderDiff(includeAllChanges);
+      fireEvent.click(await screen.findByRole("button", { name: "Diff options" }));
+      const locked = await screen.findByRole("menuitemradio", { name: "Hide" });
+      expect(locked).toHaveAttribute("aria-disabled", "true");
+      expect(locked).toHaveAccessibleDescription(/too large and was truncated/);
+      cleanup();
+
+      ipc.fetchFileDiff.mockResolvedValue({ ...filtered, truncated: true });
+      const hidden = renderDiff(includeAllChanges, {}, new Map(), "key-1", false, true);
+      fireEvent.click(await screen.findByRole("button", { name: /^Diff options/ }));
+      expect(await screen.findByRole("menuitemradio", { name: "Hide" })).toHaveAttribute("aria-checked", "true");
+      const escape = screen.getByRole("menuitemradio", { name: "Show" });
+      expect(escape).not.toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(escape);
+      expect(hidden.onHideWhitespaceChange).toHaveBeenCalledExactlyOnceWith(false);
+    });
+
+    it("still offers the way back when a filtered load fails", async () => {
+      ipc.fetchFileDiff.mockRejectedValue(new Error("fatal: bad object"));
+      renderDiff(includeAllChanges, {}, new Map(), "key-1", false, true);
+      expect(await screen.findByRole("alert")).toHaveTextContent("fatal: bad object");
+      expect(screen.getByRole("button", { name: /^Diff options/ })).toBeInTheDocument();
+    });
   });
 });

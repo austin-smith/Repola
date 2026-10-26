@@ -26,10 +26,10 @@ use worktree::{
     BranchMutationResult, BranchRequest, CloneRepositoryRequest, CommitChangedFile,
     CommitFileDiffRequest, CommitFilesRequest, CommitRequest, CommitResult, ConflictFile,
     ConflictFileRequest, CreateRepositoryRequest, CreateWorktreeRequest, CreateWorktreeResult,
-    DeleteRecoveryPointsRequest, DiscardPlan, DiscardPlanRequest, DiscardRequest, DiscardResult,
-    FileDiff, FileDiffRequest, GenerateCommitMessageRequest, GeneratedCommitMessage,
-    HistoryMutationRequest, HistoryMutationResult, HistoryPage, HistoryRequest,
-    MeasureWorktreeRequest, PullRequestEvidence, PullRequestMutationRequest,
+    DeleteRecoveryPointsRequest, DiffDisplayOptions, DiscardPlan, DiscardPlanRequest,
+    DiscardRequest, DiscardResult, FileDiff, FileDiffRequest, GenerateCommitMessageRequest,
+    GeneratedCommitMessage, HistoryMutationRequest, HistoryMutationResult, HistoryPage,
+    HistoryRequest, MeasureWorktreeRequest, PullRequestEvidence, PullRequestMutationRequest,
     PullRequestMutationResult, RecoveryFileDiff, RecoveryFileDiffRequest, RecoveryPointList,
     RecoveryPointRequest, RecoveryRestorePlan, RecoveryRestoreRequest, RecoveryRestoreResult,
     ReflogEntry, ReflogRequest, RefreshRequest, RefreshResult, RepositoryOperationMutationResult,
@@ -659,6 +659,7 @@ async fn file_diff(
     machine_id: String,
     operation_id: String,
     request: FileDiffRequest,
+    options: DiffDisplayOptions,
 ) -> Result<FileDiff, String> {
     let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
     let token = operations.begin(&operation_id)?;
@@ -667,7 +668,7 @@ async fn file_diff(
         match execute_on_machine(
             &machine,
             request_id,
-            AgentRequest::FileDiff { request },
+            AgentRequest::FileDiff { request, options },
             token,
         )? {
             AgentResult::FileDiff { diff } => Ok(diff),
@@ -1307,6 +1308,7 @@ async fn commit_file_diff(
     machine_id: String,
     operation_id: String,
     request: CommitFileDiffRequest,
+    options: DiffDisplayOptions,
 ) -> Result<FileDiff, String> {
     let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
     let token = operations.begin(&operation_id)?;
@@ -1315,7 +1317,7 @@ async fn commit_file_diff(
         match execute_on_machine(
             &machine,
             request_id,
-            AgentRequest::CommitFileDiff { request },
+            AgentRequest::CommitFileDiff { request, options },
             token,
         )? {
             AgentResult::CommitFileDiff { diff } => Ok(diff),

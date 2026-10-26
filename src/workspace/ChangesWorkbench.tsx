@@ -50,7 +50,7 @@ import {
   type CommitSelectionMap,
   type FileCommitSelection,
 } from "../domain/commit-selection";
-import { changeDiffKey, retainDiffEntries, workingCopySnapshotsEqual } from "../domain/diff-cache";
+import { changeDiffKey, exactDiffDisplay, retainDiffEntries, workingCopySnapshotsEqual } from "../domain/diff-cache";
 import { fileDiscardBlocker, recoveryLocation } from "../domain/discard";
 import { resolveAvailableToolId } from "../domain/external-tools";
 import { fileManagerName, machinePathSeparator } from "../domain/platform";
@@ -74,11 +74,12 @@ import { useWorkingCopy } from "./context";
 import { sectionHeadingClass, signingItems } from "./labels";
 import { LazyDialog } from "./LazyDialog";
 import { ConflictResolutionDialog, DiffDialog, DiscardDialog, DiscardedChangesDialog, InlineFileDiff } from "./lazy";
+import { useHideWhitespace } from "./diff-preferences";
 import { operationGuidance, operationLabel, operationSupportsSkip } from "./operations";
 
 function attributeChanges(snapshot: WorkingCopySnapshot, generation: number): string {
   return JSON.stringify(snapshot.changes.filter((change) => change.path.display === ".gitattributes" || change.path.display.endsWith("/.gitattributes"))
-    .map((change) => changeDiffKey(change, generation)).sort());
+    .map((change) => changeDiffKey(change, generation, exactDiffDisplay)).sort());
 }
 
 /** Asks the workbench showing a working copy to open one of its recovery points. */
@@ -304,6 +305,8 @@ export function ChangesWorkbench() {
   // Held as state rather than a ref so the diff pane can bind its virtualized
   // rows to the element as soon as it exists.
   const [diffScroller, setDiffScroller] = useState<HTMLDivElement | null>(null);
+  const [diffControls, setDiffControls] = useState<HTMLDivElement | null>(null);
+  const [hideWhitespace, setHideWhitespace] = useHideWhitespace("changes");
   const includedCount = includedChangeCount(visibleChanges, commitSelections);
   const allChangesIncluded = visibleChanges.length > 0 && includedCount === visibleChanges.length;
   const syncKind: SyncKind = !snapshot?.upstream
@@ -872,7 +875,8 @@ export function ChangesWorkbench() {
             <strong className="block truncate text-sm">{selectedChange?.path.display ?? "Working copy"}</strong>
             {selectedChange?.previousPath ? <span className="block truncate text-xs text-muted-foreground">renamed from {selectedChange.previousPath.display}</span> : null}
           </div>
-          <Button variant="outline" size="sm" className="ml-auto" disabled={visibleChanges.length === 0} onClick={() => setDiffOpen(true)}>
+          <div ref={setDiffControls} className="ml-auto flex shrink-0 items-center pl-2" />
+          <Button variant="outline" size="sm" className="ml-2" disabled={visibleChanges.length === 0} onClick={() => setDiffOpen(true)}>
             <FileDiffIcon data-icon="inline-start" aria-hidden="true" />
             Review complete diff
           </Button>
@@ -889,14 +893,16 @@ export function ChangesWorkbench() {
           </div>
         ) : null}
         <div ref={setDiffScroller} className="min-h-0 flex-1 overflow-auto">
-          {diffChange ? (
+          {/* The stored whitespace choice loads once per session; the pane
+              stays empty until then so the diff is fetched in the right mode. */}
+          {diffChange ? (hideWhitespace === null ? null : (
             <Suspense fallback={<div className="grid h-full place-items-center"><Spinner className="size-6" /></div>}>
               <InlineFileDiff
                 machineId={machineId}
                 repositoryPath={repository.path}
                 worktreePath={worktree.path}
                 change={diffChange}
-                diffKey={changeDiffKey(diffChange, generation)}
+                diffKey={changeDiffKey(diffChange, generation, { ignoreWhitespace: hideWhitespace })}
                 cache={diffCache}
                 scrollElement={diffScroller}
                 selection={commitSelectionFor(commitSelections, diffChange.id)}
@@ -906,9 +912,12 @@ export function ChangesWorkbench() {
                   next.set(diffChange.id, selection);
                   return next;
                 })}
+                hideWhitespace={hideWhitespace}
+                onHideWhitespaceChange={setHideWhitespace}
+                controlsElement={diffControls}
               />
             </Suspense>
-          ) : <div className="grid h-full place-items-center"><p className="text-sm text-muted-foreground">Select a changed file to review it.</p></div>}
+          )) : <div className="grid h-full place-items-center"><p className="text-sm text-muted-foreground">Select a changed file to review it.</p></div>}
         </div>
       </section>
       {diffOpen ? (
