@@ -1,23 +1,25 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { AlertTriangleIcon } from "lucide-react";
-import { PatchDiff } from "@pierre/diffs/react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Spinner } from "@/components/ui/spinner";
-import { useTheme } from "@/components/theme-provider";
 import type { CommitChangedFile, FileDiff } from "../ipc/types";
 import { fetchCommitFileDiff } from "../ipc/worktrees";
+import { toMessage } from "../lib/errors";
 import { DiffOptionsMenu } from "./DiffOptionsMenu";
+import { DiffView } from "./DiffView";
 import { FileDiffFallback } from "./FileDiffFallback";
 import { OnlyWhitespaceChanged, truncatedDiffWhitespaceReason } from "./HiddenWhitespace";
 import { useDelayedPending } from "./use-delayed-pending";
 
-export function CommitFileDiffView({ machineId, repositoryPath, worktreePath, commit, file, hideWhitespace, onHideWhitespaceChange, controlsElement }: {
+export function CommitFileDiffView({ machineId, repositoryPath, worktreePath, commit, file, scrollElement, hideWhitespace, onHideWhitespaceChange, controlsElement }: {
   machineId: string;
   repositoryPath: string;
   worktreePath: string;
   commit: string;
   file: CommitChangedFile;
+  /** The ancestor that scrolls the diff; large diffs window their rows against it. */
+  scrollElement: HTMLElement | null;
   /** Whether the diff is shown without whitespace changes (`git diff -w`). */
   hideWhitespace: boolean;
   onHideWhitespaceChange: (hide: boolean) => void;
@@ -35,7 +37,6 @@ export function CommitFileDiffView({ machineId, repositoryPath, worktreePath, co
   const diff = current?.diff ?? null;
   const error = settled ? current.error : null;
   const showLoading = useDelayedPending(diff === null && error === null);
-  const { resolvedTheme } = useTheme();
   const optionsTrigger = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
@@ -45,7 +46,7 @@ export function CommitFileDiffView({ machineId, repositoryPath, worktreePath, co
     };
     void fetchCommitFileDiff(machineId, repositoryPath, worktreePath, commit, file.path, { ignoreWhitespace: hideWhitespace }, controller.signal)
       .then((next) => settle(next, null))
-      .catch((cause: unknown) => settle(null, cause instanceof Error ? cause.message : String(cause)));
+      .catch((cause: unknown) => settle(null, toMessage(cause)));
     return () => controller.abort();
   }, [commit, file.path, hideWhitespace, identity, machineId, repositoryPath, worktreePath]);
 
@@ -81,10 +82,10 @@ export function CommitFileDiffView({ machineId, repositoryPath, worktreePath, co
   if (!diff.patch && current?.hideWhitespace) return <>{controls}<OnlyWhitespaceChanged onShowWhitespace={showWhitespace} /></>;
   if (!diff.patch) return <div className="grid h-full place-items-center text-sm text-muted-foreground">No textual lines to display.</div>;
   return (
-    <div className="flex min-h-full flex-col gap-3 p-3">
+    <div className="flex min-h-full flex-col">
       {controls}
-      {diff.truncated ? <Alert variant="warning"><AlertTriangleIcon aria-hidden="true" /><AlertDescription>This commit diff exceeded 8 MiB and was truncated.</AlertDescription></Alert> : null}
-      <PatchDiff patch={diff.patch} disableWorkerPool options={{ theme: { light: "github-light", dark: "github-dark" }, themeType: resolvedTheme }} />
+      {diff.truncated ? <Alert variant="warning" className="m-3"><AlertTriangleIcon aria-hidden="true" /><AlertDescription>This commit diff exceeded 8 MiB and was truncated.</AlertDescription></Alert> : null}
+      <DiffView patch={diff.patch} path={file.path.display} scrollElement={scrollElement} />
     </div>
   );
 }

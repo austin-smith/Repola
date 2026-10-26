@@ -43,6 +43,7 @@ export function HistoryWorkbench() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [diffControls, setDiffControls] = useState<HTMLDivElement | null>(null);
+  const [diffScroller, setDiffScroller] = useState<HTMLDivElement | null>(null);
   const [hideWhitespace, setHideWhitespace] = useHideWhitespace("history");
   const [files, setFiles] = useState<CommitChangedFile[] | null>(null);
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
@@ -361,7 +362,10 @@ export function HistoryWorkbench() {
           <div className="min-w-0"><strong className="block truncate text-sm">{selectedFile?.path.display ?? "Commit diff"}</strong>{selectedFile?.previousPath ? <span className="block truncate text-xs text-muted-foreground">renamed from {selectedFile.previousPath.display}</span> : null}</div>
           <div ref={setDiffControls} className="ml-auto flex shrink-0 items-center pl-2" />
         </div>
-        <div className="min-h-0 flex-1 overflow-auto">
+        {/* Focusable while it shows a diff, so the diff can be scrolled from
+            the keyboard; its rows are windowed, so there is nothing inside to
+            tab to. */}
+        <div ref={setDiffScroller} className="min-h-0 flex-1 overflow-auto focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring" tabIndex={selected && selectedFile ? 0 : undefined}>
           {selected && selectedFile ? (hideWhitespace === null ? null : (
             <Suspense fallback={<div className="grid h-full place-items-center"><Spinner className="size-6" /></div>}>
               <CommitFileDiffView
@@ -370,6 +374,7 @@ export function HistoryWorkbench() {
                 worktreePath={worktree.path}
                 commit={selected.oid}
                 file={selectedFile}
+                scrollElement={diffScroller}
                 hideWhitespace={hideWhitespace}
                 onHideWhitespaceChange={setHideWhitespace}
                 controlsElement={diffControls}
