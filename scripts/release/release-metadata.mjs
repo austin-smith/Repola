@@ -2,13 +2,34 @@ import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { githubClient, isMain, parseVersion, publishedReleases, readJson, releaseAsset, repository, root, validateRelease, writeJson, compareVersions } from "./release-utils.mjs";
 
-export function planRelease({ version, sha, runId, runNumber, pubDate, sourceRef, tag }) {
+export function planRelease({ version, sha, runId, sequence = "1", pubDate, sourceRef, tag }) {
   if (parseVersion(version).nightly !== null) throw new Error("Source manifests must contain the upcoming stable version.");
   const channel = tag ? "stable" : "nightly";
   if (tag && tag !== `v${version}`) throw new Error("Stable tag must match the source version.");
-  if (!tag && !/^[1-9]\d*$/.test(runNumber)) throw new Error("Nightly releases require a positive run number.");
-  const releaseVersion = tag ? version : `${version}-nightly.${runNumber}`;
+  if (!tag && !/^[1-9]\d*$/.test(sequence)) throw new Error("Nightly releases require a positive daily sequence.");
+  const date = pubDate.slice(0, 10).replaceAll("-", "");
+  const releaseVersion = tag ? version : `${version}-nightly.${date}.${sequence}`;
   return validateRelease({ schema: 1, repository, channel, version: releaseVersion, tag: `v${releaseVersion}`, sha, runId, pubDate, sourceRef });
+}
+
+export function nightlySequence(version, pubDate, runId, artifacts, releases) {
+  const prefix = `${version}-nightly.${pubDate.slice(0, 10).replaceAll("-", "")}.`;
+  let highest = 0n;
+  let retry;
+  for (const entry of [
+    ...artifacts.filter((artifact) => artifact.name.startsWith("metadata-")).map((artifact) => ({ version: artifact.name.slice("metadata-".length), runId: String(artifact.workflow_run?.id) })),
+    ...releases.map((release) => ({ version: release.tag_name.slice(1) })),
+  ]) {
+    if (!entry.version.startsWith(prefix)) continue;
+    const sequence = entry.version.slice(prefix.length);
+    if (!/^[1-9]\d*$/.test(sequence)) continue;
+    if (entry.runId === runId) {
+      if (retry && retry !== sequence) throw new Error("Build run has conflicting nightly version reservations.");
+      retry = sequence;
+    }
+    if (BigInt(sequence) > highest) highest = BigInt(sequence);
+  }
+  return retry ?? String(highest + 1n);
 }
 
 export function stampVersions({ packageJson, tauriConfig, cargoManifest, cargoLock }, release) {
@@ -50,8 +71,11 @@ export async function resolveMetadata(environment = process.env, client = github
   const manifest = await client.request(`/contents/package.json?ref=${source.sha}`);
   const version = JSON.parse(Buffer.from(manifest.content, "base64").toString("utf8")).version;
   const run = await client.request(`/actions/runs/${environment.GITHUB_RUN_ID}`);
-  const release = planRelease({ version, sha: source.sha, tag: stableTag, runId: environment.GITHUB_RUN_ID, runNumber: environment.GITHUB_RUN_NUMBER, pubDate: run.created_at, sourceRef: environment.GITHUB_REF });
   const releases = await client.list("/releases");
+  // Saved plan artifacts reserve versions even when packaging or publication fails.
+  const artifacts = stableTag ? [] : await client.list("/actions/artifacts", { key: "artifacts" });
+  const sequence = stableTag ? undefined : nightlySequence(version, run.created_at, environment.GITHUB_RUN_ID, artifacts, releases);
+  const release = planRelease({ version, sha: source.sha, tag: stableTag, runId: environment.GITHUB_RUN_ID, sequence, pubDate: run.created_at, sourceRef: environment.GITHUB_REF });
   const latestStable = publishedReleases(releases, "stable")[0];
   if (release.channel === "nightly" && latestStable && compareVersions(version, latestStable.tag_name.slice(1)) <= 0) {
     throw new Error("Bump main's upcoming stable version before building another nightly.");

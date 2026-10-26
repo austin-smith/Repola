@@ -1,6 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { readJson, repository, updateBaseUrl, validateRelease } from "./release-utils.mjs";
+import { buildIdentityConfig } from "../build-identity.mjs";
 
 function normalizedBase64(value) {
   return value.replace(/=+$/, "");
@@ -31,12 +32,12 @@ export function buildReleaseConfig({ environment, packageJson, tauriConfig, carg
     throw new Error("Release source must match the validated workflow metadata.");
   }
 
-  const releaseConfig = buildInstallerConfig(environment);
+  const releaseConfig = buildInstallerConfig(environment, tauriConfig, release.channel);
   releaseConfig.plugins.updater.endpoints = [`${updateBaseUrl}/${release.channel}.json`];
   return releaseConfig;
 }
 
-export function buildInstallerConfig(environment) {
+export function buildInstallerConfig(environment, tauriConfig = {}, channel = "development") {
   const required = (name) => {
     const value = environment[name]?.trim();
     if (!value) throw new Error(`Release configuration requires ${name}.`);
@@ -69,8 +70,11 @@ export function buildInstallerConfig(environment) {
     throw new Error("REPOLA_SIGNING_PUBLIC_KEY is not a Tauri-encoded modern Minisign public key.");
   }
 
+  const identityConfig = buildIdentityConfig(channel, tauriConfig);
   const releaseConfig = {
+    ...identityConfig,
     bundle: {
+      ...identityConfig.bundle,
       createUpdaterArtifacts: true,
     },
     plugins: {
@@ -126,7 +130,7 @@ export async function prepareRelease(environment = process.env, metadataPath = n
   const tauriConfig = JSON.parse(await readFile(new URL("../../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
   const cargoManifest = await readFile(new URL("../../src-tauri/Cargo.toml", import.meta.url), "utf8");
   const releaseConfig = installerBuild
-    ? buildInstallerConfig(environment)
+    ? buildInstallerConfig(environment, tauriConfig)
     : buildReleaseConfig({ environment, packageJson, tauriConfig, cargoManifest, release });
   await writeFile(
     new URL("../../src-tauri/tauri.release.conf.json", import.meta.url),

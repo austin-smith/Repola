@@ -7,7 +7,7 @@ use super::models::{
     StashEntry, StashMutationKind, StashMutationRequest, StashMutationResult, StashRequest,
     WorkingCopyRequest,
 };
-use super::working_copy::{path_from_token, working_copy_snapshot};
+use super::working_copy::{literal_pathspec, path_from_token, working_copy_snapshot};
 
 const MAX_STASH_MESSAGE_BYTES: usize = 998;
 
@@ -70,7 +70,7 @@ pub fn mutate_stash(request: StashMutationRequest) -> Result<StashMutationResult
                         path.display
                     ));
                 }
-                selected.push(path_from_token(&path.token)?);
+                selected.push(literal_pathspec(path_from_token(&path.token)?));
             }
             let message = request
                 .message
@@ -359,5 +359,43 @@ mod tests {
             .changes
             .iter()
             .any(|change| change.path.display == "tracked.txt"));
+    }
+
+    #[test]
+    fn stashes_a_glob_named_path_without_its_neighbour() {
+        let repository = repository();
+        let path = repository.path().to_string_lossy().into_owned();
+        std::fs::write(repository.path().join("[x].txt"), "selected\n").expect("glob name");
+        std::fs::write(repository.path().join("x.txt"), "keep\n").expect("neighbour");
+        let before = working_copy_snapshot(WorkingCopyRequest {
+            repository_path: path.clone(),
+            worktree_path: path.clone(),
+        })
+        .expect("snapshot");
+        let selected = before
+            .changes
+            .iter()
+            .find(|change| change.path.display == "[x].txt")
+            .expect("glob-named change")
+            .path
+            .clone();
+        let result = mutate_stash(StashMutationRequest {
+            repository_path: path.clone(),
+            worktree_path: path,
+            kind: StashMutationKind::Push,
+            message: None,
+            include_untracked: true,
+            paths: vec![selected],
+            stash_index: None,
+            expected_stash_oid: None,
+            expected_head: before.head,
+        })
+        .expect("selected stash");
+        assert_eq!(result.stashes.len(), 1);
+        assert!(!repository.path().join("[x].txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("x.txt")).expect("neighbour kept"),
+            "keep\n"
+        );
     }
 }

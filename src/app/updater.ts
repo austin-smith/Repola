@@ -44,6 +44,10 @@ export function checkForUpdates(reportErrors = true): Promise<void> {
       if (reportErrors) publish({ status: "error", context: "check", version: null, message: "Update checks are available in the installed Repola desktop app." });
       return;
     }
+    if (releaseChannel === "development") {
+      if (reportErrors) publish({ status: "error", context: "check", version: null, message: "Development builds are updated by installing a new build." });
+      return;
+    }
     publish({ status: "checking" });
     try {
       if (activeUpdate) {

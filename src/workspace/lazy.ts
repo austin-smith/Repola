@@ -1,6 +1,7 @@
 import { lazy } from "react";
 
-// Dialogs and diff viewers are code-split so the startup bundle stays inside the budget in vite.config.ts.
+// Dialogs, diff viewers, and the History view are code-split so the startup bundle stays inside the
+// budget in vite.config.ts.
 export const DiffDialog = lazy(() =>
   import("../dialogs/DiffDialog").then((module) => ({ default: module.DiffDialog })),
 );
@@ -9,6 +10,9 @@ export const InlineFileDiff = lazy(() =>
 );
 export const CommitFileDiffView = lazy(() =>
   import("./CommitFileDiffView").then((module) => ({ default: module.CommitFileDiffView })),
+);
+export const HistoryWorkbench = lazy(() =>
+  import("./HistoryWorkbench").then((module) => ({ default: module.HistoryWorkbench })),
 );
 export const HistoryMutationDialog = lazy(() => import("../dialogs/HistoryMutationDialog"));
 export const TagsDialog = lazy(() => import("../dialogs/TagsDialog"));

@@ -13,6 +13,7 @@ vi.mock("@tauri-apps/plugin-updater", () => ({ check: mocks.check }));
 describe("updater coordinator", () => {
   afterEach(() => vi.unstubAllEnvs());
   beforeEach(() => {
+    vi.stubEnv("VITE_REPOLA_RELEASE_CHANNEL", "stable");
     vi.resetModules();
     mocks.check.mockReset();
     mocks.isTauri.mockReset().mockReturnValue(true);
@@ -76,12 +77,22 @@ describe("updater coordinator", () => {
 
   it("closes a cross-channel offer before it can become installable", async () => {
     vi.stubEnv("VITE_REPOLA_RELEASE_CHANNEL", "stable");
-    const update = { version: "0.2.0-nightly.123", close: vi.fn(async () => undefined) };
+    const update = { version: "0.2.0-nightly.20260930.123", close: vi.fn(async () => undefined) };
     mocks.check.mockResolvedValue(update);
     const updater = await import("./updater");
     await updater.checkForUpdates();
     expect(update.close).toHaveBeenCalledOnce();
     expect(updater.getUpdaterState()).toMatchObject({ status: "error", context: "check" });
     expect(updater.getUpdaterState()).not.toHaveProperty("version", update.version);
+  });
+
+  it("never contacts an update feed from a development build", async () => {
+    vi.stubEnv("VITE_REPOLA_RELEASE_CHANNEL", "development");
+    const updater = await import("./updater");
+    await updater.checkForUpdates(false);
+    expect(updater.getUpdaterState()).toEqual({ status: "idle" });
+    await updater.checkForUpdates(true);
+    expect(updater.getUpdaterState()).toMatchObject({ status: "error", context: "check", message: "Development builds are updated by installing a new build." });
+    expect(mocks.check).not.toHaveBeenCalled();
   });
 });

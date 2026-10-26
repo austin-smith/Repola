@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { TooltipButton } from "@/components/tooltip-button";
 import { Spinner } from "@/components/ui/spinner";
 import { checkForUpdates, installAvailableUpdate, useUpdaterState } from "./updater";
-import { releaseLabel } from "./release";
+import { applicationName, releaseChannel, releaseLabel } from "./release";
 
 function progressLabel(downloadedBytes: number, totalBytes: number | null): string {
   const downloaded = Math.max(0, downloadedBytes);
@@ -17,6 +17,7 @@ export function AppUpdater() {
   const [dismissedVersion, setDismissedVersion] = useState<string | null>(null);
 
   useEffect(() => {
+    if (releaseChannel === "development") return;
     const timer = window.setTimeout(() => void checkForUpdates(false), 15_000);
     return () => window.clearTimeout(timer);
   }, []);
@@ -36,9 +37,9 @@ export function AppUpdater() {
         </div>
         <div className="min-w-0 flex-1">
           <strong className="text-sm">
-            {updater.status === "available" ? `Repola ${updater.version} is ready`
-              : updater.status === "installing" ? `Installing Repola ${updater.version}`
-                : updater.status === "restarting" ? "Restarting Repola…"
+            {updater.status === "available" ? `${applicationName} ${updater.version} is ready`
+              : updater.status === "installing" ? `Installing ${applicationName} ${updater.version}`
+                : updater.status === "restarting" ? `Restarting ${applicationName}…`
                   : "Update could not be installed"}
           </strong>
           <p className="mt-1 text-xs text-muted-foreground">
@@ -82,16 +83,17 @@ export function UpdateSettings() {
         <strong className="text-sm">Software updates</strong>
         <p className="mt-1 text-xs text-muted-foreground">{releaseLabel}</p>
         <p className={`mt-1 text-xs ${updater.status === "error" ? "text-destructive" : "text-muted-foreground"}`}>
-          {updater.status === "checking" ? "Checking the signed release channel…"
-            : updater.status === "upToDate" ? "Repola is up to date."
-              : updater.status === "available" ? `Repola ${updater.version} is available.`
+          {releaseChannel === "development" ? "Development builds are updated by installing a new build."
+            : updater.status === "checking" ? "Checking the signed release channel…"
+            : updater.status === "upToDate" ? `${applicationName} is up to date.`
+              : updater.status === "available" ? `${applicationName} ${updater.version} is available.`
                 : updater.status === "installing" ? `Installing ${updater.version} · ${progressLabel(updater.downloadedBytes, updater.totalBytes)}`
                   : updater.status === "restarting" ? "Update installed; restarting…"
                     : updater.status === "error" ? updater.message
                       : "Checks use Repola's pinned signing key and release channel."}
         </p>
       </div>
-      {updater.status === "available" || (updater.status === "error" && updater.context === "install") ? (
+      {releaseChannel === "development" ? null : updater.status === "available" || (updater.status === "error" && updater.context === "install") ? (
         <Button size="sm" disabled={installing} onClick={() => void installAvailableUpdate()}>
           <DownloadIcon data-icon="inline-start" aria-hidden="true" />Install and Restart
         </Button>
