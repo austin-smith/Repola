@@ -28,6 +28,8 @@
 //!   contained in has not moved, as `git branch -d` requires.
 //! - The remote still pushes to the reviewed URL, and that URL does not name
 //!   this branch as its default.
+//! - The remote branch's remote-tracking ref is not symbolic. The push deletes
+//!   that ref too, and would follow a symbolic one to another branch.
 //!
 //! Another process can still change these between the check and the deletion;
 //! `git branch -d` has the same window between its checks and its deletion.
@@ -756,6 +758,17 @@ fn delete_remote(reviewed: &Review, remote: &RemoteBranchDeletion) -> RemoteDele
         }
         Err(reason) => return failed(format!("{reason} {} was not deleted.", remote.display_name)),
     }
+    match symbolic_target(worktree, &remote.tracking_ref) {
+        Ok(None) => {}
+        Ok(Some(target)) => {
+            return failed(format!(
+                "{} {} was not deleted. Review the deletion again.",
+                symbolic_tracking_reason(&remote.tracking_ref, &target),
+                remote.display_name
+            ))
+        }
+        Err(reason) => return failed(format!("{reason} {} was not deleted.", remote.display_name)),
+    }
     let output = match command::git_at(worktree, remote_deletion_args(remote)) {
         Ok(output) => output,
         Err(error) if may_have_run(&error) => {
@@ -1104,6 +1117,18 @@ fn delete_local(
         finish_commands,
         recovery_commands,
     })
+}
+
+/// Why a remote branch whose remote-tracking ref is symbolic is not deleted: a
+/// push that deletes a branch also deletes its remote-tracking ref, following
+/// a symbolic one to the ref it points to, whatever that holds.
+fn symbolic_tracking_reason(tracking_ref: &str, target: &str) -> String {
+    format!(
+        "{} is a symbolic ref to {}, so deleting the remote branch would make Git delete {} too.",
+        short_ref(tracking_ref),
+        short_ref(target),
+        short_ref(target)
+    )
 }
 
 /// The ref `reference` points to when it is symbolic.
@@ -1614,6 +1639,9 @@ fn upstream_candidate(
         ));
     }
     match refs.get(&record.upstream) {
+        Some(tracking) if !tracking.symref.is_empty() => RemoteTarget::Unavailable(
+            symbolic_tracking_reason(&record.upstream, &tracking.symref),
+        ),
         Some(tracking) => RemoteTarget::Available(RemoteCandidate {
             remote: record.upstream_remote.clone(),
             remote_ref: record.upstream_remote_ref.clone(),
@@ -3261,6 +3289,65 @@ mod tests {
             "{}",
             deletion.output
         );
+        assert!(fixture.remote_has_branch("topic"));
+    }
+
+    #[test]
+    fn a_remote_branch_whose_tracking_ref_is_symbolic_is_not_deleted() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "topic"]);
+        git(
+            &fixture.repository,
+            &["push", "--set-upstream", "origin", "topic"],
+        );
+        git(
+            &fixture.repository,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/topic",
+                "refs/heads/main",
+            ],
+        );
+        let plan = fixture.plan("refs/heads/topic", false, true);
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| blocker.contains("symbolic ref to main")),
+            "{:?}",
+            plan.blockers
+        );
+        execute(&plan, None).expect_err("the push would delete main");
+        assert!(fixture.has_ref("refs/heads/main"));
+        assert!(fixture.remote_has_branch("topic"));
+    }
+
+    #[test]
+    fn a_remote_branch_is_kept_once_its_tracking_ref_turns_symbolic_after_review() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "topic"]);
+        git(
+            &fixture.repository,
+            &["push", "--set-upstream", "origin", "topic"],
+        );
+        let reviewed =
+            review(fixture.request("refs/heads/topic", false, true), None).expect("review");
+        git(
+            &fixture.repository,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/topic",
+                "refs/heads/main",
+            ],
+        );
+        let remote = reviewed.plan.remote.as_ref().expect("remote details");
+        let deletion = delete_remote(&reviewed, remote);
+        assert!(matches!(deletion.outcome, RemoteOutcome::Failed));
+        assert!(
+            deletion.output.contains("symbolic ref to main"),
+            "{}",
+            deletion.output
+        );
+        assert!(fixture.has_ref("refs/heads/main"));
         assert!(fixture.remote_has_branch("topic"));
     }
 
