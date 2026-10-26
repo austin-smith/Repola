@@ -1,7 +1,10 @@
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Output;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -13,6 +16,7 @@ use crate::operation;
 
 use super::agents::detect_worktree_origin;
 use super::command;
+use super::git_metadata::metadata_line;
 use super::identity;
 use super::models::{
     ChangeSummary, IntegrationEvidence, IntegrationKind, RegistrationKind, RegistrationState,
@@ -40,9 +44,10 @@ enum GitContext {
 impl GitContext {
     fn output(&self, args: &[&str]) -> Result<Output, command::CommandError> {
         match self {
-            Self::Worktree(path) => command::git_at(path, args),
+            Self::Worktree(path) => command::inspection_git_at(path, args),
             Self::Explicit { git_dir, work_tree } => {
                 let mut full_args = vec![
+                    OsString::from("--no-optional-locks"),
                     OsString::from("--git-dir"),
                     git_dir.as_os_str().to_owned(),
                     OsString::from("--work-tree"),
@@ -70,30 +75,80 @@ pub(crate) fn inspect_worktree_shallow(
     repository: &RepositoryContext,
     seed: &WorktreeSeed,
 ) -> WorktreeRecord {
+    inspect_worktree_with_status(repository, seed, None, None, true)
+}
+
+pub(crate) fn worktree_membership(
+    repository: &RepositoryContext,
+    seed: &WorktreeSeed,
+) -> WorktreeRecord {
+    inspect_worktree_with_status(repository, seed, None, None, false)
+}
+
+pub(crate) fn inspect_worktree_with_status(
+    repository: &RepositoryContext,
+    seed: &WorktreeSeed,
+    supplied_status: Option<&ChangeSummary>,
+    cached: Option<&WorktreeRecord>,
+    inspect: bool,
+) -> WorktreeRecord {
     let path = PathBuf::from(&seed.path);
     let exists = path.is_dir();
-    let (git_context, broken_link) = if exists && seed.prunable_reason.is_none() {
+    let (git_context, broken_link) = if inspect && supplied_status.is_some() && cached.is_some() {
+        (
+            None,
+            !seed.is_primary && broken_git_pointer(repository, &path),
+        )
+    } else if inspect && exists && seed.prunable_reason.is_none() {
         resolve_git_context(repository, seed)
+    } else if !inspect && exists && !seed.is_primary {
+        (None, broken_git_pointer(repository, &path))
     } else {
         (None, false)
     };
 
-    let status = git_context
-        .as_ref()
-        .and_then(|context| {
-            context
-                .output(&["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
-                .ok()
-        })
-        .filter(|output| output.status.success())
-        .map(|output| parse_status_porcelain(&output.stdout))
-        .unwrap_or_default();
-    let unpushed_commit_count = unpushed_commit_count(repository, git_context.as_ref());
+    let status = supplied_status.cloned().unwrap_or_else(|| {
+        git_context
+            .as_ref()
+            .and_then(|context| {
+                context
+                    .output(&["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
+                    .ok()
+            })
+            .filter(|output| output.status.success())
+            .map(|output| parse_status_porcelain(&output.stdout))
+            .unwrap_or_default()
+    });
+    let unpushed_commit_count = if let Some(cached) = cached {
+        cached.unpushed_commit_count
+    } else if inspect {
+        unpushed_commit_count(repository, git_context.as_ref())
+    } else {
+        None
+    };
 
     let registration = registration_state(seed, exists, broken_link);
-    let integration = integration_evidence(repository, seed);
+    let integration = cached
+        .map(|record| record.integration.clone())
+        .unwrap_or_else(|| {
+            if inspect {
+                integration_evidence(repository, seed)
+            } else {
+                IntegrationEvidence {
+                    kind: IntegrationKind::Unknown,
+                    target: None,
+                    summary: "Git information has not been refreshed.".into(),
+                }
+            }
+        });
     let safety = safety_assessment(exists, &status, &registration, unpushed_commit_count);
-    let (head_commit_at_ms, head_subject) = head_metadata(repository, seed.head.as_deref());
+    let (head_commit_at_ms, head_subject) = if let Some(cached) = cached {
+        (cached.head_commit_at_ms, cached.head_subject.clone())
+    } else if inspect {
+        head_metadata(repository, seed.head.as_deref())
+    } else {
+        (None, None)
+    };
     let created_at_ms = created_at_ms(&path);
     let last_activity_at_ms = [created_at_ms, head_commit_at_ms]
         .into_iter()
@@ -244,7 +299,7 @@ fn resolve_git_context(
     seed: &WorktreeSeed,
 ) -> (Option<GitContext>, bool) {
     let path = PathBuf::from(&seed.path);
-    if command::git_at(&path, ["rev-parse", "--is-inside-work-tree"])
+    if command::inspection_git_at(&path, ["rev-parse", "--is-inside-work-tree"])
         .is_ok_and(|output| output.status.success())
     {
         return (Some(GitContext::Worktree(path)), false);
@@ -270,7 +325,7 @@ fn resolve_git_context(
 fn locate_admin_dir(repository_git_dir: &Path, worktree_path: &Path) -> Option<PathBuf> {
     let pointer_path = worktree_path.join(".git");
     if let Ok(pointer) = fs::read_to_string(&pointer_path) {
-        if let Some(raw_path) = pointer.trim().strip_prefix("gitdir: ") {
+        if let Some(raw_path) = metadata_line(&pointer).strip_prefix("gitdir: ") {
             if let Some(name) = Path::new(raw_path).file_name() {
                 let candidate = repository_git_dir.join("worktrees").join(name);
                 if candidate.is_dir() {
@@ -287,11 +342,42 @@ fn locate_admin_dir(repository_git_dir: &Path, worktree_path: &Path) -> Option<P
         let Ok(registered_pointer) = fs::read_to_string(admin_dir.join("gitdir")) else {
             continue;
         };
-        if registered_pointer.trim() == expected_pointer {
+        if metadata_line(&registered_pointer) == expected_pointer {
             return Some(admin_dir);
         }
     }
     None
+}
+
+fn broken_git_pointer(repository: &RepositoryContext, worktree: &Path) -> bool {
+    let read_small = |path: &Path| -> Option<String> {
+        let mut value = String::new();
+        fs::File::open(path)
+            .ok()?
+            .take(32 * 1024 + 1)
+            .read_to_string(&mut value)
+            .ok()?;
+        (value.len() <= 32 * 1024).then_some(value)
+    };
+    let Some(pointer) = read_small(&worktree.join(".git")) else {
+        return true;
+    };
+    let Some(raw_admin) = metadata_line(&pointer).strip_prefix("gitdir: ") else {
+        return true;
+    };
+    let admin = worktree.join(raw_admin);
+    if !admin.is_dir() {
+        return true;
+    }
+    let Some(common) = read_small(&admin.join("commondir")) else {
+        return true;
+    };
+    let actual = dunce::canonicalize(admin.join(metadata_line(&common)));
+    let expected = dunce::canonicalize(&repository.git_dir);
+    match (actual, expected) {
+        (Ok(actual), Ok(expected)) => actual != expected,
+        _ => true,
+    }
 }
 
 pub(crate) fn parse_status_porcelain(bytes: &[u8]) -> ChangeSummary {
@@ -399,7 +485,7 @@ fn integration_evidence(
         };
     };
 
-    let result = command::git_at(
+    let result = command::inspection_git_at(
         &repository.path,
         [
             "merge-base",
@@ -516,7 +602,8 @@ fn head_metadata(
     let Some(head) = head else {
         return (None, None);
     };
-    let Ok(output) = command::git_at(&repository.path, ["show", "-s", "--format=%ct%x00%s", head])
+    let Ok(output) =
+        command::inspection_git_at(&repository.path, ["show", "-s", "--format=%ct%x00%s", head])
     else {
         return (None, None);
     };
@@ -549,9 +636,29 @@ fn system_time_ms(time: SystemTime) -> Option<u64> {
 }
 
 fn measure_directory(path: &Path) -> DirectoryMeasurement {
+    // Full scans and individual requests share this gate, including requests
+    // from different windows. Polling the gate keeps cancellation responsive.
+    static MEASUREMENT: OnceLock<Mutex<()>> = OnceLock::new();
+    let gate = MEASUREMENT.get_or_init(|| Mutex::new(()));
+    let _guard = loop {
+        match gate.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if operation::is_cancelled() {
+                    return DirectoryMeasurement {
+                        incomplete: true,
+                        ..Default::default()
+                    };
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    let started = Instant::now();
     let mut measurement = DirectoryMeasurement::default();
     for entry in WalkDir::new(path).follow_links(false) {
-        if operation::is_cancelled() {
+        if operation::is_cancelled() || started.elapsed() >= Duration::from_secs(5) {
             measurement.incomplete = true;
             break;
         }

@@ -9,6 +9,78 @@ pub struct ScanRequest {
     pub repository_paths: Vec<String>,
 }
 
+/// Refresh Git state without recursively measuring any working directories.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshRequest {
+    pub repository_paths: Vec<String>,
+    /// None inspects every member; an empty list only reconciles membership.
+    pub worktree_paths: Option<Vec<String>>,
+    pub working_copy: Option<WorkingCopyRequest>,
+    #[serde(default = "default_refresh_metadata")]
+    pub refresh_metadata: bool,
+}
+
+fn default_refresh_metadata() -> bool {
+    true
+}
+
+impl Default for RefreshRequest {
+    fn default() -> Self {
+        Self {
+            repository_paths: Vec::new(),
+            worktree_paths: None,
+            working_copy: None,
+            refresh_metadata: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshResult {
+    pub refreshed_at_ms: u64,
+    pub repositories: Vec<RepositorySummary>,
+    pub memberships: Vec<WorktreeRecord>,
+    pub worktrees: Vec<WorktreeRecord>,
+    pub successful_repository_paths: Vec<String>,
+    pub errors: Vec<RefreshError>,
+    pub git_signatures: Vec<RepositoryGitSignature>,
+    pub working_copy: Option<WorkingCopySnapshot>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshError {
+    pub repository_path: String,
+    pub worktree_path: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryGitSignature {
+    pub repository_path: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasureWorktreeRequest {
+    pub repository_path: String,
+    pub worktree_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeMeasurement {
+    pub repository_path: String,
+    pub worktree_path: String,
+    pub size_bytes: Option<u64>,
+    pub size_incomplete: bool,
+    pub last_activity_at_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanResult {
@@ -549,6 +621,8 @@ pub struct HistoryMutationRequest {
     pub kind: HistoryMutationKind,
     pub target: String,
     pub expected_head: Option<String>,
+    #[serde(default)]
+    pub expected_branch: Option<String>,
     #[serde(default)]
     pub expected_changes: Vec<ReviewedFileChange>,
 }
@@ -1259,6 +1333,8 @@ pub struct BranchMutationRequest {
     #[serde(default)]
     pub start_point: Option<String>,
     pub expected_head: Option<String>,
+    #[serde(default)]
+    pub expected_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

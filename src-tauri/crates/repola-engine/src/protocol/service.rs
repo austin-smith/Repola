@@ -68,6 +68,8 @@ where
                         capabilities: vec![
                             AgentCapability::RepositoryDiscovery,
                             AgentCapability::WorktreeInventory,
+                            AgentCapability::WorkspaceRefresh,
+                            AgentCapability::WorktreeMeasurement,
                             AgentCapability::WorkingCopy,
                             AgentCapability::History,
                             AgentCapability::Synchronization,
@@ -92,6 +94,14 @@ where
         })
         .map(|result| AgentResult::ScanWorktrees { result })
         .map_err(|error| AgentError::operation(error.to_string())),
+        AgentRequest::RefreshWorktrees { request } => worktree::refresh_worktrees(request)
+            .map(|result| AgentResult::RefreshWorktrees {
+                result: Box::new(result),
+            })
+            .map_err(|error| AgentError::operation(error.to_string())),
+        AgentRequest::MeasureWorktree { request } => worktree::measure_worktree_directory(request)
+            .map(|measurement| AgentResult::WorktreeMeasurement { measurement })
+            .map_err(AgentError::operation),
         AgentRequest::ResolveRepository { path } => worktree::resolve_repository(&path)
             .map(|repository_path| AgentResult::RepositoryResolved { repository_path })
             .map_err(AgentError::operation),
@@ -325,6 +335,12 @@ mod tests {
                 assert!(agent
                     .capabilities
                     .contains(&AgentCapability::WorktreeInventory));
+                assert!(agent
+                    .capabilities
+                    .contains(&AgentCapability::WorkspaceRefresh));
+                assert!(agent
+                    .capabilities
+                    .contains(&AgentCapability::WorktreeMeasurement));
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -332,28 +348,30 @@ mod tests {
 
     #[test]
     fn incompatible_versions_fail_explicitly() {
-        let response = execute(
-            RequestEnvelope {
-                protocol_version: PROTOCOL_VERSION + 1,
-                request_id: "future".into(),
-                request: AgentRequest::Handshake {
-                    client_version: "future".into(),
-                    minimum_protocol_version: PROTOCOL_VERSION + 1,
-                    maximum_protocol_version: PROTOCOL_VERSION + 1,
+        for version in [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+            let response = execute(
+                RequestEnvelope {
+                    protocol_version: version,
+                    request_id: "incompatible".into(),
+                    request: AgentRequest::Handshake {
+                        client_version: "incompatible".into(),
+                        minimum_protocol_version: version,
+                        maximum_protocol_version: version,
+                    },
                 },
-            },
-            |_| {},
-        );
+                |_| {},
+            );
 
-        assert!(matches!(
-            response.body,
-            ResponseBody::Failure {
-                error: AgentError {
-                    kind: super::super::AgentErrorKind::Protocol,
-                    ..
+            assert!(matches!(
+                response.body,
+                ResponseBody::Failure {
+                    error: AgentError {
+                        kind: super::super::AgentErrorKind::Protocol,
+                        ..
+                    }
                 }
-            }
-        ));
+            ));
+        }
     }
 
     #[test]

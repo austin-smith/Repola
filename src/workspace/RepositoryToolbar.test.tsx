@@ -1,6 +1,6 @@
 import type { ComponentProps } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as WorktreeIpc from "../ipc/worktrees";
 import type { BranchDeletionPlan, BranchDeletionRequest, BranchDeletionResult, BranchInfo, RepositorySummary, WorktreeRecord } from "../ipc/types";
 import { fileManagerName } from "../domain/platform";
@@ -9,6 +9,7 @@ import { RepositoryToolbar } from "./RepositoryToolbar";
 
 const ipc = vi.hoisted(() => ({
   loadBranches: vi.fn(),
+  mutateBranch: vi.fn(),
   prepareBranchDeletionReview: vi.fn(),
   executeBranchDeletion: vi.fn(),
 }));
@@ -92,6 +93,52 @@ describe("RepositoryToolbar", () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+  });
+  beforeEach(() => {
+    ipc.loadBranches.mockReset();
+    ipc.mutateBranch.mockReset();
+  });
+
+  it("keeps a branch dialog draft through HEAD and metadata updates", async () => {
+    const main = worktree("/repos/repola", "main", true);
+    ipc.loadBranches.mockResolvedValue([{ name: "main", fullName: "refs/heads/main", head: main.head, remote: false, current: true, upstream: null, ahead: 0, behind: 0, occupiedWorktreePath: main.path }]);
+    const toolbar = (head: string, gitRevision: number) => (
+      <RepositoryProvider value={{ machineId: "local", machineKind: "local", machineOs: null, repository, worktree: { ...main, head }, gitRevision, refreshWorkspace: vi.fn(), showChanges: vi.fn(), recordAuditPath: vi.fn() }}>
+        <RepositoryToolbar repositories={[repository]} worktrees={[main]} onRepositoryChange={vi.fn()} onWorktreeChange={vi.fn()} onAddRepository={vi.fn()} onCreateWorktree={vi.fn()} onRemoveRepository={vi.fn()} />
+      </RepositoryProvider>
+    );
+    const view = render(toolbar(main.head ?? "", 0));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Branch actions" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Branch actions" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Create branch…" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Branch name" }), { target: { value: "draft-branch" } });
+    view.rerender(toolbar("new-head", 1));
+    expect(screen.getByRole("textbox", { name: "Branch name" })).toHaveValue("draft-branch");
+    await waitFor(() => expect(ipc.loadBranches).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "Create Branch" }));
+    await screen.findByText("The current branch changed while this dialog was open. Close it and review the branch action again.");
+    expect(ipc.mutateBranch).not.toHaveBeenCalled();
+  });
+
+  it("passes the captured reviewed branch alongside HEAD to branch mutations", async () => {
+    const main = worktree("/repos/repola", "main", true);
+    ipc.loadBranches.mockResolvedValue([{ name: "main", fullName: "refs/heads/main", head: main.head, remote: false, current: true, upstream: null, ahead: 0, behind: 0, occupiedWorktreePath: main.path }]);
+    ipc.mutateBranch.mockRejectedValue(new Error("Backend revalidation rejected the action"));
+    const toolbar = (gitRevision: number) => (
+      <RepositoryProvider value={{ machineId: "local", machineKind: "local", machineOs: null, repository, worktree: main, gitRevision, refreshWorkspace: vi.fn(), showChanges: vi.fn(), recordAuditPath: vi.fn() }}>
+        <RepositoryToolbar repositories={[repository]} worktrees={[main]} onRepositoryChange={vi.fn()} onWorktreeChange={vi.fn()} onAddRepository={vi.fn()} onCreateWorktree={vi.fn()} onRemoveRepository={vi.fn()} />
+      </RepositoryProvider>
+    );
+    const view = render(toolbar(0));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Branch actions" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Branch actions" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Create branch…" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Branch name" }), { target: { value: "draft-branch" } });
+    view.rerender(toolbar(1));
+    await waitFor(() => expect(ipc.loadBranches).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "Create Branch" }));
+    await waitFor(() => expect(ipc.mutateBranch).toHaveBeenCalledWith("local", repository.path, main.path, "create", "draft-branch", null, main.head, "main"));
+    await screen.findByText("Backend revalidation rejected the action");
   });
 
   it("puts repository actions in the repository picker", () => {

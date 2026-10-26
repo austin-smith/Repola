@@ -55,6 +55,12 @@ import type {
   RepositoryOperationMutationResult,
   ScanEvent,
   ScanResult,
+  RefreshRequest,
+  RefreshResult,
+  WorktreeMeasurement,
+  WorkspaceWatchTarget,
+  WorkspaceWatchResult,
+  WorkspaceChangedEvent,
   StashEntry,
   StashMutationKind,
   StashMutationResult,
@@ -64,6 +70,27 @@ import type {
   WorkingCopySnapshot,
 } from "./types";
 import { invokeOperation } from "./operations";
+import { runWorkspaceMutation } from "./refresh-events";
+export { onWorkspaceMutation } from "./refresh-events";
+export type { WorkspaceMutationEvent, WorkspaceMutationScope } from "./refresh-events";
+
+function invokeMutation<T>(
+  command: string,
+  args: Record<string, unknown>,
+  options: { signal?: AbortSignal } = {},
+): Promise<T> {
+  const request = args.request as Record<string, unknown> | undefined;
+  const repositoryPath = request?.repositoryPath ?? args.repositoryPath ?? args.path;
+  const worktreePath = request?.worktreePath ?? request?.sourceWorktreePath ?? args.worktreePath;
+  const files = ["set_file_staging", "discard_changes", "restore_recovery_point", "apply_patch_hunk", "resolve_conflict"];
+  const inventory = ["register_repository", "clone_repository", "create_repository", "create_worktree", "execute_worktree_action"];
+  return runWorkspaceMutation({
+    machineId: args.machineId as string,
+    impact: files.includes(command) ? "files" : inventory.includes(command) ? "inventory" : "git",
+    ...(typeof repositoryPath === "string" ? { repositoryPath } : {}),
+    ...(typeof worktreePath === "string" && worktreePath ? { worktreePath } : {}),
+  }, () => invokeOperation<T>(command, args, options));
+}
 
 /** Read the repositories the user explicitly added, cloned, or created on one machine. */
 export function loadRegisteredRepositories(machineId: string): Promise<string[]> {
@@ -72,12 +99,12 @@ export function loadRegisteredRepositories(machineId: string): Promise<string[]>
 
 /** Validate an exact repository path on its owning machine, then persist the resolved working copy. */
 export function registerRepository(machineId: string, path: string): Promise<RepositoryRegistrationResult> {
-  return invokeOperation<RepositoryRegistrationResult>("register_repository", { machineId, path });
+  return invokeMutation<RepositoryRegistrationResult>("register_repository", { machineId, path });
 }
 
 /** Remove one exact repository from Repola without changing files or Git data. */
 export function unregisterRepository(machineId: string, repositoryPath: string): Promise<string[]> {
-  return invoke<string[]>("unregister_repository", { machineId, repositoryPath });
+  return runWorkspaceMutation({ machineId, repositoryPath, impact: "inventory" }, () => invoke<string[]>("unregister_repository", { machineId, repositoryPath }));
 }
 
 export function scanWorktrees(
@@ -122,7 +149,7 @@ export function mutatePullRequest(
     draft?: boolean;
   } = {},
 ): Promise<PullRequestMutationResult> {
-  return invokeOperation<PullRequestMutationResult>("mutate_pull_request", {
+  return invokeMutation<PullRequestMutationResult>("mutate_pull_request", {
     machineId,
     request: {
       repositoryPath,
@@ -171,7 +198,7 @@ export function applyPatchHunk(
   expectedHead: string | null,
   selectedLineIndices: number[] = [],
 ): Promise<WorkingCopySnapshot> {
-  return invokeOperation<WorkingCopySnapshot>("apply_patch_hunk", {
+  return invokeMutation<WorkingCopySnapshot>("apply_patch_hunk", {
     machineId,
     request: {
       repositoryPath,
@@ -205,7 +232,7 @@ export function setFileStaging(
   paths: GitPath[],
   staged: boolean,
 ): Promise<WorkingCopySnapshot> {
-  return invokeOperation<WorkingCopySnapshot>("set_file_staging", {
+  return invokeMutation<WorkingCopySnapshot>("set_file_staging", {
     machineId,
     request: { repositoryPath, worktreePath, paths, staged },
   });
@@ -221,7 +248,7 @@ export function resolveConflict(
   expectedContent: string | null = null,
   manualContent: string | null = null,
 ): Promise<WorkingCopySnapshot> {
-  return invokeOperation<WorkingCopySnapshot>("resolve_conflict", {
+  return invokeMutation<WorkingCopySnapshot>("resolve_conflict", {
     machineId,
     request: { repositoryPath, worktreePath, path, kind, expectedHead, expectedContent, manualContent },
   });
@@ -260,7 +287,7 @@ export function discardChanges(
   worktreePath: string,
   plan: DiscardPlan,
 ): Promise<DiscardResult> {
-  return invokeOperation<DiscardResult>("discard_changes", {
+  return invokeMutation<DiscardResult>("discard_changes", {
     machineId,
     request: { repositoryPath, worktreePath, target: plan.target, fingerprint: plan.fingerprint },
   });
@@ -298,7 +325,7 @@ export function restoreRecoveryPoint(
   worktreePath: string,
   plan: RecoveryRestorePlan,
 ): Promise<RecoveryRestoreResult> {
-  return invokeOperation<RecoveryRestoreResult>("restore_recovery_point", {
+  return invokeMutation<RecoveryRestoreResult>("restore_recovery_point", {
     machineId,
     request: {
       repositoryPath,
@@ -330,7 +357,7 @@ export function deleteRecoveryPoints(
   worktreePath: string,
   points: RecoveryPointReference[],
 ): Promise<void> {
-  return invokeOperation<void>("delete_recovery_points", {
+  return invokeMutation<void>("delete_recovery_points", {
     machineId,
     request: { repositoryPath, worktreePath, points },
   });
@@ -344,7 +371,7 @@ export function mutateRepositoryOperation(
   expectedOperation: RepositoryOperation,
   expectedHead: string | null,
 ): Promise<RepositoryOperationMutationResult> {
-  return invokeOperation<RepositoryOperationMutationResult>("mutate_repository_operation", {
+  return invokeMutation<RepositoryOperationMutationResult>("mutate_repository_operation", {
     machineId,
     request: { repositoryPath, worktreePath, action, expectedOperation, expectedHead },
   });
@@ -354,7 +381,7 @@ export function commitWorkingCopy(
   machineId: string,
   request: CommitRequest,
 ): Promise<CommitResult> {
-  return invokeOperation<CommitResult>("commit_working_copy", { machineId, request });
+  return invokeMutation<CommitResult>("commit_working_copy", { machineId, request });
 }
 
 export function generateCommitMessage(
@@ -378,7 +405,7 @@ export function undoLatestCommit(
   worktreePath: string,
   expectedHead: string,
 ): Promise<UndoCommitResult> {
-  return invokeOperation<UndoCommitResult>("undo_commit", {
+  return invokeMutation<UndoCommitResult>("undo_commit", {
     machineId,
     request: { repositoryPath, worktreePath, expectedHead },
   });
@@ -417,7 +444,7 @@ export function mutateHistory(
   kind: HistoryMutationKind,
   target: string,
 ): Promise<HistoryMutationResult> {
-  return invokeOperation<HistoryMutationResult>("mutate_history", {
+  return invokeMutation<HistoryMutationResult>("mutate_history", {
     machineId,
     request: {
       repositoryPath: snapshot.repositoryPath,
@@ -425,6 +452,7 @@ export function mutateHistory(
       kind,
       target,
       expectedHead: snapshot.head,
+      expectedBranch: snapshot.branch,
       expectedChanges: snapshot.changes
         .filter((change) => !change.ignored)
         .map((change) => ({
@@ -458,7 +486,7 @@ export function mutateTag(
   message: string | null,
   expectedTagTarget: string | null,
 ): Promise<TagMutationResult> {
-  return invokeOperation<TagMutationResult>("mutate_tag", {
+  return invokeMutation<TagMutationResult>("mutate_tag", {
     machineId,
     request: {
       repositoryPath: snapshot.repositoryPath,
@@ -508,7 +536,7 @@ export function synchronizeWorkingCopy(
   expectedHead: string | null,
   expectedUpstreamHead: string | null = null,
 ): Promise<SyncResult> {
-  return invokeOperation<SyncResult>("synchronize_working_copy", {
+  return invokeMutation<SyncResult>("synchronize_working_copy", {
     machineId,
     request: { repositoryPath, worktreePath, kind, expectedHead, expectedUpstreamHead },
   });
@@ -534,10 +562,11 @@ export function mutateBranch(
   branch: string,
   startPoint: string | null,
   expectedHead: string | null,
+  expectedBranch: string | null = null,
 ): Promise<BranchMutationResult> {
-  return invokeOperation<BranchMutationResult>("mutate_branch", {
+  return invokeMutation<BranchMutationResult>("mutate_branch", {
     machineId,
-    request: { repositoryPath, worktreePath, kind, branch, startPoint, expectedHead },
+    request: { repositoryPath, worktreePath, kind, branch, startPoint, expectedHead, expectedBranch },
   });
 }
 
@@ -558,7 +587,8 @@ export function executeBranchDeletion(
   plan: BranchDeletionPlan,
   typedConfirmation: string | null,
 ): Promise<BranchDeletionResult> {
-  return invokeOperation<BranchDeletionResult>("execute_branch_deletion", {
+  const scope = { machineId, repositoryPath: plan.repositoryPath, worktreePath: plan.worktreePath, impact: "git" as const };
+  return runWorkspaceMutation(scope, () => invokeOperation<BranchDeletionResult>("execute_branch_deletion", {
     machineId,
     request: {
       request: {
@@ -572,7 +602,7 @@ export function executeBranchDeletion(
       expected: plan.fingerprint,
       typedConfirmation,
     },
-  });
+  }));
 }
 
 export function cloneRepository(
@@ -581,7 +611,7 @@ export function cloneRepository(
   destinationPath: string,
   signal?: AbortSignal,
 ): Promise<RepositoryOperationResult> {
-  return invokeOperation<RepositoryOperationResult>("clone_repository", {
+  return invokeMutation<RepositoryOperationResult>("clone_repository", {
     machineId,
     request: { source, destinationPath },
   }, { signal });
@@ -593,7 +623,7 @@ export function createRepository(
   initialBranch: string,
   signal?: AbortSignal,
 ): Promise<RepositoryOperationResult> {
-  return invokeOperation<RepositoryOperationResult>("create_repository", {
+  return invokeMutation<RepositoryOperationResult>("create_repository", {
     machineId,
     request: { destinationPath, initialBranch },
   }, { signal });
@@ -612,7 +642,7 @@ export function createLinkedWorktree(
   },
   signal?: AbortSignal,
 ): Promise<CreateWorktreeResult> {
-  return invokeOperation<CreateWorktreeResult>("create_worktree", { machineId, request }, { signal });
+  return invokeMutation<CreateWorktreeResult>("create_worktree", { machineId, request }, { signal });
 }
 
 export function loadStashes(
@@ -641,7 +671,7 @@ export function mutateStash(
     expectedHead: string | null;
   },
 ): Promise<StashMutationResult> {
-  return invokeOperation<StashMutationResult>("mutate_stash", { machineId, request });
+  return invokeMutation<StashMutationResult>("mutate_stash", { machineId, request });
 }
 
 export function revealWorktree(path: string): Promise<void> {
@@ -698,7 +728,7 @@ export function prepareWorktreeAction(
 }
 
 export function executeWorktreeAction(machineId: string, plan: ActionPlan): Promise<ActionResult> {
-  return invokeOperation<ActionResult>("execute_worktree_action", {
+  return invokeMutation<ActionResult>("execute_worktree_action", {
     machineId,
     request: {
       kind: plan.kind,
@@ -709,4 +739,42 @@ export function executeWorktreeAction(machineId: string, plan: ActionPlan): Prom
       expectedAffectedPaths: plan.affectedPaths,
     },
   });
+}
+
+export function refreshWorkspace(
+  machineId: string,
+  request: RefreshRequest,
+  signal?: AbortSignal,
+): Promise<RefreshResult> {
+  return invokeOperation<RefreshResult>("refresh_workspace", { machineId, request }, { signal });
+}
+
+export function measureWorktree(
+  machineId: string,
+  repositoryPath: string,
+  worktreePath: string,
+  signal?: AbortSignal,
+): Promise<WorktreeMeasurement> {
+  return invokeOperation<WorktreeMeasurement>("measure_worktree", {
+    machineId,
+    request: { repositoryPath, worktreePath },
+  }, { signal });
+}
+
+/** Install the event listener before activating a subscription. */
+export function replaceWorkspaceWatch(
+  machineId: string,
+  subscriptionId: string,
+  targets: WorkspaceWatchTarget[],
+): Promise<WorkspaceWatchResult> {
+  return invoke<WorkspaceWatchResult>("replace_workspace_watch", { machineId, subscriptionId, targets });
+}
+
+/** A stale effect cleanup cannot stop a newer subscription. */
+export function releaseWorkspaceWatch(subscriptionId: string): Promise<void> {
+  return invoke<void>("release_workspace_watch", { subscriptionId });
+}
+
+export function onWorkspaceChanged(handler: (event: WorkspaceChangedEvent) => void): Promise<() => void> {
+  return listen<WorkspaceChangedEvent>("repola://workspace-changed", (event) => handler(event.payload));
 }

@@ -24,12 +24,13 @@ interface WorktreeRowProps {
   selected: boolean;
   checked: boolean;
   worktree: WorktreeRecord;
+  measurementPending?: boolean;
   onSelect: (id: string) => void;
   onToggleChecked: (id: string) => void;
   onContextMenu: (event: React.MouseEvent, worktree: WorktreeRecord) => void;
 }
 
-export const WorktreeRow = memo(function WorktreeRow({ now, selected, checked, worktree, onSelect, onToggleChecked, onContextMenu }: WorktreeRowProps) {
+export const WorktreeRow = memo(function WorktreeRow({ now, selected, checked, worktree, measurementPending, onSelect, onToggleChecked, onContextMenu }: WorktreeRowProps) {
   const shortPath = useShortPath();
   const ageTimestamp = worktree.lastActivityAtMs;
   const dirty = worktree.status.available && worktree.status.total > 0;
@@ -110,12 +111,12 @@ export const WorktreeRow = memo(function WorktreeRow({ now, selected, checked, w
           worktree.integration.kind === "headNotContained" ? "Not contained" :
             worktree.integration.kind === "notApplicable" ? "—" : "Unknown"}
       </span>
-      {worktree.sizeIncomplete ? (
+      {worktree.sizeIncomplete || measurementPending ? (
         <Tooltip>
           <TooltipTrigger render={<span className="text-right font-mono text-sm tabular-nums" role="cell" tabIndex={0} />}>
-            {formatMeasuredBytes(worktree.sizeBytes, true)}
+            {formatMeasuredBytes(worktree.sizeBytes, worktree.sizeIncomplete)}{measurementPending ? " *" : ""}
           </TooltipTrigger>
-          <TooltipContent>Some files could not be measured; this is a lower bound.</TooltipContent>
+          <TooltipContent>{measurementPending ? "Size is waiting for an update." : "Some files could not be measured; this is a lower bound."}</TooltipContent>
         </Tooltip>
       ) : (
         <span className="text-right font-mono text-sm tabular-nums" role="cell">

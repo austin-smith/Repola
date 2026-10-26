@@ -29,14 +29,16 @@ use worktree::{
     DeleteRecoveryPointsRequest, DiscardPlan, DiscardPlanRequest, DiscardRequest, DiscardResult,
     FileDiff, FileDiffRequest, GenerateCommitMessageRequest, GeneratedCommitMessage,
     HistoryMutationRequest, HistoryMutationResult, HistoryPage, HistoryRequest,
-    PullRequestEvidence, PullRequestMutationRequest, PullRequestMutationResult, RecoveryFileDiff,
-    RecoveryFileDiffRequest, RecoveryPointList, RecoveryPointRequest, RecoveryRestorePlan,
-    RecoveryRestoreRequest, RecoveryRestoreResult, ReflogEntry, ReflogRequest,
-    RepositoryOperationMutationResult, RepositoryOperationRequest, RepositoryOperationResult,
-    ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry,
-    StashMutationRequest, StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo,
-    TagMutationRequest, TagMutationResult, TagRequest, TextGenerationStatus, UndoCommitRequest,
-    UndoCommitResult, WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges, WorktreeWatcher,
+    MeasureWorktreeRequest, PullRequestEvidence, PullRequestMutationRequest,
+    PullRequestMutationResult, RecoveryFileDiff, RecoveryFileDiffRequest, RecoveryPointList,
+    RecoveryPointRequest, RecoveryRestorePlan, RecoveryRestoreRequest, RecoveryRestoreResult,
+    ReflogEntry, ReflogRequest, RefreshRequest, RefreshResult, RepositoryOperationMutationResult,
+    RepositoryOperationRequest, RepositoryOperationResult, ResolveConflictRequest, ScanEvent,
+    ScanRequest, ScanResult, SetFileStagingRequest, StashEntry, StashMutationRequest,
+    StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo, TagMutationRequest,
+    TagMutationResult, TagRequest, TextGenerationStatus, UndoCommitRequest, UndoCommitResult,
+    WatchCoverageError, WorkingCopyRequest, WorkingCopySnapshot, WorkspaceChangeKind,
+    WorkspaceWatchTarget, WorkspaceWatcher, WorktreeChanges, WorktreeMeasurement, WorktreeWatcher,
 };
 
 const WORKTREE_CHANGED_EVENT: &str = "repola://worktree-changed";
@@ -96,6 +98,175 @@ fn unwatch_worktree(watch: tauri::State<'_, WorktreeWatchState>) -> Result<(), S
         .map_err(|_| "The worktree watcher is unavailable.".to_string())?;
     active.take();
     Ok(())
+}
+
+const WORKSPACE_CHANGED_EVENT: &str = "repola://workspace-changed";
+
+#[derive(Default)]
+struct WorkspaceWatchState(Mutex<WorkspaceWatchRegistration>, Mutex<()>);
+
+#[derive(Default)]
+struct WorkspaceWatchRegistration {
+    generation: u64,
+    subscription_id: Option<String>,
+    active: Option<WorkspaceWatcher>,
+}
+
+impl WorkspaceWatchRegistration {
+    fn reserve(&mut self, subscription_id: &str) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.subscription_id = Some(subscription_id.into());
+        self.generation
+    }
+
+    fn is_current(&self, subscription_id: &str, generation: u64) -> bool {
+        self.generation == generation && self.subscription_id.as_deref() == Some(subscription_id)
+    }
+
+    fn release(&mut self, subscription_id: &str) -> Option<WorkspaceWatcher> {
+        if self.subscription_id.as_deref() != Some(subscription_id) {
+            return None;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.subscription_id = None;
+        self.active.take()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceWatchResult {
+    supported: bool,
+    active: bool,
+    subscription_id: String,
+    coverage_errors: Vec<WatchCoverageError>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceChangedPayload {
+    machine_id: String,
+    subscription_id: String,
+    repository_paths: Vec<String>,
+    worktree_paths: Vec<String>,
+    kind: WorkspaceChangeKind,
+}
+
+#[tauri::command]
+async fn replace_workspace_watch(
+    app: tauri::AppHandle,
+    watch: tauri::State<'_, WorkspaceWatchState>,
+    machine_id: String,
+    subscription_id: String,
+    targets: Vec<WorkspaceWatchTarget>,
+) -> Result<WorkspaceWatchResult, String> {
+    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+    let generation = watch
+        .0
+        .lock()
+        .map_err(|_| "The workspace watcher is unavailable.".to_string())?
+        .reserve(&subscription_id);
+    tauri::async_runtime::spawn_blocking(move || {
+        let setup_state = app.state::<WorkspaceWatchState>();
+        // Reserve before waiting, then discard superseded builds without any
+        // directory enumeration. Only one replacement can allocate watches.
+        // Keeping the active watcher live caps transient registrations at
+        // twice the per-inventory budget until replacement is ready.
+        let _setup = setup_state
+            .1
+            .lock()
+            .map_err(|_| "The workspace watcher setup is unavailable.".to_string())?;
+        if !setup_state
+            .0
+            .lock()
+            .map_err(|_| "The workspace watcher is unavailable.".to_string())?
+            .is_current(&subscription_id, generation)
+        {
+            return Ok(WorkspaceWatchResult {
+                supported: machine.kind == MachineKind::Local,
+                active: false,
+                subscription_id,
+                coverage_errors: Vec::new(),
+            });
+        }
+        let emitter = app.clone();
+        let event_subscription_id = subscription_id.clone();
+        let supported = machine.kind == MachineKind::Local;
+        let (new_watcher, coverage_errors) = if supported {
+            let built = WorkspaceWatcher::start(&targets, move |event| {
+                let _ = emitter.emit(
+                    WORKSPACE_CHANGED_EVENT,
+                    WorkspaceChangedPayload {
+                        machine_id: machine_id.clone(),
+                        subscription_id: event_subscription_id.clone(),
+                        repository_paths: event.repository_paths,
+                        worktree_paths: event.worktree_paths,
+                        kind: event.kind,
+                    },
+                );
+            });
+            let (watcher, errors) = match built {
+                Ok(built) => built,
+                Err(error) => {
+                    let state = app.state::<WorkspaceWatchState>();
+                    let previous = {
+                        let mut state = state
+                            .0
+                            .lock()
+                            .map_err(|_| "The workspace watcher is unavailable.".to_string())?;
+                        if state.is_current(&subscription_id, generation) {
+                            state.release(&subscription_id)
+                        } else {
+                            None
+                        }
+                    };
+                    drop(previous);
+                    return Err(error);
+                }
+            };
+            (Some(watcher), errors)
+        } else {
+            (None, Vec::new())
+        };
+        let state = app.state::<WorkspaceWatchState>();
+        let (active, previous) = {
+            let mut state = state
+                .0
+                .lock()
+                .map_err(|_| "The workspace watcher is unavailable.".to_string())?;
+            if state.is_current(&subscription_id, generation) {
+                let previous = std::mem::replace(&mut state.active, new_watcher);
+                (supported, previous)
+            } else {
+                // A newer activation or cleanup has superseded this build.
+                (false, new_watcher)
+            }
+        };
+        drop(previous);
+        Ok(WorkspaceWatchResult {
+            supported,
+            active,
+            subscription_id,
+            coverage_errors,
+        })
+    })
+    .await
+    .map_err(|error| format!("Workspace watcher setup failed: {error}"))?
+}
+
+#[tauri::command]
+async fn release_workspace_watch(
+    watch: tauri::State<'_, WorkspaceWatchState>,
+    subscription_id: String,
+) -> Result<(), String> {
+    let previous = watch
+        .0
+        .lock()
+        .map_err(|_| "The workspace watcher is unavailable.".to_string())?
+        .release(&subscription_id);
+    tauri::async_runtime::spawn_blocking(move || drop(previous))
+        .await
+        .map_err(|error| format!("Workspace watcher cleanup failed: {error}"))
 }
 
 #[tauri::command]
@@ -306,6 +477,60 @@ async fn scan_worktrees(
     .await;
     operations.finish(&operation_id);
     result.map_err(|error| format!("Worktree scan task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn refresh_workspace(
+    app: tauri::AppHandle,
+    operations: tauri::State<'_, OperationRegistry>,
+    machine_id: String,
+    operation_id: String,
+    request: RefreshRequest,
+) -> Result<RefreshResult, String> {
+    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+    let token = operations.begin(&operation_id)?;
+    let request_id = operation_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        match execute_on_machine(
+            &machine,
+            request_id,
+            AgentRequest::RefreshWorktrees { request },
+            token,
+        )? {
+            AgentResult::RefreshWorktrees { result } => Ok(*result),
+            _ => Err("The Repola agent returned an unexpected workspace response.".into()),
+        }
+    })
+    .await;
+    operations.finish(&operation_id);
+    result.map_err(|error| format!("Workspace refresh task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn measure_worktree(
+    app: tauri::AppHandle,
+    operations: tauri::State<'_, OperationRegistry>,
+    machine_id: String,
+    operation_id: String,
+    request: MeasureWorktreeRequest,
+) -> Result<WorktreeMeasurement, String> {
+    let machine = settings::machine(&app, &machine_id).map_err(|error| error.to_string())?;
+    let token = operations.begin(&operation_id)?;
+    let request_id = operation_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        match execute_on_machine(
+            &machine,
+            request_id,
+            AgentRequest::MeasureWorktree { request },
+            token,
+        )? {
+            AgentResult::WorktreeMeasurement { measurement } => Ok(measurement),
+            _ => Err("The Repola agent returned an unexpected measurement response.".into()),
+        }
+    })
+    .await;
+    operations.finish(&operation_id);
+    result.map_err(|error| format!("Worktree measurement task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1816,6 +2041,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(OperationRegistry::default())
         .manage(WorktreeWatchState::default())
+        .manage(WorkspaceWatchState::default())
         .menu(desktop::application_menu)
         .on_menu_event(|app, event| {
             let _ = app.emit("repola://menu-action", event.id().as_ref());
@@ -1881,6 +2107,10 @@ pub fn run() {
             save_workspace_context,
             save_window_state,
             scan_worktrees,
+            refresh_workspace,
+            measure_worktree,
+            replace_workspace_watch,
+            release_workspace_watch,
             set_file_staging,
             synchronize_working_copy,
             test_machine,
@@ -2147,5 +2377,27 @@ mod audit_tests {
                 .expect("branch deletion details")
                 .outcome_unknown
         );
+    }
+}
+
+#[cfg(test)]
+mod workspace_watch_tests {
+    use super::WorkspaceWatchRegistration;
+
+    #[test]
+    fn stale_cleanup_and_out_of_order_activation_cannot_replace_the_current_subscription() {
+        let mut registration = WorkspaceWatchRegistration::default();
+        let first = registration.reserve("first");
+        let second = registration.reserve("second");
+        registration.release("first");
+        assert!(!registration.is_current("first", first));
+        assert!(registration.is_current("second", second));
+        registration.release("second");
+        assert!(!registration.is_current("second", second));
+        let third = registration.reserve("third");
+        assert!(registration.is_current("third", third));
+        let reused = registration.reserve("third");
+        assert!(!registration.is_current("third", third));
+        assert!(registration.is_current("third", reused));
     }
 }

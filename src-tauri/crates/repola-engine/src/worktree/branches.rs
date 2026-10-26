@@ -40,6 +40,9 @@ pub fn mutate_branch(request: BranchMutationRequest) -> Result<BranchMutationRes
     if snapshot.head != request.expected_head {
         return Err("The working-copy HEAD changed after the branch action was reviewed.".into());
     }
+    if snapshot.branch != request.expected_branch {
+        return Err("The working-copy branch changed after the branch action was reviewed. Refresh and review it again.".into());
+    }
     if snapshot.operation.is_some() {
         return Err(
             "Finish or abort the in-progress Git operation before changing branches.".into(),
@@ -243,6 +246,7 @@ mod tests {
             branch: "feature/one".into(),
             start_point: None,
             expected_head: initial.head,
+            expected_branch: initial.branch,
         })
         .expect("create branch");
         assert_eq!(created.snapshot.branch.as_deref(), Some("feature/one"));
@@ -254,6 +258,7 @@ mod tests {
             branch: "feature/renamed".into(),
             start_point: None,
             expected_head: created.snapshot.head,
+            expected_branch: created.snapshot.branch,
         })
         .expect("rename branch");
         assert_eq!(renamed.snapshot.branch.as_deref(), Some("feature/renamed"));
@@ -279,8 +284,62 @@ mod tests {
             branch: main,
             start_point: None,
             expected_head: renamed.snapshot.head,
+            expected_branch: renamed.snapshot.branch,
         })
         .expect_err("occupied branch must be protected");
         assert!(error.contains("already checked out"));
+    }
+
+    #[test]
+    fn rename_rejects_a_branch_switch_at_the_same_head_without_changing_refs() {
+        let repository = initialize_repository();
+        let path = repository.path().to_string_lossy().into_owned();
+        let reviewed = working_copy_snapshot(WorkingCopyRequest {
+            repository_path: path.clone(),
+            worktree_path: path.clone(),
+        })
+        .unwrap();
+        command::successful_git_at(repository.path(), ["switch", "--create", "other"]).unwrap();
+        let refs_before = command::successful_git_at(
+            repository.path(),
+            [
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+            ],
+        )
+        .unwrap()
+        .stdout;
+        for expected_branch in [reviewed.branch.clone(), None] {
+            let error = mutate_branch(BranchMutationRequest {
+                repository_path: path.clone(),
+                worktree_path: path.clone(),
+                kind: BranchMutationKind::Rename,
+                branch: "renamed".into(),
+                start_point: None,
+                expected_head: reviewed.head.clone(),
+                expected_branch,
+            })
+            .expect_err("A stale or missing reviewed branch must be rejected");
+            assert!(error.contains("branch changed"), "{error}");
+            let after = working_copy_snapshot(WorkingCopyRequest {
+                repository_path: path.clone(),
+                worktree_path: path.clone(),
+            })
+            .unwrap();
+            assert_eq!(after.head, reviewed.head);
+            assert_eq!(after.branch.as_deref(), Some("other"));
+            let refs_after = command::successful_git_at(
+                repository.path(),
+                [
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname)",
+                    "refs/heads",
+                ],
+            )
+            .unwrap()
+            .stdout;
+            assert_eq!(refs_after, refs_before);
+        }
     }
 }
