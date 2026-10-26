@@ -7,7 +7,8 @@ import type { CommitChangedFile, FileDiff } from "../ipc/types";
 
 const ipc = vi.hoisted(() => ({ fetchCommitFileDiff: vi.fn() }));
 vi.mock("../ipc/worktrees", () => ipc);
-vi.mock("@pierre/diffs/react", () => ({ PatchDiff: ({ patch }: { patch: string }) => <pre data-testid="patch-diff">{patch}</pre> }));
+// The renderer has its own tests; here it only needs to show which patch it was given.
+vi.mock("./DiffView", () => ({ DiffView: ({ patch }: { patch: string }) => <pre data-testid="patch-diff">{patch}</pre> }));
 
 const commit = "a".repeat(40);
 const file: CommitChangedFile = {
@@ -41,6 +42,7 @@ function renderView(hideWhitespace: boolean) {
             worktreePath="/repo"
             commit={commit}
             file={file}
+            scrollElement={null}
             hideWhitespace={hidden}
             onHideWhitespaceChange={onHideWhitespaceChange}
             controlsElement={controlsElement}
