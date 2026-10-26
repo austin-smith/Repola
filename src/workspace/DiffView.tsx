@@ -36,8 +36,9 @@ export function DiffView({ patch, path, scrollElement }: {
 }) {
   const file = useMemo(() => singleFile(patch), [patch]);
   // A patch that does not parse as exactly one file is shown verbatim, so
-  // nothing in it is ever hidden.
-  if (!file) return <pre className="overflow-x-auto p-3 font-mono text-xs whitespace-pre">{patch}</pre>;
+  // nothing in it is ever hidden. So is one with no hunks (a mode change, a
+  // pure rename, an empty new file): its header lines are the whole change.
+  if (!file || file.hunks.length === 0) return <pre className="overflow-x-auto p-3 font-mono text-xs whitespace-pre">{patch}</pre>;
   return <ParsedDiffView patch={patch} path={path} file={file} scrollElement={scrollElement} />;
 }
 

@@ -158,6 +158,13 @@ describe("DiffView", () => {
     expect(screen.queryByText(/Syntax highlighting/)).not.toBeInTheDocument();
   });
 
+  it("shows a change with no lines, such as a mode change, verbatim", () => {
+    const modeOnly = "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n";
+    renderView({ patch: modeOnly, path: "run.sh" });
+    expect(highlighter.highlightDiff).not.toHaveBeenCalled();
+    expect(document.querySelector("pre")?.textContent).toBe(modeOnly);
+  });
+
   it("shows a patch that is not exactly one file verbatim", () => {
     const raw = "@@ -1 +1 @@\n-a\n+b\n";
     renderView({ patch: raw });
