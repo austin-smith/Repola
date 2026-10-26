@@ -9,6 +9,51 @@ import { buildIdentities, resolveBuildChannel } from "./src/domain/build-identit
 const host = process.env.TAURI_DEV_HOST;
 const STARTUP_JAVASCRIPT_BUDGET_BYTES = 768 * 1024;
 const STARTUP_CSS_BUDGET_BYTES = 128 * 1024;
+const WORKER_JAVASCRIPT_BUDGET_BYTES = 320 * 1024;
+
+/**
+ * Modules `@pierre/diffs` can import but Repola never loads. Its WebAssembly
+ * highlighters are never selected, since the content security policy does
+ * not allow WebAssembly. The worker also never loads grammars or themes
+ * itself; the UI thread resolves them and sends them with each request.
+ */
+const UNUSED_HIGHLIGHTER_MODULES = ["./backends/highlights.js", "@pierre/highlights/themes/loader", "shiki/engine/oniguruma", "shiki/wasm"];
+const UNUSED_WORKER_MODULES = [...UNUSED_HIGHLIGHTER_MODULES, "shiki/langs", "@pierre/theming/themes"];
+const UNUSED_MODULE_PREFIX = "\0repola-unused:";
+
+/** Replaces the given imports made by `@pierre/diffs` with a module that throws, so the build does not emit them. */
+function unusedPierreModules(specifiers: readonly string[]): Plugin {
+  return {
+    name: "repola-unused-pierre-modules",
+    apply: "build",
+    enforce: "pre",
+    resolveId(source, importer) {
+      if (!importer || !/[\\/]@pierre[\\/]diffs[\\/]/.test(importer) || !specifiers.includes(source)) return null;
+      return UNUSED_MODULE_PREFIX + source;
+    },
+    load(id) {
+      if (!id.startsWith(UNUSED_MODULE_PREFIX)) return null;
+      const message = `${id.slice(UNUSED_MODULE_PREFIX.length)} is not available in Repola.`;
+      return `throw new Error(${JSON.stringify(message)});`;
+    },
+  };
+}
+
+/** Keeps the highlighting worker to one file, so nothing it can import is inlined into it unnoticed. */
+function workerBudget(): Plugin {
+  return {
+    name: "repola-worker-budget",
+    generateBundle(_options, bundle) {
+      const chunks = Object.values(bundle).filter((output) => output.type === "chunk");
+      const bytes = chunks.reduce((size, chunk) => size + chunk.code.length, 0);
+      if (chunks.length !== 1 || bytes > WORKER_JAVASCRIPT_BUDGET_BYTES) {
+        throw new Error(
+          `The highlighting worker is ${bytes} bytes in ${chunks.length} files; the Repola budget is ${WORKER_JAVASCRIPT_BUDGET_BYTES} bytes in one file.`,
+        );
+      }
+    },
+  };
+}
 
 function startupBudget(): Plugin {
   return {
@@ -62,7 +107,7 @@ export default defineConfig(async ({ mode }) => {
       transformIndexHtml(html) {
         return html.replace(/%REPOLA_BUILD_CHANNEL%/g, channel).replace(/%REPOLA_APPLICATION_NAME%/g, identity.name);
       },
-    }, startupBudget()],
+    }, unusedPierreModules(UNUSED_HIGHLIGHTER_MODULES), startupBudget()],
     define: {
       "import.meta.env.VITE_REPOLA_RELEASE_CHANNEL": JSON.stringify(channel),
     },
@@ -78,6 +123,9 @@ export default defineConfig(async ({ mode }) => {
       // idle), which exceeded the 5s default under heavy CPU load. This is only
       // a hang detector; tests must not depend on wall-clock timing.
       testTimeout: 20_000,
+    },
+    worker: {
+      plugins: () => [unusedPierreModules(UNUSED_WORKER_MODULES), workerBudget()],
     },
     build: {
       // Shiki grammars are emitted as independently loaded chunks. The largest
