@@ -70,16 +70,16 @@ const change: FileChange = {
 
 // jsdom performs no layout, so the scroll container that windows the diff
 // rows would report a zero-height viewport (the virtualizer reads
-// offsetWidth/offsetHeight). Give it a viewport tall enough to hold every row
+// clientWidth/clientHeight). Give it a viewport tall enough to hold every row
 // so the tests exercise the full list.
-const VIEWPORT = { offsetWidth: 800, offsetHeight: 100_000 };
+const VIEWPORT = { clientWidth: 800, clientHeight: 100_000 };
 
 function ScrollHost({ children }: { children: (scrollElement: HTMLDivElement | null) => React.ReactNode }) {
   const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null);
   return (
     <div
       ref={(element) => {
-        if (element) Object.defineProperties(element, { offsetWidth: { value: VIEWPORT.offsetWidth }, offsetHeight: { value: VIEWPORT.offsetHeight } });
+        if (element) Object.defineProperties(element, { clientWidth: { value: VIEWPORT.clientWidth }, clientHeight: { value: VIEWPORT.clientHeight } });
         setScrollElement(element);
       }}
       style={{ overflow: "auto" }}

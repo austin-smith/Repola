@@ -33,7 +33,7 @@ function ScrollHost({ height, children }: { height: number; children: (scrollEle
     <div
       data-testid="scroller"
       ref={(element) => {
-        if (element) Object.defineProperties(element, { offsetWidth: { value: 800 }, offsetHeight: { value: height } });
+        if (element) Object.defineProperties(element, { clientWidth: { value: 800 }, clientHeight: { value: height } });
         setScrollElement(element);
       }}
     >
