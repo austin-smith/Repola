@@ -1,13 +1,14 @@
 // @vitest-environment node
 // Runs the real highlighter with grammars resolved as the UI thread resolves
-// them, so a change in either fails here rather than silently dropping colors.
+// them and copied as `postMessage` copies them to the worker, so a change in
+// any of these fails here rather than silently dropping colors.
 import { describe, expect, it } from "vitest";
 import type { DiffToken } from "../domain/diff-tokens";
 import { resolveGrammar } from "./highlight-grammar";
 import { tokenizeDiff } from "./tokenize-diff";
 
 const text = (tokens: readonly DiffToken[]) => tokens.map((token) => token.text).join("");
-const tokenize = async (patch: string, path: string) => tokenizeDiff(patch, await resolveGrammar(path));
+const tokenize = async (patch: string, path: string) => tokenizeDiff(patch, structuredClone(await resolveGrammar(path)));
 
 describe("tokenizeDiff", () => {
   it("colors each side's lines for both themes and marks the words that changed", async () => {

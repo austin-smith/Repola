@@ -1,13 +1,13 @@
-import { createBundledHighlighter } from "shiki/core";
-import { createJavaScriptRegexEngine } from "shiki/engine/javascript";
 import {
   attachResolvedLanguages,
   attachResolvedThemes,
+  createHighlighter,
   processPatch,
   renderDiffWithHighlighter,
+  type DiffsHighlighter,
 } from "@pierre/diffs";
 import { lineTokens, type DiffTokens } from "../domain/diff-tokens";
-import { diffThemes, type HighlightGrammar } from "./highlight-grammar";
+import { diffHighlighterType, diffThemes, type HighlightGrammar } from "./highlight-grammar";
 
 /**
  * Lines longer than this are shown as plain text. Matches the other diff
@@ -18,22 +18,13 @@ const TOKENIZE_MAX_LINE_LENGTH = 1_000;
 const MAX_LINE_DIFF_LENGTH = 1_000;
 
 /**
- * A highlighter that bundles no grammars or themes of its own: the worker
- * never loads them itself, so it only ever uses the ones attached from a
- * request, and none of the language catalogue ships in the worker. The
- * JavaScript regex engine needs no WebAssembly, which the app's content
- * security policy does not allow.
+ * The worker's highlighter. It never loads grammars or themes itself; it only
+ * uses the ones attached from each request.
  */
-const createHighlighter = createBundledHighlighter<string, string>({
-  langs: {},
-  themes: {},
-  engine: createJavaScriptRegexEngine,
-});
-
-let highlighter: ReturnType<typeof createHighlighter> | null = null;
+let highlighter: Promise<DiffsHighlighter> | null = null;
 
 function sharedHighlighter() {
-  highlighter ??= createHighlighter({ langs: [], themes: [] });
+  highlighter ??= createHighlighter(diffHighlighterType);
   return highlighter;
 }
 

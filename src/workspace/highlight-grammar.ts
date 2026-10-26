@@ -2,13 +2,21 @@ import {
   getFiletypeFromFileName,
   resolveLanguages,
   resolveThemes,
+  type DiffsTheme,
+  type HighlighterTypes,
   type SupportedLanguages,
-  type ThemeRegistrationResolved,
 } from "@pierre/diffs";
 import type { ResolvedLanguage } from "@pierre/diffs/worker";
 
 /** The themes every diff is highlighted with; tokens carry both, so switching appearance never re-highlights. */
 export const diffThemes = { light: "github-light", dark: "github-dark" } as const;
+
+/**
+ * The highlighter both threads use. Its JavaScript regex engine needs no
+ * WebAssembly, which the app's content security policy does not allow, and
+ * a thread can only run one highlighter type at a time.
+ */
+export const diffHighlighterType: HighlighterTypes = "shiki-js";
 
 /**
  * What the highlighting worker needs for one file: its language, with the
@@ -17,7 +25,7 @@ export const diffThemes = { light: "github-light", dark: "github-dark" } as cons
  */
 export interface HighlightGrammar {
   readonly lang: SupportedLanguages;
-  readonly themes: readonly ThemeRegistrationResolved[];
+  readonly themes: readonly DiffsTheme[];
   readonly languages: readonly ResolvedLanguage[];
 }
 
@@ -28,7 +36,7 @@ export interface HighlightGrammar {
 export async function resolveGrammar(path: string): Promise<HighlightGrammar> {
   const lang = getFiletypeFromFileName(path);
   const [themes, languages] = await Promise.all([
-    resolveThemes([diffThemes.light, diffThemes.dark]),
+    resolveThemes([diffThemes.light, diffThemes.dark], diffHighlighterType),
     resolveLanguages([lang]),
   ]);
   return { lang, themes, languages };
