@@ -148,7 +148,7 @@ describe("release trust preparation", () => {
   });
 
   it("isolates nightly builds from the stable feed", () => {
-    const nightly = planRelease({ ...release, version: "0.1.0", tag: null, runNumber: "10", sourceRef: "refs/heads/main" });
+    const nightly = planRelease({ ...release, version: "0.1.0", tag: null, sequence: "10", sourceRef: "refs/heads/main" });
     const config = buildReleaseConfig({ environment: environment({ GITHUB_REF: nightly.sourceRef }), packageJson: { version: nightly.version }, tauriConfig: { version: nightly.version }, cargoManifest: cargoManifest.replace('version = "0.1.0"', `version = "${nightly.version}"`), release: nightly });
     expect(config.plugins.updater.endpoints).toEqual(["https://austin-smith.github.io/Repola/updates/nightly.json"]);
     expect(config.productName).toBe("Repola (Nightly)");
