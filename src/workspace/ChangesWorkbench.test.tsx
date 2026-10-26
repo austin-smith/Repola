@@ -93,6 +93,28 @@ describe("commit-message generation", () => {
     expect(ipc.fetchWorkingCopy).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    { label: "Commit author name", value: "Author without email", error: "Enter both an author name and email address, or leave both blank to use Git configuration." },
+    { label: "Co-authors", value: "Malformed co-author", error: "Each co-author must use the format Name <email@example.com>, one per line." },
+    { label: "Additional trailers", value: "Malformed trailer", error: "Trailers must use the format Key: value, one per line." },
+  ])("keeps refreshing after invalid $label input prevents a commit", async ({ label, value, error }) => {
+    context.workingCopySnapshot = snapshot;
+    renderWorkbench();
+    await screen.findByRole("button", { name: "Generate commit message" });
+    fireEvent.change(screen.getByPlaceholderText("Summary (required)"), { target: { value: "keep this draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Author, co-authors, trailers, and signing…" }));
+    fireEvent.change(screen.getByLabelText(label), { target: { value } });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Commit 1 file to main" })));
+    expect(screen.getByText(error)).toBeInTheDocument();
+    expect(ipc.commitWorkingCopy).not.toHaveBeenCalled();
+
+    context.workingCopySnapshot = { ...snapshot, changes: [] };
+    await act(async () => refreshWorkbench());
+    expect(screen.getByText("No local changes")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Summary (required)")).toHaveValue("keep this draft");
+    expect(ipc.fetchWorkingCopy).not.toHaveBeenCalled();
+  });
+
   it("invalidates an in-flight diff cache on metadata revision without changing the draft", async () => {
     context.workingCopySnapshot = snapshot;
     renderWorkbench();

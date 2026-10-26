@@ -437,15 +437,13 @@ export function ChangesWorkbench() {
 
   const submitCommit = async (event: FormEvent) => {
     event.preventDefault();
-    mutatingRef.current = true;
-    setCommitBusy(true);
     setError(null);
     try {
       const hasAuthorOverride = authorName.trim() !== "" || authorEmail.trim() !== "";
       if (hasAuthorOverride && (authorName.trim() === "" || authorEmail.trim() === "")) {
         throw new Error("Enter both an author name and email address, or leave both blank to use Git configuration.");
       }
-      const result = await commitWorkingCopy(machineId, {
+      const request = {
         repositoryPath: repository.path,
         worktreePath: worktree.path,
         expectedHead: snapshot?.head ?? null,
@@ -457,7 +455,10 @@ export function ChangesWorkbench() {
         coAuthors: parseCommitPeople(coAuthors, "Each co-author"),
         trailers: parseCommitTrailers(trailers),
         signing,
-      });
+      };
+      mutatingRef.current = true;
+      setCommitBusy(true);
+      const result = await commitWorkingCopy(machineId, request);
       setSnapshot(result.snapshot);
       setCommitSelections(createCommitSelection(result.snapshot.changes));
       setSummary("");
