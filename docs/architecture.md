@@ -70,7 +70,7 @@ The product rename migrates the legacy application-data directory and browser st
 - Repository discovery, status, size, provider lookup, and diff loading are independent cancellable operations.
 - The UI publishes partial inventory results in batches and uses stable keyed records.
 - Change lists and history are windowed or use `content-visibility`; selection state is stored by stable path/commit identity.
-- Diff parsing and expensive syntax work stay outside urgent React updates and can move to workers if measurement shows main-thread pressure.
+- Diff parsing and expensive syntax work stay outside urgent React updates. Syntax highlighting runs on a worker that returns compact per-line tokens: windowed diff rows show plain text at once and take colors when the worker finishes, and diffs too large to highlight, or whose highlighting fails or times out, stay plain text.
 - Remote calls avoid waterfalls: independent capability, repository, and provider requests start together after the minimum context is known.
 - Cached data is labeled with its observation time and never presented as current safety evidence.
 
