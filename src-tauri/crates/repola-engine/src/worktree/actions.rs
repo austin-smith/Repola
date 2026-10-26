@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use super::command;
+use super::command_display::git_command_line;
 use super::discovery::{list_worktrees, repository_context};
 use super::inspection::inspect_worktree;
 use super::models::{
@@ -25,14 +26,6 @@ pub enum ActionError {
 }
 
 pub fn prepare_action(request: ActionRequest) -> Result<ActionPlan, ActionError> {
-    if request.kind == ActionKind::DeleteBranch {
-        let repository = load_repository(&request.repository_path)?;
-        let branch = request
-            .branch
-            .as_deref()
-            .ok_or_else(|| ActionError::Blocked("no branch was named for deletion".to_string()))?;
-        return delete_branch_plan(&repository, branch);
-    }
     let (repository, seed, record) = load_record(&request)?;
     plan_for_record(request.kind, &repository, &seed, &record)
 }
@@ -42,7 +35,6 @@ pub fn execute_action(request: ActionExecutionRequest) -> Result<ActionResult, A
         kind: request.kind,
         repository_path: request.repository_path.clone(),
         worktree_path: request.worktree_path.clone(),
-        branch: request.expected_branch.clone(),
     })?;
     if current_plan.expected_head != request.expected_head
         || current_plan.branch != request.expected_branch
@@ -69,12 +61,6 @@ pub fn execute_action(request: ActionExecutionRequest) -> Result<ActionResult, A
             repository,
             ["worktree", "prune", "--expire=now", "--verbose"],
         ),
-        ActionKind::DeleteBranch => {
-            let branch = current_plan.branch.as_deref().ok_or_else(|| {
-                ActionError::Blocked("no branch was named for deletion".to_string())
-            })?;
-            command::git_at(repository, ["branch", "-d", branch])
-        }
     }
     .map_err(|error| ActionError::Git(error.to_string()))?;
 
@@ -85,14 +71,16 @@ pub fn execute_action(request: ActionExecutionRequest) -> Result<ActionResult, A
     }
 
     let follow_up = match (request.kind, &current_plan.branch) {
-        (ActionKind::Remove, Some(branch)) => Some(FollowUpAction {
-            kind: ActionKind::DeleteBranch,
-            repository_path: request.repository_path.clone(),
-            branch: branch.clone(),
-            description: format!(
-                "Branch {branch} was retained and can now be reviewed for deletion."
-            ),
-        }),
+        (ActionKind::Remove, Some(branch)) => {
+            review_worktree(repository).map(|worktree_path| FollowUpAction {
+                repository_path: request.repository_path.clone(),
+                worktree_path,
+                branch: branch.clone(),
+                description: format!(
+                    "Branch {branch} was retained and can now be reviewed for deletion."
+                ),
+            })
+        }
         _ => None,
     };
 
@@ -109,10 +97,6 @@ pub fn execute_action(request: ActionExecutionRequest) -> Result<ActionResult, A
                 } else {
                     "s"
                 }
-            ),
-            ActionKind::DeleteBranch => format!(
-                "Branch {} deleted with git branch -d.",
-                current_plan.branch.as_deref().unwrap_or("(unknown)")
             ),
         },
         audit_path: None,
@@ -157,78 +141,41 @@ fn plan_for_record(
         ActionKind::Repair => repair_plan(repository, record),
         ActionKind::Unlock => unlock_plan(repository, record),
         ActionKind::PruneRepository => prune_plan(repository, seed, record),
-        ActionKind::DeleteBranch => Err(ActionError::Blocked(
-            "branch deletion is planned per branch, not per worktree".to_string(),
-        )),
     }
 }
 
-fn delete_branch_plan(
-    repository: &RepositoryContext,
-    branch: &str,
-) -> Result<ActionPlan, ActionError> {
-    let branch_ref = format!("refs/heads/{branch}");
-    let tip = command::successful_git_at(&repository.path, ["rev-parse", "--verify", &branch_ref])
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .map_err(|_| {
-            ActionError::Blocked(format!(
-                "branch {branch} no longer exists in this repository"
-            ))
-        })?;
+/// The worktree a retained branch is reviewed from once its own worktree is
+/// gone: the first remaining checkout Git can work in, which is the primary one
+/// when it has one.
+pub(super) fn review_worktree(repository: &Path) -> Option<String> {
+    let common_dir = canonical_git_path(repository, "--git-common-dir")?;
+    list_worktrees(repository)
+        .ok()?
+        .into_iter()
+        .filter(|seed| seed.head.is_some() && seed.prunable_reason.is_none())
+        // A locked worktree is never marked prunable, even once its directory
+        // or its `.git` file is gone. Git run in what is left finds an
+        // enclosing repository, or none.
+        .find(|seed| {
+            let Ok(path) = dunce::canonicalize(&seed.path) else {
+                return false;
+            };
+            canonical_git_path(&path, "--show-toplevel").as_ref() == Some(&path)
+                && canonical_git_path(&path, "--git-common-dir").as_ref() == Some(&common_dir)
+        })
+        .map(|seed| seed.path)
+}
 
-    let seeds = list_worktrees(&repository.path).map_err(ActionError::Repository)?;
-    if let Some(seed) = seeds
-        .iter()
-        .find(|seed| seed.branch.as_deref() == Some(branch))
-    {
-        return Err(ActionError::Blocked(format!(
-            "branch {branch} is still checked out at {}",
-            seed.path
-        )));
+/// The path `git rev-parse --path-format=absolute <option>` prints in
+/// `directory`, canonicalized.
+fn canonical_git_path(directory: &Path, option: &str) -> Option<PathBuf> {
+    let output =
+        command::git_at(directory, ["rev-parse", "--path-format=absolute", option]).ok()?;
+    if !output.status.success() {
+        return None;
     }
-
-    let Some(target) = repository.default_target.as_deref() else {
-        return Err(ActionError::Blocked(
-            "the repository has no default remote target to verify the branch against".to_string(),
-        ));
-    };
-    let contained = command::git_at(
-        &repository.path,
-        ["merge-base", "--is-ancestor", tip.as_str(), target],
-    )
-    .map_err(|error| ActionError::Git(error.to_string()))?;
-    let display_target = target.strip_prefix("refs/remotes/").unwrap_or(target);
-    if !contained.status.success() {
-        return Err(ActionError::Blocked(format!(
-            "the tip of {branch} is not contained in {display_target}. \
-             A squash-merged branch can be integrated without containment; \
-             verify its pull request before deleting the branch manually."
-        )));
-    }
-
-    Ok(ActionPlan {
-        kind: ActionKind::DeleteBranch,
-        title: format!("Delete integrated branch {branch}?"),
-        summary: format!(
-            "Every commit on {branch} is contained in {display_target}. Git will delete only the local branch ref with branch -d, which refuses unmerged work."
-        ),
-        repository_path: repository.path.to_string_lossy().into_owned(),
-        worktree_path: String::new(),
-        branch: Some(branch.to_string()),
-        expected_head: Some(tip),
-        command_display: format!(
-            "git -C {} branch -d {}",
-            shell_quote(&repository.path.to_string_lossy()),
-            shell_quote(branch)
-        ),
-        affected_paths: vec![branch_ref],
-        warnings: vec![
-            "No worktree directories or remote branches are touched. This app never passes -D."
-                .to_string(),
-        ],
-        confirmation_text: "DELETE".to_string(),
-        destructive: true,
-    })
+    let printed = String::from_utf8(output.stdout).ok()?;
+    dunce::canonicalize(printed.strip_suffix('\n')?).ok()
 }
 
 fn remove_plan(
@@ -282,7 +229,7 @@ fn remove_plan(
         worktree_path: record.path.clone(),
         branch: record.branch.clone(),
         expected_head: record.head.clone(),
-        command_display: format!("git -C {} worktree remove {}", shell_quote(&repository.path.to_string_lossy()), shell_quote(&record.path)),
+        command_display: git_command_line(&repository.path, ["worktree", "remove", record.path.as_str()]),
         affected_paths: vec![record.path.clone()],
         warnings,
         confirmation_text: "REMOVE".to_string(),
@@ -308,10 +255,9 @@ fn repair_plan(
         worktree_path: record.path.clone(),
         branch: record.branch.clone(),
         expected_head: record.head.clone(),
-        command_display: format!(
-            "git -C {} worktree repair {}",
-            shell_quote(&repository.path.to_string_lossy()),
-            shell_quote(&record.path)
+        command_display: git_command_line(
+            &repository.path,
+            ["worktree", "repair", record.path.as_str()],
         ),
         affected_paths: vec![record.path.clone()],
         warnings: vec!["No working-tree files will be deleted.".to_string()],
@@ -338,10 +284,9 @@ fn unlock_plan(
         worktree_path: record.path.clone(),
         branch: record.branch.clone(),
         expected_head: record.head.clone(),
-        command_display: format!(
-            "git -C {} worktree unlock {}",
-            shell_quote(&repository.path.to_string_lossy()),
-            shell_quote(&record.path)
+        command_display: git_command_line(
+            &repository.path,
+            ["worktree", "unlock", record.path.as_str()],
         ),
         affected_paths: vec![record.path.clone()],
         warnings: vec!["Unlocking does not remove files or metadata.".to_string()],
@@ -379,14 +324,10 @@ fn prune_plan(
         worktree_path: record.path.clone(),
         branch: record.branch.clone(),
         expected_head: record.head.clone(),
-        command_display: format!("git -C {} worktree prune --expire=now --verbose", shell_quote(&repository.path.to_string_lossy())),
+        command_display: git_command_line(&repository.path, ["worktree", "prune", "--expire=now", "--verbose"]),
         affected_paths,
         warnings: vec!["This is repository-wide. Review every affected path below.".to_string()],
         confirmation_text: "PRUNE".to_string(),
         destructive: true,
     })
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }

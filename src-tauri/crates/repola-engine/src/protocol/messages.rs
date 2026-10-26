@@ -2,11 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::worktree::{
     ActionExecutionRequest, ActionPlan, ActionRequest, ActionResult, ApplyPatchHunkRequest,
-    BranchInfo, BranchMutationRequest, BranchMutationResult, BranchRequest, CloneRepositoryRequest,
-    CommitChangedFile, CommitFileDiffRequest, CommitFilesRequest, CommitRequest, CommitResult,
-    ConflictFile, ConflictFileRequest, CreateRepositoryRequest, CreateWorktreeRequest,
-    CreateWorktreeResult, DeleteRecoveryPointsRequest, DiffDisplayOptions, DiscardPlan,
-    DiscardPlanRequest, DiscardRequest, DiscardResult, FileDiff, FileDiffRequest,
+    BranchDeletionExecutionRequest, BranchDeletionPlan, BranchDeletionRequest,
+    BranchDeletionResult, BranchInfo, BranchMutationRequest, BranchMutationResult, BranchRequest,
+    CloneRepositoryRequest, CommitChangedFile, CommitFileDiffRequest, CommitFilesRequest,
+    CommitRequest, CommitResult, ConflictFile, ConflictFileRequest, CreateRepositoryRequest,
+    CreateWorktreeRequest, CreateWorktreeResult, DeleteRecoveryPointsRequest, DiffDisplayOptions,
+    DiscardPlan, DiscardPlanRequest, DiscardRequest, DiscardResult, FileDiff, FileDiffRequest,
     GenerateCommitMessageRequest, GeneratedCommitMessage, HistoryMutationRequest,
     HistoryMutationResult, HistoryPage, HistoryRequest, MeasureWorktreeRequest,
     PullRequestEvidence, PullRequestMutationRequest, PullRequestMutationResult, RecoveryFileDiff,
@@ -20,7 +21,7 @@ use crate::worktree::{
     WorkingCopySnapshot, WorktreeChanges, WorktreeMeasurement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 22;
+pub const PROTOCOL_VERSION: u16 = 23;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -129,6 +130,12 @@ pub enum AgentRequest {
     },
     MutateBranch {
         request: BranchMutationRequest,
+    },
+    PrepareBranchDeletion {
+        request: BranchDeletionRequest,
+    },
+    ExecuteBranchDeletion {
+        request: BranchDeletionExecutionRequest,
     },
     CloneRepository {
         request: CloneRepositoryRequest,
@@ -304,6 +311,12 @@ pub enum AgentResult {
     BranchMutation {
         result: BranchMutationResult,
     },
+    BranchDeletionPlan {
+        plan: Box<BranchDeletionPlan>,
+    },
+    BranchDeletion {
+        result: Box<BranchDeletionResult>,
+    },
     RepositoryOperation {
         result: RepositoryOperationResult,
     },
@@ -458,6 +471,66 @@ mod tests {
     }
 
     #[test]
+    fn branch_deletion_requests_have_a_stable_json_contract() {
+        let request = AgentRequest::ExecuteBranchDeletion {
+            request: crate::worktree::BranchDeletionExecutionRequest {
+                request: BranchDeletionRequest {
+                    repository_path: "/work/repository".into(),
+                    worktree_path: "/work/repository".into(),
+                    branch_ref: "refs/heads/feature".into(),
+                    delete_local: true,
+                    delete_remote: true,
+                },
+                force: false,
+                expected: crate::worktree::BranchDeletionFingerprint {
+                    local_tip: Some("a".repeat(40)),
+                    merge_reference_oid: Some("b".repeat(40)),
+                    requires_force: false,
+                    remote: Some("origin".into()),
+                    remote_ref: Some("refs/heads/feature".into()),
+                    remote_oid: Some("a".repeat(40)),
+                    pull_requests: Some(vec!["octo/app#42".into()]), more_pull_requests: false,
+                    push_destination: Some("e".repeat(64)),
+                    local_reachability: Some("c".repeat(64)),
+                    remote_reachability: Some("d".repeat(64)),
+                    commands: vec!["git -C /work/repository update-ref --no-deref -d refs/heads/feature aaaa".into()],
+                    warnings: vec!["2 commits on origin/feature are on no ref, stash entry, or worktree HEAD that remains in this repository.".into()],
+                    confirmation: crate::worktree::BranchDeletionConfirmation::TypeBranchName,
+                },
+                typed_confirmation: Some("feature".into()),
+            },
+        };
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(value["type"], "executeBranchDeletion");
+        assert_eq!(
+            value["request"]["request"]["branchRef"],
+            "refs/heads/feature"
+        );
+        assert_eq!(value["request"]["request"]["deleteRemote"], true);
+        assert_eq!(
+            value["request"]["expected"]["confirmation"],
+            "typeBranchName"
+        );
+        assert_eq!(value["request"]["typedConfirmation"], "feature");
+        assert_eq!(
+            value["request"]["expected"]["remoteReachability"],
+            "d".repeat(64)
+        );
+        let decoded: AgentRequest = serde_json::from_value(value).expect("decode request");
+        let AgentRequest::ExecuteBranchDeletion { request: decoded } = decoded else {
+            panic!("wrong request type")
+        };
+        assert_eq!(decoded.expected.remote.as_deref(), Some("origin"));
+        assert_eq!(
+            decoded.expected.remote_reachability.as_deref(),
+            Some("d".repeat(64).as_str())
+        );
+        assert_eq!(decoded.expected.commands.len(), 1);
+        assert_eq!(decoded.expected.warnings.len(), 1);
+        assert!(decoded.request.delete_local);
+    }
+
+    #[test]
     fn handshake_request_has_a_stable_golden_json_contract() {
         let request = RequestEnvelope::current(
             "golden-1",
@@ -470,7 +543,7 @@ mod tests {
         let json = serde_json::to_string(&request).expect("serialize request");
         assert_eq!(
             json,
-            r#"{"protocolVersion":22,"requestId":"golden-1","request":{"type":"handshake","clientVersion":"0.1.0","minimumProtocolVersion":22,"maximumProtocolVersion":22}}"#
+            r#"{"protocolVersion":23,"requestId":"golden-1","request":{"type":"handshake","clientVersion":"0.1.0","minimumProtocolVersion":23,"maximumProtocolVersion":23}}"#
         );
 
         let with_future_field = json.replace(
@@ -555,7 +628,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&file).expect("serialize discard"),
             format!(
-                r#"{{"protocolVersion":22,"requestId":"golden-2","request":{{"type":"discard","request":{{"repositoryPath":"/repo","worktreePath":"/repo","target":{{"kind":"file","path":{{"display":"a.txt","token":"612e747874"}},"scope":"unstaged"}},"fingerprint":"{}"}}}}}}"#,
+                r#"{{"protocolVersion":23,"requestId":"golden-2","request":{{"type":"discard","request":{{"repositoryPath":"/repo","worktreePath":"/repo","target":{{"kind":"file","path":{{"display":"a.txt","token":"612e747874"}},"scope":"unstaged"}},"fingerprint":"{}"}}}}}}"#,
                 "f".repeat(64)
             )
         );

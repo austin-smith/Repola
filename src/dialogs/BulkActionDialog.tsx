@@ -8,15 +8,22 @@ import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
-import type { ActionPlan } from "../ipc/types";
+import { deletionNotice } from "../domain/branch-deletion";
+import type { BranchDeletionResult } from "../ipc/types";
 
 export interface BulkItem {
   key: string;
   title: string;
   subtitle: string;
   sizeLabel?: string;
-  plan: ActionPlan | null;
+  /** The reviewed command, or null when the item could not be reviewed. */
+  command: string | null;
+  warnings: string[];
   error: string | null;
+  /** The action was interrupted after it started, so it may have completed anyway. */
+  unconfirmed?: boolean;
+  /** A finished branch deletion, reported as the single-deletion dialog reports it. */
+  deletion?: BranchDeletionResult;
   done: boolean;
 }
 
@@ -35,7 +42,11 @@ interface BulkActionDialogProps {
 }
 
 function itemBadge(item: BulkItem, stage: BulkStage) {
+  if (item.done && item.deletion && deletionNotice(item.deletion).type === "warning") {
+    return <Badge variant="warning">Done with warnings</Badge>;
+  }
   if (item.done) return <Badge variant="success">Done</Badge>;
+  if (item.unconfirmed) return <Badge variant="warning">Unconfirmed</Badge>;
   if (item.error) return <Badge variant="destructive">{stage === "review" ? "Blocked" : "Failed"}</Badge>;
   if (stage === "review") return <Badge variant="secondary">Ready</Badge>;
   return <Badge variant="ghost">Pending…</Badge>;
@@ -56,10 +67,11 @@ export function BulkActionDialog({
   const inputRef = useRef<HTMLInputElement>(null);
   const busy = stage === "running";
 
-  const readyCount = items.filter((item) => item.plan && !item.error && !item.done).length;
+  const readyCount = items.filter((item) => item.command !== null && !item.error && !item.done).length;
   const doneCount = items.filter((item) => item.done).length;
   const failedCount = items.filter((item) => item.error).length;
-  const warnings = Array.from(new Set(items.flatMap((item) => item.plan?.warnings ?? [])));
+  const unconfirmedCount = items.filter((item) => item.unconfirmed).length;
+  const warnings = Array.from(new Set(items.flatMap((item) => item.warnings)));
   const confirmed = confirmation === confirmationText;
 
   return (
@@ -72,7 +84,9 @@ export function BulkActionDialog({
             </div>
             <div className="flex min-w-0 flex-col gap-1 wrap-anywhere">
               <span className="text-xs font-medium tracking-widest text-muted-foreground uppercase">
-                {stage === "done" ? `${doneCount} completed · ${failedCount} not completed` : "Batch preflight complete"}
+                {stage === "done"
+                  ? [`${doneCount} completed`, `${failedCount - unconfirmedCount} not completed`, unconfirmedCount > 0 && `${unconfirmedCount} unconfirmed`].filter(Boolean).join(" · ")
+                  : "Batch preflight complete"}
               </span>
               <DialogTitle>{title}</DialogTitle>
             </div>
@@ -91,9 +105,10 @@ export function BulkActionDialog({
                 </div>
                 <code className="font-mono text-xs break-all text-muted-foreground">{item.subtitle}</code>
                 {item.error && <p className="text-xs wrap-anywhere text-destructive">{item.error}</p>}
-                {!item.error && item.plan && (
+                {item.deletion ? <DeletionOutcome deletion={item.deletion} /> : null}
+                {!item.error && item.command !== null && (
                   <code className="border-l-2 border-foreground bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap break-all">
-                    {item.plan.commandDisplay}
+                    {item.command}
                   </code>
                 )}
               </div>
@@ -140,4 +155,11 @@ export function BulkActionDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+/** What a finished branch deletion left to do and how to restore it, as the single deletion reports it. */
+function DeletionOutcome({ deletion }: { deletion: BranchDeletionResult }) {
+  const { type, description } = deletionNotice(deletion);
+  if (!description) return null;
+  return <p className={`text-xs wrap-anywhere ${type === "warning" ? "text-warning" : "text-muted-foreground"}`}>{description}</p>;
 }

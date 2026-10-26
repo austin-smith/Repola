@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invokeOperation } from "./operations";
 import { onWorkspaceMutation, type WorkspaceMutationEvent } from "./refresh-events";
-import { mutateBranch, mutateHistory, createRepository, deleteRecoveryPoints, discardChanges, planDiscard, planRecoveryRestore, registerRepository, restoreRecoveryPoint, setFileStaging, synchronizeWorkingCopy, unregisterRepository } from "./worktrees";
+import { executeBranchDeletion, mutateBranch, mutateHistory, prepareBranchDeletionReview, createRepository, deleteRecoveryPoints, discardChanges, planDiscard, planRecoveryRestore, registerRepository, restoreRecoveryPoint, setFileStaging, synchronizeWorkingCopy, unregisterRepository } from "./worktrees";
 import { invoke } from "@tauri-apps/api/core";
-import type { DiscardPlan, RecoveryRestorePlan, WorkingCopySnapshot } from "./types";
+import type { BranchDeletionPlan, DiscardPlan, RecoveryRestorePlan, WorkingCopySnapshot } from "./types";
 
 vi.mock("./operations", () => ({ invokeOperation: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), Channel: class {} }));
@@ -85,6 +85,35 @@ describe("mutation IPC refresh scope", () => {
         { phase: "start", machineId: "local", repositoryPath: "repo", worktreePath: "tree", impact: "files" },
         { phase: "settled", machineId: "local", repositoryPath: "repo", worktreePath: "tree", impact: "files" },
       ]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("refreshes a branch deletion's repository once it settles, even when its outcome is unknown", async () => {
+    const events: WorkspaceMutationEvent[] = [];
+    const unsubscribe = onWorkspaceMutation((event) => { events.push(event); });
+    const plan: BranchDeletionPlan = {
+      repositoryPath: "repo", worktreePath: "tree", branchRef: "refs/heads/old", branchName: "old",
+      deleteLocal: true, deleteRemote: true, local: null, remote: null, remoteUnavailableReason: null,
+      requiresForce: false, confirmation: "confirm", commands: [], warnings: [], blockers: [],
+      fingerprint: {
+        localTip: "abc", mergeReferenceOid: null, requiresForce: false, remote: "origin", remoteRef: "refs/heads/old", remoteOid: "abc",
+        pullRequests: null, morePullRequests: false, pushDestination: null, localReachability: null, remoteReachability: null,
+        commands: [], warnings: [], confirmation: "confirm",
+      },
+    };
+    try {
+      await prepareBranchDeletionReview("local", { repositoryPath: "repo", worktreePath: "tree", branchRef: "refs/heads/old", deleteLocal: true, deleteRemote: true });
+      expect(events).toEqual([]);
+
+      const failure = new Error("The SSH connection closed.");
+      vi.mocked(invokeOperation).mockImplementation(() => {
+        expect(events).toEqual([{ phase: "start", machineId: "local", repositoryPath: "repo", worktreePath: "tree", impact: "git" }]);
+        return Promise.reject(failure);
+      });
+      await expect(executeBranchDeletion("local", plan, null)).rejects.toBe(failure);
+      expect(events[1]).toEqual({ ...events[0], phase: "settled" });
     } finally {
       unsubscribe();
     }
