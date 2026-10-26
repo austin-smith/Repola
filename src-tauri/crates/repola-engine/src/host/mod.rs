@@ -27,6 +27,8 @@ pub enum HostError {
     },
     #[error("The operation on {machine:?} exceeded its {seconds}-second deadline.")]
     Timeout { machine: String, seconds: u64 },
+    #[error("{machine:?} has not finished the change after {minutes} minutes. It may still finish there, so check the working copy and Discarded Changes before trying again.")]
+    Unconfirmed { machine: String, minutes: u64 },
     #[error("The operation on {0:?} was cancelled.")]
     Cancelled(String),
     #[error("SSH transport failed: {0}")]
