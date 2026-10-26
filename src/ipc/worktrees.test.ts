@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invokeOperation } from "./operations";
 import { onWorkspaceMutation, type WorkspaceMutationEvent } from "./refresh-events";
-import { mutateBranch, mutateHistory, createRepository, registerRepository, setFileStaging, synchronizeWorkingCopy, unregisterRepository } from "./worktrees";
+import { mutateBranch, mutateHistory, createRepository, deleteRecoveryPoints, discardChanges, planDiscard, planRecoveryRestore, registerRepository, restoreRecoveryPoint, setFileStaging, synchronizeWorkingCopy, unregisterRepository } from "./worktrees";
 import { invoke } from "@tauri-apps/api/core";
-import type { WorkingCopySnapshot } from "./types";
+import type { DiscardPlan, RecoveryRestorePlan, WorkingCopySnapshot } from "./types";
 
 vi.mock("./operations", () => ({ invokeOperation: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), Channel: class {} }));
@@ -40,13 +40,50 @@ describe("mutation IPC refresh scope", () => {
       await synchronizeWorkingCopy("remote", "repo", "tree", "fetch", "abc");
       await createRepository("remote", "destination", "main");
       await registerRepository("local", "exact path");
+      await deleteRecoveryPoints("local", "repo", "tree", []);
       vi.mocked(invoke).mockRejectedValueOnce(failure);
       await expect(unregisterRepository("local", "repo")).rejects.toBe(failure);
       expect(events.filter((event) => event.phase === "settled")).toEqual([
         { phase: "settled", machineId: "remote", repositoryPath: "repo", worktreePath: "tree", impact: "git" },
         { phase: "settled", machineId: "remote", impact: "inventory" },
         { phase: "settled", machineId: "local", repositoryPath: "exact path", impact: "inventory" },
+        { phase: "settled", machineId: "local", repositoryPath: "repo", worktreePath: "tree", impact: "git" },
         { phase: "settled", machineId: "local", repositoryPath: "repo", impact: "inventory" },
+      ]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it.each(["discard", "restore"] as const)("fences reads only while a reviewed %s executes and reconciles partial failures", async (kind) => {
+    const events: WorkspaceMutationEvent[] = [];
+    const unsubscribe = onWorkspaceMutation((event) => { events.push(event); });
+    const discard: DiscardPlan = { target: { kind: "all" }, entries: [], omitted: 0, kept: [], keptOmitted: 0, backupBytes: 0, fingerprint: "reviewed" };
+    const restore: RecoveryRestorePlan = {
+      point: { id: "saved", oid: "abc", kind: "discardAll", summary: "Saved changes", createdAt: "2026-10-01T00:00:00Z", worktreePath: "tree", head: "abc", pathCount: 0, paths: [], storedBytes: 0 },
+      entries: [], omitted: 0, fingerprint: "reviewed",
+    };
+    try {
+      if (kind === "discard") await planDiscard("local", "repo", "tree", discard.target);
+      else await planRecoveryRestore("local", "repo", "tree", restore.point);
+      expect(events).toEqual([]);
+
+      let reject!: (error: Error) => void;
+      const pending = new Promise<never>((_resolve, fail) => { reject = fail; });
+      vi.mocked(invokeOperation).mockImplementation(() => {
+        expect(events).toEqual([{ phase: "start", machineId: "local", repositoryPath: "repo", worktreePath: "tree", impact: "files" }]);
+        return pending;
+      });
+      const operation = kind === "discard"
+        ? discardChanges("local", "repo", "tree", discard)
+        : restoreRecoveryPoint("local", "repo", "tree", restore);
+      const failure = new Error("files changed before the operation failed");
+      const assertion = expect(operation).rejects.toBe(failure);
+      reject(failure);
+      await assertion;
+      expect(events).toEqual([
+        { phase: "start", machineId: "local", repositoryPath: "repo", worktreePath: "tree", impact: "files" },
+        { phase: "settled", machineId: "local", repositoryPath: "repo", worktreePath: "tree", impact: "files" },
       ]);
     } finally {
       unsubscribe();

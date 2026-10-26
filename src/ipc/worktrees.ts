@@ -16,7 +16,9 @@ import type {
   CreateWorktreeResult,
   ConflictResolutionKind,
   ConflictFile,
-  DiscardScope,
+  DiscardPlan,
+  DiscardResult,
+  DiscardTarget,
   BranchInfo,
   BranchMutationKind,
   BranchMutationResult,
@@ -37,6 +39,11 @@ import type {
   PullRequestMutationKind,
   PullRequestMutationResult,
   PullRequestSummary,
+  RecoveryFileDiff,
+  RecoveryPointList,
+  RecoveryPointReference,
+  RecoveryRestorePlan,
+  RecoveryRestoreResult,
   RepositoryOperationResult,
   RepositoryRegistrationResult,
   ReflogEntry,
@@ -72,7 +79,7 @@ function invokeMutation<T>(
   const request = args.request as Record<string, unknown> | undefined;
   const repositoryPath = request?.repositoryPath ?? args.repositoryPath ?? args.path;
   const worktreePath = request?.worktreePath ?? request?.sourceWorktreePath ?? args.worktreePath;
-  const files = ["set_file_staging", "discard_file", "discard_all", "apply_patch_hunk", "resolve_conflict"];
+  const files = ["set_file_staging", "discard_changes", "restore_recovery_point", "apply_patch_hunk", "resolve_conflict"];
   const inventory = ["register_repository", "clone_repository", "create_repository", "create_worktree", "execute_worktree_action"];
   return runWorkspaceMutation({
     machineId: args.machineId as string,
@@ -257,47 +264,99 @@ export function loadConflictFile(
   }, { signal });
 }
 
-export function discardFile(
+export function planDiscard(
   machineId: string,
   repositoryPath: string,
   worktreePath: string,
-  change: WorkingCopySnapshot["changes"][number],
-  scope: DiscardScope,
-  expectedHead: string | null,
-): Promise<WorkingCopySnapshot> {
-  return invokeMutation<WorkingCopySnapshot>("discard_file", {
+  target: DiscardTarget,
+  signal?: AbortSignal,
+): Promise<DiscardPlan> {
+  return invokeOperation<DiscardPlan>("plan_discard", {
+    machineId,
+    request: { repositoryPath, worktreePath, target },
+  }, { signal });
+}
+
+/** Execute a reviewed discard; the engine refuses unless the working copy still matches `plan.fingerprint`. */
+export function discardChanges(
+  machineId: string,
+  repositoryPath: string,
+  worktreePath: string,
+  plan: DiscardPlan,
+): Promise<DiscardResult> {
+  return invokeMutation<DiscardResult>("discard_changes", {
+    machineId,
+    request: { repositoryPath, worktreePath, target: plan.target, fingerprint: plan.fingerprint },
+  });
+}
+
+export function loadRecoveryPoints(
+  machineId: string,
+  repositoryPath: string,
+  worktreePath: string,
+  signal?: AbortSignal,
+): Promise<RecoveryPointList> {
+  return invokeOperation<RecoveryPointList>("load_recovery_points", {
+    machineId,
+    request: { repositoryPath, worktreePath },
+  }, { signal });
+}
+
+export function planRecoveryRestore(
+  machineId: string,
+  repositoryPath: string,
+  worktreePath: string,
+  point: RecoveryPointReference,
+  signal?: AbortSignal,
+): Promise<RecoveryRestorePlan> {
+  return invokeOperation<RecoveryRestorePlan>("plan_recovery_restore", {
+    machineId,
+    request: { repositoryPath, worktreePath, point },
+  }, { signal });
+}
+
+/** Restore a reviewed recovery point; whatever it replaces is saved as a new recovery point first. */
+export function restoreRecoveryPoint(
+  machineId: string,
+  repositoryPath: string,
+  worktreePath: string,
+  plan: RecoveryRestorePlan,
+): Promise<RecoveryRestoreResult> {
+  return invokeMutation<RecoveryRestoreResult>("restore_recovery_point", {
     machineId,
     request: {
       repositoryPath,
       worktreePath,
-      path: change.path,
-      scope,
-      expectedHead,
-      expectedIndexStatus: change.indexStatus,
-      expectedWorktreeStatus: change.worktreeStatus,
+      point: { id: plan.point.id, oid: plan.point.oid },
+      fingerprint: plan.fingerprint,
     },
   });
 }
 
-export function discardAll(
+export function loadRecoveryFileDiff(
   machineId: string,
-  snapshot: WorkingCopySnapshot,
-): Promise<WorkingCopySnapshot> {
-  return invokeMutation<WorkingCopySnapshot>("discard_all", {
+  repositoryPath: string,
+  worktreePath: string,
+  point: RecoveryPointReference,
+  path: GitPath,
+  signal?: AbortSignal,
+): Promise<RecoveryFileDiff> {
+  return invokeOperation<RecoveryFileDiff>("load_recovery_file_diff", {
     machineId,
-    request: {
-      repositoryPath: snapshot.repositoryPath,
-      worktreePath: snapshot.worktreePath,
-      expectedHead: snapshot.head,
-      expectedChanges: snapshot.changes
-        .filter((change) => !change.ignored)
-        .map((change) => ({
-          pathToken: change.path.token,
-          previousPathToken: change.previousPath?.token ?? null,
-          indexStatus: change.indexStatus,
-          worktreeStatus: change.worktreeStatus,
-        })),
-    },
+    request: { repositoryPath, worktreePath, point, path },
+  }, { signal });
+}
+
+/** Delete the reviewed recovery points in one transaction. */
+export function deleteRecoveryPoints(
+  machineId: string,
+  repositoryPath: string,
+  worktreePath: string,
+  points: RecoveryPointReference[],
+): Promise<void> {
+  return invokeMutation<void>("delete_recovery_points", {
+    machineId,
+    request: { repositoryPath, worktreePath, points },
   });
 }
 

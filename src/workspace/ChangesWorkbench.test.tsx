@@ -37,6 +37,20 @@ vi.mock("./lazy", () => ({
     ipc.observeCache(cache);
     return <input type="checkbox" aria-label="Select diff line" disabled={selectionDisabled} />;
   },
+  DiscardDialog: ({ change, onBusyChange }: { change: { path: { display: string } } | null; onBusyChange: (busy: boolean) => void }) => (
+    <div role="dialog" aria-label="Discard review">
+      {change ? change.path.display : "every change"}
+      <button type="button" onClick={() => onBusyChange(true)}>Start discard</button>
+      <button type="button" onClick={() => onBusyChange(false)}>End discard</button>
+    </div>
+  ),
+  DiscardedChangesDialog: ({ initialPointId, onBusyChange }: { initialPointId: string | null; onBusyChange: (busy: boolean) => void }) => (
+    <div role="dialog" aria-label="Discarded changes">
+      {initialPointId ?? "no point"}
+      <button type="button" onClick={() => onBusyChange(true)}>Start restore</button>
+      <button type="button" onClick={() => onBusyChange(false)}>End restore</button>
+    </div>
+  ),
 }));
 
 const snapshot: WorkingCopySnapshot = {
@@ -164,7 +178,58 @@ describe("commit-message generation", () => {
     expect(screen.getByRole("menuitem", { name: "Stashes" })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: "Force push…" })).not.toBeInTheDocument();
     await act(async () => fireEvent.click(screen.getByRole("menuitem", { name: "Discard all changes…" })));
-    expect(screen.getByRole("dialog", { name: "Discard all 1 changed files?" })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Discard review" })).toHaveTextContent("every change");
+  });
+
+  it("holds coordinated snapshots back while a discard runs and applies them once it ends", async () => {
+    context.workingCopySnapshot = snapshot;
+    await act(async () => { renderWorkbench(); });
+    fireEvent.change(screen.getByPlaceholderText("Summary (required)"), { target: { value: "keep discard draft" } });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "More change actions" })));
+    await act(async () => fireEvent.click(screen.getByRole("menuitem", { name: "Discard all changes…" })));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Start discard" })));
+    context.workingCopySnapshot = { ...snapshot, changes: [] };
+    await act(async () => refreshWorkbench());
+    expect(screen.queryByText("No local changes")).not.toBeInTheDocument();
+    // Both success and failure settle the busy state before accepting refreshes.
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "End discard" })));
+    expect(screen.getByText("No local changes")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Summary (required)")).toHaveValue("keep discard draft");
+    expect(ipc.fetchWorkingCopy).not.toHaveBeenCalled();
+  });
+
+  it("queues recovery snapshots while restoring and preserves the commit draft", async () => {
+    context.workingCopySnapshot = snapshot;
+    await act(async () => { renderWorkbench(); });
+    fireEvent.change(screen.getByPlaceholderText("Summary (required)"), { target: { value: "keep recovery draft" } });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "More change actions" })));
+    await act(async () => fireEvent.click(screen.getByRole("menuitem", { name: "Discarded changes…" })));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Start restore" })));
+    context.workingCopySnapshot = { ...snapshot, branch: "restored", head: "restored-head" };
+    await act(async () => refreshWorkbench());
+    expect(screen.getByRole("button", { name: "Commit 1 file to main" })).toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "End restore" })));
+    expect(screen.getByRole("button", { name: "Commit 1 file to restored" })).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Summary (required)")).toHaveValue("keep recovery draft");
+    expect(ipc.fetchWorkingCopy).not.toHaveBeenCalled();
+  });
+
+  it("opens the recovery point a discard's toast asks for, but not another working copy's", async () => {
+    await act(async () => { render(<ChangesWorkbench />); });
+    const show = (worktreePath: string, pointId: string) => window.dispatchEvent(
+      new CustomEvent("repola:show-recovery-point", { detail: { machineId: "local", worktreePath, pointId } }),
+    );
+    await act(async () => show("/elsewhere", "refs/repola/discarded/other"));
+    expect(screen.queryByRole("dialog", { name: "Discarded changes" })).not.toBeInTheDocument();
+    await act(async () => show("/repo", "refs/repola/discarded/mine"));
+    expect(screen.getByRole("dialog", { name: "Discarded changes" })).toHaveTextContent("refs/repola/discarded/mine");
+  });
+
+  it("opens the discarded changes from the menu", async () => {
+    await act(async () => { render(<ChangesWorkbench />); });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "More change actions" })));
+    await act(async () => fireEvent.click(screen.getByRole("menuitem", { name: "Discarded changes…" })));
+    expect(screen.getByRole("dialog", { name: "Discarded changes" })).toHaveTextContent("no point");
   });
 
   it("offers force push for diverged branches through its existing confirmation", async () => {
@@ -209,7 +274,11 @@ describe("commit-message generation", () => {
   });
 
   it("cancels generation when a pull replaces the snapshot without a watcher refresh", async () => {
-    ipc.fetchWorkingCopy.mockResolvedValue({ ...snapshot, remote: "origin", upstream: "origin/main", behind: 1 });
+    // The reload once the pull ends never answers, so only the pull's own
+    // snapshot can cancel the generation.
+    ipc.fetchWorkingCopy
+      .mockResolvedValueOnce({ ...snapshot, remote: "origin", upstream: "origin/main", behind: 1 })
+      .mockImplementation(() => new Promise(() => undefined));
     let complete!: (message: GeneratedCommitMessage) => void;
     ipc.generateCommitMessage.mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
     ipc.synchronizeWorkingCopy.mockResolvedValue({ snapshot: { ...snapshot, head: "new-head" }, output: "" });
@@ -221,7 +290,6 @@ describe("commit-message generation", () => {
     const signal = ipc.generateCommitMessage.mock.calls[0][2] as AbortSignal;
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Pull 1" })));
     expect(ipc.synchronizeWorkingCopy).toHaveBeenCalled();
-    expect(ipc.fetchWorkingCopy).toHaveBeenCalledTimes(1);
     expect(signal.aborted).toBe(true);
     await act(async () => complete({ subject: "outdated message", body: "" }));
     expect(summary).toHaveValue("existing message");
