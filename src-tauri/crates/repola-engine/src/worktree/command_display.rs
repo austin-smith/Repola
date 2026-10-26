@@ -225,7 +225,7 @@ mod tests {
         );
         assert_eq!(
             git_command_line(Path::new(r"C:\repo"), ["branch", "--", r#"a"b"#, r"a b\"]),
-            r#"Start-Process git -ArgumentList '-C C:\repo branch -- a\"b "a b\\"' -NoNewWindow -Wait"#
+            r#"Start-Process git -ArgumentList '-C C:\repo branch -- "a\"b" "a b\\"' -NoNewWindow -Wait"#
         );
     }
 
