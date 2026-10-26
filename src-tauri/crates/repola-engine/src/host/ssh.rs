@@ -468,6 +468,11 @@ fn validate_handshake(
             AgentCapability::RepositoryDiscovery,
             AgentCapability::WorktreeInventory,
         ],
+        AgentRequest::RefreshWorktrees { .. } => &[
+            AgentCapability::WorkspaceRefresh,
+            AgentCapability::WorkingCopy,
+        ],
+        AgentRequest::MeasureWorktree { .. } => &[AgentCapability::WorktreeMeasurement],
         AgentRequest::ResolveRepository { .. } => &[AgentCapability::RepositoryDiscovery],
         AgentRequest::FetchPullRequests { .. } | AgentRequest::MutatePullRequest { .. } => {
             &[AgentCapability::ProviderIntegration]
@@ -572,7 +577,9 @@ fn operation_timeout(request: &AgentRequest) -> Duration {
         AgentRequest::TextGenerationStatus { provider } => (HANDSHAKE_TIMEOUT
             + crate::worktree::text_generation_status_timeout(*provider))
         .max(STANDARD_TIMEOUT),
-        AgentRequest::ResolveRepository { .. }
+        AgentRequest::RefreshWorktrees { .. }
+        | AgentRequest::MeasureWorktree { .. }
+        | AgentRequest::ResolveRepository { .. }
         | AgentRequest::FetchPullRequests { .. }
         | AgentRequest::MutatePullRequest { .. }
         | AgentRequest::WorktreeChanges { .. }

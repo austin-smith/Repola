@@ -39,6 +39,7 @@ export type PullState = PullRequestEvidence | "loading";
  */
 export function WorktreeDetails({
   worktree,
+  measurementPending,
   provider,
   pull,
   now,
@@ -50,6 +51,7 @@ export function WorktreeDetails({
   onViewChanges,
 }: {
   worktree: WorktreeRecord;
+  measurementPending?: boolean;
   provider: RemoteProvider;
   pull: PullState | null;
   now: number;
@@ -165,7 +167,7 @@ export function WorktreeDetails({
           <ActivityFact label="Folder created" value={formatDate(worktree.createdAtMs)} />
           <ActivityFact label="HEAD commit" value={`${formatDate(worktree.headCommitAtMs)} · ${shortSha(worktree.head)}`} />
           <ActivityFact label="Subject" value={worktree.headSubject ?? "Unavailable"} />
-          <ActivityFact label="Allocated size" value={formatMeasuredBytes(worktree.sizeBytes, worktree.sizeIncomplete)} tooltip={worktree.sizeIncomplete ? "Some files could not be measured; this is a lower bound." : undefined} />
+          <ActivityFact label="Allocated size" value={`${formatMeasuredBytes(worktree.sizeBytes, worktree.sizeIncomplete)}${measurementPending ? " · update pending" : ""}`} tooltip={worktree.sizeIncomplete ? "Some files could not be measured; this is a lower bound." : undefined} />
           <ActivityFact label="Registration" value={worktree.registration.kind.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase()} />
         </dl>
       </DetailSection>

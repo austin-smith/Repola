@@ -4,14 +4,14 @@ import { PhysicalPosition } from "@tauri-apps/api/dpi";
 import type { EventCallback } from "@tauri-apps/api/event";
 import type { DragDropEvent } from "@tauri-apps/api/webview";
 import { TooltipProvider } from "../components/ui/tooltip";
-import { computeTotals } from "../domain/inventory";
-import type { MachineProfile, ScanResult, WorkspaceContext } from "../ipc/types";
+import type { MachineProfile, RefreshRequest, RefreshResult, WorkspaceContext } from "../ipc/types";
 import type * as WorktreeIpc from "../ipc/worktrees";
 import type * as MachineIpc from "../ipc/machines";
 import App from "./App";
 
 const mocks = vi.hoisted(() => ({
-  subscribe: vi.fn(), loadRepositories: vi.fn(), scan: vi.fn(), resolve: vi.fn(), register: vi.fn(),
+  subscribe: vi.fn(), loadRepositories: vi.fn(), refresh: vi.fn(), resolve: vi.fn(), register: vi.fn(),
+  measure: vi.fn(), watch: vi.fn(), releaseWatch: vi.fn(), workspaceChanged: vi.fn(), workspaceMutation: vi.fn(),
   loadMachines: vi.fn(), loadContext: vi.fn(), toast: vi.fn(),
 }));
 vi.mock("@tauri-apps/api/core", () => ({ isTauri: () => true }));
@@ -22,7 +22,9 @@ vi.mock("./window-state", () => ({ restoreAndTrackWindow: async () => () => unde
 vi.mock("./environment", () => ({ useShortPath: () => (path: string) => path, usePathSeparator: () => "/" }));
 vi.mock("../ipc/worktrees", async (importOriginal) => ({
   ...await importOriginal<typeof WorktreeIpc>(),
-  loadRegisteredRepositories: mocks.loadRepositories, scanWorktrees: mocks.scan,
+  loadRegisteredRepositories: mocks.loadRepositories, refreshWorkspace: mocks.refresh,
+  measureWorktree: mocks.measure, replaceWorkspaceWatch: mocks.watch, releaseWorkspaceWatch: mocks.releaseWatch,
+  onWorkspaceChanged: mocks.workspaceChanged, onWorkspaceMutation: mocks.workspaceMutation,
   resolveDroppedRepository: mocks.resolve, registerRepository: mocks.register,
 }));
 vi.mock("../ipc/machines", async (importOriginal) => ({
@@ -39,9 +41,14 @@ const remote: MachineProfile = { ...local, id: "remote", name: "Remote", kind: "
 const context: WorkspaceContext = {
   selectedMachineId: "local", locations: {}, filters: {}, layout: { inventorySidebarWidth: 230, detailsWidth: 360 },
 };
-const scan: ScanResult = {
-  scannedAtMs: 1, repositoryPaths: ["repository"], repositories: [], worktrees: [], totals: computeTotals([], 0), warnings: [],
-};
+function emptyRefresh(request: RefreshRequest): RefreshResult {
+  return {
+    refreshedAtMs: 1, repositories: [], memberships: [], worktrees: [],
+    successfulRepositoryPaths: request.repositoryPaths, errors: [],
+    gitSignatures: request.repositoryPaths.map((repositoryPath) => ({ repositoryPath, signature: "unchanged" })),
+    workingCopy: null,
+  };
+}
 let listeners: Set<EventCallback<DragDropEvent>>;
 function dropOn(target: HTMLElement, paths = ["dropped folder"]) {
   vi.spyOn(target, "getBoundingClientRect").mockReturnValue({
@@ -76,7 +83,13 @@ describe("repository drop entry points", () => {
     mocks.loadMachines.mockResolvedValue([local, remote]);
     mocks.loadContext.mockResolvedValue(context);
     mocks.loadRepositories.mockResolvedValue([]);
-    mocks.scan.mockResolvedValue(scan);
+    mocks.refresh.mockImplementation(async (_machineId: string, request: RefreshRequest) => emptyRefresh(request));
+    mocks.workspaceChanged.mockResolvedValue(() => undefined);
+    mocks.workspaceMutation.mockReturnValue(() => undefined);
+    mocks.watch.mockImplementation(async (_machineId: string, subscriptionId: string) => ({
+      supported: true, active: true, subscriptionId, coverageErrors: [],
+    }));
+    mocks.releaseWatch.mockResolvedValue(undefined);
     mocks.resolve.mockResolvedValue("repository");
     mocks.register.mockResolvedValue({ repositoryPath: "repository", registeredRepositories: ["repository"] });
     vi.stubGlobal("devicePixelRatio", 1);

@@ -524,6 +524,35 @@ where
     launch("git", command, None)
 }
 
+/// Read-only inspection must not refresh Git's index or create optional locks.
+pub(crate) fn inspection_git_at<I, S>(path: &Path, args: I) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    git_at_with_env(path, args, [("GIT_OPTIONAL_LOCKS", "0")])
+}
+
+pub(crate) fn successful_inspection_git_at<I, S>(
+    path: &Path,
+    args: I,
+) -> Result<Output, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = inspection_git_at(path, args)?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(CommandError::Failed {
+            program: "git".into(),
+            status: output.status.code().unwrap_or(-1),
+            message: String::from_utf8_lossy(&output.stderr).trim().into(),
+        })
+    }
+}
+
 pub fn git_at_with_input<I, S>(path: &Path, args: I, input: &[u8]) -> Result<Output, CommandError>
 where
     I: IntoIterator<Item = S>,

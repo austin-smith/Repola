@@ -1,5 +1,5 @@
 import { createContext, useContext, type ReactNode } from "react";
-import type { MachineProfile, RepositorySummary, WorktreeRecord } from "../ipc/types";
+import type { MachineProfile, RepositorySummary, WorkingCopySnapshot, WorktreeRecord } from "../ipc/types";
 
 /**
  * The machine → repository → worktree selection the workbench operates on, plus the
@@ -14,6 +14,14 @@ export interface RepositoryContextValue {
   repository: RepositorySummary | null;
   worktree: WorktreeRecord | null;
   refreshWorkspace: () => Promise<void>;
+  /** Accepted status for the selected working copy; unrelated trees do not advance it. */
+  statusRevision?: number;
+  /** Repository metadata changed (HEAD, refs, configuration, or inventory). */
+  gitRevision?: number;
+  workingCopySnapshot?: WorkingCopySnapshot | null;
+  refreshPending?: boolean;
+  waitForRefresh?: () => Promise<void>;
+  registerRefreshConsumer?: (wait: () => Promise<void>) => (() => void);
   showChanges: () => void;
 }
 
