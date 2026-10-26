@@ -970,10 +970,11 @@ fn remote_tip(worktree: &Path, url: &str, reference: &str) -> Result<Option<Stri
 ///
 /// `update-ref` deletes the branch only at the reviewed tip, but checks nothing
 /// else `git branch` would, and the review can be seconds old by now, after
-/// asking the remote. So right before deleting, the branch must still be a
-/// regular ref that no worktree uses, it must leave unreachable exactly the
-/// commits the review found, and, unless the deletion is forced, the reference
-/// the review found the branch contained in must not have moved.
+/// asking the remote. So right before deleting: the branch must still be a
+/// regular ref that no worktree uses; it must leave unreachable exactly the
+/// commits the review found; it must have configuration exactly when the review
+/// planned to remove some; and, unless the deletion is forced, the reference the
+/// review found the branch contained in must not have moved.
 fn delete_local(
     reviewed: &Review,
     local: &LocalBranchDeletion,
@@ -1023,6 +1024,14 @@ fn delete_local(
     }
     // Read before the cleanup removes it, so the recovery can restore it.
     let configuration = branch_configuration(worktree, &local.name)?;
+    // The review removes configuration only if the branch had some then.
+    if configuration.is_empty() != cleanup.is_empty() {
+        return Err(format!(
+            "Nothing was deleted. The configuration of {} {} after this deletion was reviewed. Review the deletion again.",
+            local.name,
+            if configuration.is_empty() { "was removed" } else { "was added" }
+        ));
+    }
 
     let recovery = git_command_line(
         worktree,
@@ -3173,6 +3182,36 @@ mod tests {
         let error = delete_local(&reviewed, local).expect_err("the branch is checked out by now");
         assert!(error.contains("checked out"), "{error}");
         assert!(fixture.has_ref("refs/heads/late"));
+    }
+
+    #[test]
+    fn a_branch_whose_configuration_comes_or_goes_after_review_is_kept() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "plain"]);
+        git(&fixture.repository, &["branch", "configured"]);
+        git(
+            &fixture.repository,
+            &["config", "branch.configured.description", "reviewed"],
+        );
+        let changes: [(&str, &[&str]); 2] = [
+            (
+                "plain",
+                &["config", "branch.plain.description", "added later"],
+            ),
+            (
+                "configured",
+                &["config", "--remove-section", "branch.configured"],
+            ),
+        ];
+        for (name, change) in changes {
+            let reference = format!("refs/heads/{name}");
+            let reviewed = review(fixture.request(&reference, true, false), None).expect("review");
+            git(&fixture.repository, change);
+            let local = reviewed.plan.local.as_ref().expect("local details");
+            let error = delete_local(&reviewed, local).expect_err("the configuration changed");
+            assert!(error.contains("configuration of"), "{error}");
+            assert!(fixture.has_ref(&reference), "{name}");
+        }
     }
 
     #[test]
