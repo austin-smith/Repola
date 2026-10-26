@@ -1,9 +1,9 @@
 //! User preferences the engine acts on: which external editor and terminal to
-//! launch, and whether commits are signed by default.
+//! launch, whether commits are signed by default, and how diffs are shown.
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub const APP_PREFERENCES_VERSION: u16 = 5;
 
@@ -116,6 +116,29 @@ pub struct AppPreferences {
     pub default_sign_commits: bool,
     #[serde(alias = "codexSelections")]
     pub text_generation_selections: BTreeMap<String, TextGenerationPreferences>,
+    #[serde(deserialize_with = "lenient_diff_preferences")]
+    pub diff: DiffPreferences,
+}
+
+/// How diffs are presented. Changes and History remember whitespace
+/// visibility separately because hiding it disables line selection only
+/// where lines can be selected.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DiffPreferences {
+    pub hide_whitespace_in_changes: bool,
+    pub hide_whitespace_in_history: bool,
+}
+
+/// Diff presentation is cosmetic, so a value this build cannot read (written
+/// by a newer build, or damaged) resets only the diff preferences instead of
+/// failing the whole preference record.
+fn lenient_diff_preferences<'de, D>(deserializer: D) -> Result<DiffPreferences, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 impl Default for AppPreferences {
@@ -126,6 +149,7 @@ impl Default for AppPreferences {
             terminal_id: None,
             default_sign_commits: false,
             text_generation_selections: BTreeMap::new(),
+            diff: DiffPreferences::default(),
         }
     }
 }
@@ -303,6 +327,7 @@ mod tests {
             terminal_id: Some("warp".into()),
             default_sign_commits: true,
             text_generation_selections: BTreeMap::new(),
+            diff: DiffPreferences::default(),
         });
         assert_eq!(legacy.version, APP_PREFERENCES_VERSION);
         assert_eq!(legacy.editor_id.as_deref(), Some("cursor"));
@@ -315,6 +340,7 @@ mod tests {
             terminal_id: Some("iterm2".into()),
             default_sign_commits: true,
             text_generation_selections: BTreeMap::new(),
+            diff: DiffPreferences::default(),
         });
         assert_eq!(future, AppPreferences::default());
     }
@@ -364,5 +390,61 @@ mod tests {
         });
         assert_eq!(migrated.text_generation_selections.len(), 1);
         assert!(migrated.text_generation_selections.contains_key("local"));
+    }
+
+    #[test]
+    fn diff_preferences_load_in_both_directions_without_resetting_other_choices() {
+        let current = serde_json::json!({
+            "version": APP_PREFERENCES_VERSION,
+            "editorId": "zed",
+            "defaultSignCommits": true,
+        });
+
+        // Written before diff preferences existed.
+        let older: AppPreferences =
+            serde_json::from_value(current.clone()).expect("preferences without diff");
+        let older = migrate_app_preferences(older);
+        assert_eq!(older.diff, DiffPreferences::default());
+        assert_eq!(older.editor_id.as_deref(), Some("zed"));
+        assert!(older.default_sign_commits);
+
+        // Written by a newer build that added keys this build does not know.
+        let mut newer = current.clone();
+        newer["futurePreference"] = serde_json::json!({ "enabled": true });
+        newer["diff"] = serde_json::json!({
+            "hideWhitespaceInChanges": true,
+            "futureDiffChoice": "wrapped",
+        });
+        let newer = migrate_app_preferences(
+            serde_json::from_value(newer).expect("preferences with future keys"),
+        );
+        assert!(newer.diff.hide_whitespace_in_changes);
+        assert!(!newer.diff.hide_whitespace_in_history);
+        assert_eq!(newer.editor_id.as_deref(), Some("zed"));
+        assert!(newer.default_sign_commits);
+
+        // A diff value this build cannot read resets only the diff choices.
+        let mut unreadable = current;
+        unreadable["diff"] = serde_json::json!({ "hideWhitespaceInHistory": "sometimes" });
+        let unreadable = migrate_app_preferences(
+            serde_json::from_value(unreadable).expect("preferences with unreadable diff"),
+        );
+        assert_eq!(unreadable.diff, DiffPreferences::default());
+        assert_eq!(unreadable.editor_id.as_deref(), Some("zed"));
+        assert!(unreadable.default_sign_commits);
+
+        let round_trip: AppPreferences = serde_json::from_value(
+            serde_json::to_value(AppPreferences {
+                diff: DiffPreferences {
+                    hide_whitespace_in_changes: false,
+                    hide_whitespace_in_history: true,
+                },
+                ..AppPreferences::default()
+            })
+            .expect("serialize preferences"),
+        )
+        .expect("deserialize preferences");
+        assert!(round_trip.diff.hide_whitespace_in_history);
+        assert!(!round_trip.diff.hide_whitespace_in_changes);
     }
 }

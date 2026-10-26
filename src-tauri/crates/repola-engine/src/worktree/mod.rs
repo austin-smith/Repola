@@ -46,15 +46,16 @@ pub use models::{
     ApplyPatchHunkRequest, BranchInfo, BranchMutationRequest, BranchMutationResult, BranchRequest,
     CloneRepositoryRequest, CommitChangedFile, CommitFileDiffRequest, CommitFilesRequest,
     CommitRequest, CommitResult, ConflictFile, ConflictFileRequest, CreateRepositoryRequest,
-    CreateWorktreeRequest, CreateWorktreeResult, DeleteRecoveryPointsRequest, DiscardEffect,
-    DiscardPlan, DiscardPlanEntry, DiscardPlanRequest, DiscardRequest, DiscardResult, DiscardScope,
-    DiscardTarget, FileDiff, FileDiffRequest, GenerateCommitMessageRequest, GeneratedCommitMessage,
-    GitPath, HistoryMutationKind, HistoryMutationRequest, HistoryMutationResult, HistoryPage,
-    HistoryRequest, KeptChange, KeptChangeReason, PatchHunk, PatchHunkAction, PullRequestEvidence,
-    PullRequestMutationKind, PullRequestMutationRequest, PullRequestMutationResult,
-    ReasoningEffort, RecoveryFileDiff, RecoveryFileDiffRequest, RecoveryPoint, RecoveryPointKind,
-    RecoveryPointList, RecoveryPointReference, RecoveryPointRequest, RecoveryRestoreEntry,
-    RecoveryRestorePlan, RecoveryRestoreRequest, RecoveryRestoreResult, ReflogEntry, ReflogRequest,
+    CreateWorktreeRequest, CreateWorktreeResult, DeleteRecoveryPointsRequest, DiffDisplayOptions,
+    DiscardEffect, DiscardPlan, DiscardPlanEntry, DiscardPlanRequest, DiscardRequest,
+    DiscardResult, DiscardScope, DiscardTarget, FileDiff, FileDiffRequest,
+    GenerateCommitMessageRequest, GeneratedCommitMessage, GitPath, HistoryMutationKind,
+    HistoryMutationRequest, HistoryMutationResult, HistoryPage, HistoryRequest, KeptChange,
+    KeptChangeReason, PatchHunk, PatchHunkAction, PullRequestEvidence, PullRequestMutationKind,
+    PullRequestMutationRequest, PullRequestMutationResult, ReasoningEffort, RecoveryFileDiff,
+    RecoveryFileDiffRequest, RecoveryPoint, RecoveryPointKind, RecoveryPointList,
+    RecoveryPointReference, RecoveryPointRequest, RecoveryRestoreEntry, RecoveryRestorePlan,
+    RecoveryRestoreRequest, RecoveryRestoreResult, ReflogEntry, ReflogRequest,
     RepositoryOperationAction, RepositoryOperationMutationResult, RepositoryOperationRequest,
     RepositoryOperationResult, ResolveConflictRequest, RestoreEffect, ReviewedFileChange,
     ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry, StashMutationRequest,
@@ -86,8 +87,8 @@ pub use watch::{
 };
 pub use watch::{WorktreeChangeEvent, WorktreeWatcher};
 pub use working_copy::{
-    apply_patch_hunk, commit, conflict_file, file_diff, resolve_conflict, set_file_staging,
-    undo_commit, working_copy_snapshot,
+    apply_patch_hunk, commit, conflict_file, file_diff, file_diff_for_display, resolve_conflict,
+    set_file_staging, undo_commit, working_copy_snapshot,
 };
 
 pub(crate) fn git_version() -> Result<String, String> {

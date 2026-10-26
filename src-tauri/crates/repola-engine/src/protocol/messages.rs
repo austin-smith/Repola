@@ -5,21 +5,22 @@ use crate::worktree::{
     BranchInfo, BranchMutationRequest, BranchMutationResult, BranchRequest, CloneRepositoryRequest,
     CommitChangedFile, CommitFileDiffRequest, CommitFilesRequest, CommitRequest, CommitResult,
     ConflictFile, ConflictFileRequest, CreateRepositoryRequest, CreateWorktreeRequest,
-    CreateWorktreeResult, DeleteRecoveryPointsRequest, DiscardPlan, DiscardPlanRequest,
-    DiscardRequest, DiscardResult, FileDiff, FileDiffRequest, GenerateCommitMessageRequest,
-    GeneratedCommitMessage, HistoryMutationRequest, HistoryMutationResult, HistoryPage,
-    HistoryRequest, MeasureWorktreeRequest, PullRequestEvidence, PullRequestMutationRequest,
-    PullRequestMutationResult, RecoveryFileDiff, RecoveryFileDiffRequest, RecoveryPointList,
-    RecoveryPointRequest, RecoveryRestorePlan, RecoveryRestoreRequest, RecoveryRestoreResult,
-    ReflogEntry, ReflogRequest, RefreshRequest, RefreshResult, RepositoryOperationMutationResult,
-    RepositoryOperationRequest, RepositoryOperationResult, ResolveConflictRequest, ScanEvent,
-    ScanRequest, ScanResult, SetFileStagingRequest, StashEntry, StashMutationRequest,
-    StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo, TagMutationRequest,
-    TagMutationResult, TagRequest, TextGenerationStatus, UndoCommitRequest, UndoCommitResult,
-    WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges, WorktreeMeasurement,
+    CreateWorktreeResult, DeleteRecoveryPointsRequest, DiffDisplayOptions, DiscardPlan,
+    DiscardPlanRequest, DiscardRequest, DiscardResult, FileDiff, FileDiffRequest,
+    GenerateCommitMessageRequest, GeneratedCommitMessage, HistoryMutationRequest,
+    HistoryMutationResult, HistoryPage, HistoryRequest, MeasureWorktreeRequest,
+    PullRequestEvidence, PullRequestMutationRequest, PullRequestMutationResult, RecoveryFileDiff,
+    RecoveryFileDiffRequest, RecoveryPointList, RecoveryPointRequest, RecoveryRestorePlan,
+    RecoveryRestoreRequest, RecoveryRestoreResult, ReflogEntry, ReflogRequest, RefreshRequest,
+    RefreshResult, RepositoryOperationMutationResult, RepositoryOperationRequest,
+    RepositoryOperationResult, ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult,
+    SetFileStagingRequest, StashEntry, StashMutationRequest, StashMutationResult, StashRequest,
+    SyncRequest, SyncResult, TagInfo, TagMutationRequest, TagMutationResult, TagRequest,
+    TextGenerationStatus, UndoCommitRequest, UndoCommitResult, WorkingCopyRequest,
+    WorkingCopySnapshot, WorktreeChanges, WorktreeMeasurement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 21;
+pub const PROTOCOL_VERSION: u16 = 22;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -76,6 +77,8 @@ pub enum AgentRequest {
     },
     FileDiff {
         request: FileDiffRequest,
+        #[serde(default)]
+        options: DiffDisplayOptions,
     },
     WorkingCopySnapshot {
         request: WorkingCopyRequest,
@@ -106,6 +109,8 @@ pub enum AgentRequest {
     },
     CommitFileDiff {
         request: CommitFileDiffRequest,
+        #[serde(default)]
+        options: DiffDisplayOptions,
     },
     MutateHistory {
         request: HistoryMutationRequest,
@@ -465,7 +470,7 @@ mod tests {
         let json = serde_json::to_string(&request).expect("serialize request");
         assert_eq!(
             json,
-            r#"{"protocolVersion":21,"requestId":"golden-1","request":{"type":"handshake","clientVersion":"0.1.0","minimumProtocolVersion":21,"maximumProtocolVersion":21}}"#
+            r#"{"protocolVersion":22,"requestId":"golden-1","request":{"type":"handshake","clientVersion":"0.1.0","minimumProtocolVersion":22,"maximumProtocolVersion":22}}"#
         );
 
         let with_future_field = json.replace(
@@ -475,6 +480,57 @@ mod tests {
         let decoded: RequestEnvelope =
             serde_json::from_str(&with_future_field).expect("ignore compatible future field");
         assert_eq!(decoded.request_id, "golden-1");
+    }
+
+    #[test]
+    fn diff_requests_carry_display_options_and_default_to_the_exact_diff() {
+        let file = serde_json::json!({
+            "type": "fileDiff",
+            "request": {
+                "repositoryPath": "/repo",
+                "worktreePath": "/repo",
+                "path": { "display": "a.txt", "token": "612e747874" },
+            },
+            "options": { "ignoreWhitespace": true },
+        });
+        let decoded: AgentRequest = serde_json::from_value(file.clone()).expect("decode options");
+        let AgentRequest::FileDiff { options, .. } = &decoded else {
+            panic!("wrong request type")
+        };
+        assert!(options.ignore_whitespace);
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("serialize request"),
+            file
+        );
+
+        let mut without_options = file;
+        without_options
+            .as_object_mut()
+            .expect("request object")
+            .remove("options");
+        let AgentRequest::FileDiff { options, .. } =
+            serde_json::from_value(without_options).expect("decode without options")
+        else {
+            panic!("wrong request type")
+        };
+        assert_eq!(options, DiffDisplayOptions::default());
+
+        let commit = serde_json::json!({
+            "type": "commitFileDiff",
+            "request": {
+                "repositoryPath": "/repo",
+                "worktreePath": "/repo",
+                "commit": "0".repeat(40),
+                "path": { "display": "a.txt", "token": "612e747874" },
+            },
+            "options": {},
+        });
+        let AgentRequest::CommitFileDiff { options, .. } =
+            serde_json::from_value(commit).expect("decode empty options")
+        else {
+            panic!("wrong request type")
+        };
+        assert_eq!(options, DiffDisplayOptions::default());
     }
 
     #[test]
@@ -499,7 +555,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&file).expect("serialize discard"),
             format!(
-                r#"{{"protocolVersion":21,"requestId":"golden-2","request":{{"type":"discard","request":{{"repositoryPath":"/repo","worktreePath":"/repo","target":{{"kind":"file","path":{{"display":"a.txt","token":"612e747874"}},"scope":"unstaged"}},"fingerprint":"{}"}}}}}}"#,
+                r#"{{"protocolVersion":22,"requestId":"golden-2","request":{{"type":"discard","request":{{"repositoryPath":"/repo","worktreePath":"/repo","target":{{"kind":"file","path":{{"display":"a.txt","token":"612e747874"}},"scope":"unstaged"}},"fingerprint":"{}"}}}}}}"#,
                 "f".repeat(64)
             )
         );

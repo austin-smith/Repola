@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 
 export interface DelayedPendingOptions {
   /** How long an operation must be pending before an indicator is shown. */
@@ -16,7 +16,11 @@ export function useDelayedPending(pending: boolean, { delay = 150, minimum = 250
   const [visible, setVisible] = useState(false);
   const shownAt = useRef<number | null>(null);
 
-  useEffect(() => {
+  // A layout effect cancels the pending timer in the same task that commits
+  // the end of the operation. A passive effect can run after the timer has
+  // already fired, which would raise the indicator over content that has
+  // finished loading.
+  useLayoutEffect(() => {
     if (pending) {
       if (visible) return;
       const timer = setTimeout(() => {
