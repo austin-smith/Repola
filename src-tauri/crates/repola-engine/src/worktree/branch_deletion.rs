@@ -28,8 +28,9 @@
 //!   contained in has not moved, as `git branch -d` requires.
 //! - The remote still pushes to the reviewed URL, and that URL does not name
 //!   this branch as its default.
-//! - The remote branch's remote-tracking ref is not symbolic. The push deletes
-//!   that ref too, and would follow a symbolic one to another branch.
+//! - The remote's fetch refspecs are unchanged, and the remote-tracking ref
+//!   they map the branch to is not symbolic. The push deletes that ref too, and
+//!   would follow a symbolic one to another branch.
 //!
 //! Another process can still change these between the check and the deletion;
 //! `git branch -d` has the same window between its checks and its deletion.
@@ -135,6 +136,9 @@ struct Review {
     merge_reference: Option<String>,
     repository: RepositoryContext,
     push_url: Option<String>,
+    /// The fetch refspecs of the remote the branch is deleted from, which
+    /// decide the ref its push cleans up.
+    fetch_refspecs: Option<Vec<String>>,
 }
 
 pub fn plan_branch_deletion(request: BranchDeletionRequest) -> Result<BranchDeletionPlan, String> {
@@ -235,6 +239,11 @@ fn review(
     let local_deleted = local.as_ref().map(|local| local.name.as_str());
 
     let push_url = remote_target.as_ref().ok().map(|(_, url)| url.clone());
+    let fetch_refspecs = remote_target
+        .as_ref()
+        .ok()
+        .map(|(candidate, _)| fetch_refspecs(worktree, &candidate.remote))
+        .transpose()?;
     let (mut remote, remote_reachability, remote_unavailable_reason) = match remote_target {
         Ok((candidate, url)) => {
             let (remote, reachability) =
@@ -427,6 +436,7 @@ fn review(
         merge_reference,
         repository,
         push_url,
+        fetch_refspecs,
     })
 }
 
@@ -754,6 +764,17 @@ fn delete_remote(reviewed: &Review, remote: &RemoteBranchDeletion) -> RemoteDele
             return failed(format!(
                 "The commits deleting {} would leave unreachable in this repository changed after this deletion was reviewed, so it was not deleted. Review the deletion again.",
                 remote.display_name
+            ))
+        }
+        Err(reason) => return failed(format!("{reason} {} was not deleted.", remote.display_name)),
+    }
+    // The push cleans up whatever ref these map the remote branch to.
+    match fetch_refspecs(worktree, &remote.remote) {
+        Ok(current) if Some(&current) == reviewed.fetch_refspecs.as_ref() => {}
+        Ok(_) => {
+            return failed(format!(
+                "The fetch refspecs of {} changed after this deletion was reviewed, so its push could delete another ref. {} was not deleted. Review the deletion again.",
+                remote.remote, remote.display_name
             ))
         }
         Err(reason) => return failed(format!("{reason} {} was not deleted.", remote.display_name)),
@@ -1638,6 +1659,13 @@ fn upstream_candidate(
             "{name} tracks {display}, which is not a branch on a configured remote."
         ));
     }
+    // A push that deletes the remote branch deletes the ref its fetch refspec
+    // maps it to, which must therefore be a remote-tracking branch.
+    if !record.upstream.starts_with("refs/remotes/") {
+        return RemoteTarget::Unavailable(format!(
+            "{name} tracks {display}, which is not a remote-tracking branch, so deleting the remote branch would make Git delete {display} too."
+        ));
+    }
     match refs.get(&record.upstream) {
         Some(tracking) if !tracking.symref.is_empty() => RemoteTarget::Unavailable(
             symbolic_tracking_reason(&record.upstream, &tracking.symref),
@@ -1684,16 +1712,8 @@ fn tracking_candidate(
         )))
         }
     };
-    let key = format!("remote.{remote}.fetch");
-    let output = command::git_at(worktree, ["config", "--get-all", key.as_str()])
-        .map_err(|error| error.to_string())?;
     let default_refspec = format!("refs/heads/*:refs/remotes/{remote}/*");
-    let refspecs: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
+    let refspecs = fetch_refspecs(worktree, remote)?;
     if refspecs.is_empty()
         || refspecs
             .iter()
@@ -1709,6 +1729,28 @@ fn tracking_candidate(
         tracking_ref: tracking_ref.to_string(),
         oid: record.oid.clone(),
     }))
+}
+
+/// The configured `remote.<remote>.fetch` values, exactly and in order.
+fn fetch_refspecs(worktree: &Path, remote: &str) -> Result<Vec<String>, String> {
+    let key = format!("remote.{remote}.fetch");
+    let output = command::git_at(worktree, ["config", "-z", "--get-all", key.as_str()])
+        .map_err(|error| error.to_string())?;
+    // Git exits with 1 when the key is not set.
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(combined_output(&output.stdout, &output.stderr));
+    }
+    // Each value ends with a NUL.
+    Ok(output
+        .stdout
+        .strip_suffix(&[0])
+        .map(|values| {
+            values
+                .split(|byte| *byte == 0)
+                .map(|value| String::from_utf8_lossy(value).into_owned())
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 fn local_details(
@@ -3344,6 +3386,73 @@ mod tests {
         assert!(matches!(deletion.outcome, RemoteOutcome::Failed));
         assert!(
             deletion.output.contains("symbolic ref to main"),
+            "{}",
+            deletion.output
+        );
+        assert!(fixture.has_ref("refs/heads/main"));
+        assert!(fixture.remote_has_branch("topic"));
+    }
+
+    /// Maps origin's `topic` onto local `main` ahead of the default refspec.
+    fn map_topic_onto_main(repository: &Path) {
+        git(
+            repository,
+            &[
+                "config",
+                "--replace-all",
+                "remote.origin.fetch",
+                "+refs/heads/topic:refs/heads/main",
+            ],
+        );
+        git(
+            repository,
+            &[
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_remote_branch_whose_upstream_is_not_a_remote_tracking_branch_is_not_deleted() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "topic"]);
+        git(
+            &fixture.repository,
+            &["push", "--set-upstream", "origin", "topic"],
+        );
+        map_topic_onto_main(&fixture.repository);
+        let plan = fixture.plan("refs/heads/topic", false, true);
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| blocker.contains("not a remote-tracking branch")),
+            "{:?}",
+            plan.blockers
+        );
+        execute(&plan, None).expect_err("the push would delete main");
+        assert!(fixture.has_ref("refs/heads/main"));
+        assert!(fixture.remote_has_branch("topic"));
+    }
+
+    #[test]
+    fn a_remote_branch_is_kept_once_its_fetch_refspecs_change_after_review() {
+        let fixture = Fixture::new();
+        git(&fixture.repository, &["branch", "topic"]);
+        git(
+            &fixture.repository,
+            &["push", "--set-upstream", "origin", "topic"],
+        );
+        let reviewed =
+            review(fixture.request("refs/heads/topic", false, true), None).expect("review");
+        map_topic_onto_main(&fixture.repository);
+        let remote = reviewed.plan.remote.as_ref().expect("remote details");
+        let deletion = delete_remote(&reviewed, remote);
+        assert!(matches!(deletion.outcome, RemoteOutcome::Failed));
+        assert!(
+            deletion.output.contains("fetch refspecs of origin changed"),
             "{}",
             deletion.output
         );
