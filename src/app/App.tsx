@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   AlertTriangleIcon,
@@ -42,7 +42,7 @@ import { inventoryGridClass, WorktreeRow } from "../workspace/WorktreeRow";
 import { useShortPath } from "./environment";
 import { formatAge, formatBytes, formatMeasuredBytes } from "../domain/format";
 import { performFocusedSelectAll } from "../domain/select-all";
-import { actionForWorktree, computeTotals, filterAndSortWorktrees, isRemovable } from "../domain/inventory";
+import { actionForWorktree, filterAndSortWorktrees, isRemovable } from "../domain/inventory";
 import type { AgeFilter, StateFilter } from "../domain/inventory";
 import type {
   ActionKind,
@@ -52,7 +52,6 @@ import type {
   MachineProfile,
   MachineProfileInput,
   RemoteProvider,
-  RepositorySummary,
   ScanResult,
   WorktreeRecord,
   WorkspaceContext,
@@ -74,20 +73,33 @@ import {
   revealAuditLog,
   resolveDroppedRepository,
   registerRepository,
-  scanWorktrees,
+  refreshWorkspace as inspectWorkspace,
+  onWorkspaceMutation,
   unregisterRepository,
 } from "../ipc/worktrees";
 import { RepositoryProvider, type RepositoryContextValue } from "../workspace/context";
 import { AppSidebar, type MachineConnection } from "../workspace/AppSidebar";
 import { RepositoryToolbar } from "../workspace/RepositoryToolbar";
-import { ChangesWorkbench } from "../workspace/ChangesWorkbench";
-import { HistoryWorkbench } from "../workspace/HistoryWorkbench";
 import { WorktreeDetails, type PullState } from "../workspace/WorktreeDetails";
 import { PaneResizeHandle } from "../workspace/PaneResizeHandle";
 import { LazyDialog } from "../workspace/LazyDialog";
 import { DiffDialog } from "../workspace/lazy";
 import { RepositoryDropZone } from "../components/RepositoryDropZone";
 import { useRepositoryDrop } from "./use-repository-drop";
+import { useWorkspaceRefresh } from "./useWorkspaceRefresh";
+import { mergeRefresh } from "../domain/refresh-merge";
+
+const ChangesWorkbench = lazy(() => import("../workspace/ChangesWorkbench").then((module) => ({ default: module.ChangesWorkbench })));
+const HistoryWorkbench = lazy(() => import("../workspace/HistoryWorkbench").then((module) => ({ default: module.HistoryWorkbench })));
+
+function WorkbenchLoading({ label }: { label: string }) {
+  return (
+    <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-sm text-muted-foreground" role="status">
+      <Spinner aria-hidden="true" />
+      Loading {label}…
+    </div>
+  );
+}
 
 const stateOptions: { value: StateFilter; label: string }[] = [
   { value: "all", label: "Every state" },
@@ -102,6 +114,13 @@ interface BulkState {
   stage: BulkStage;
   items: BulkItem[];
   followUps: FollowUpAction[];
+}
+
+interface BoundPullEvidence {
+  machineId: string;
+  branch: string | null;
+  head: string | null;
+  value: PullState;
 }
 
 function App() {
@@ -139,7 +158,7 @@ function App() {
   const [actionPlan, setActionPlan] = useState<ActionPlan | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [pullEvidence, setPullEvidence] = useState<Record<string, PullState>>({});
+  const [pullEvidence, setPullEvidence] = useState<Record<string, BoundPullEvidence>>({});
   const [diffWorktree, setDiffWorktree] = useState<WorktreeRecord | null>(null);
   const [auditPath, setAuditPath] = useState<string | null>(null);
   const didStart = useRef(false);
@@ -148,7 +167,11 @@ function App() {
   const refreshController = useRef<AbortController | null>(null);
   const connectionGenerations = useRef<Record<string, number>>({});
   const workspaceSaveChain = useRef<Promise<unknown>>(Promise.resolve());
-  const now = scan?.scannedAtMs ?? Date.now();
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = setInterval(() => { if (!document.hidden) setNow(Date.now()); }, 60_000);
+    return () => clearInterval(timer);
+  }, []);
   const repositoryPaths = useMemo(() => registeredRepositories ?? [], [registeredRepositories]);
   const selectedMachine = machines?.find((machine) => machine.id === selectedMachineId) ?? null;
   const selectedConnection = machineConnections[selectedMachineId] ?? null;
@@ -226,73 +249,30 @@ function App() {
     }
     setLoading(true);
     setError(null);
-    const records = new Map<string, WorktreeRecord>();
-    let meta: { repositoryPaths: string[]; repositories: RepositorySummary[]; warnings: string[] } | null = null;
-    let settled = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const publishPartial = () => {
-      timer = null;
-      const partialMeta = meta;
-      if (settled || !partialMeta || generation !== refreshGeneration.current) return;
-      const worktrees = Array.from(records.values());
-      setScan({
-        scannedAtMs: Date.now(),
-        repositoryPaths: partialMeta.repositoryPaths,
-        repositories: partialMeta.repositories,
-        worktrees,
-        totals: computeTotals(worktrees, partialMeta.repositories.length),
-        warnings: partialMeta.warnings,
-      });
-    };
     try {
-      const next = await scanWorktrees(machineId, paths, (event) => {
-        if (generation !== refreshGeneration.current) return;
-        if (event.type === "repositories") {
-          meta = { repositoryPaths: event.repositoryPaths, repositories: event.repositories, warnings: event.warnings };
-        } else if (event.type === "worktree") {
-          records.set(event.record.id, event.record);
-        } else if (event.type === "size") {
-          const record = records.get(event.id);
-          if (record) {
-            records.set(event.id, {
-              ...record,
-              sizeBytes: event.sizeBytes,
-              sizeIncomplete: event.sizeIncomplete,
-              lastActivityAtMs: event.lastActivityAtMs,
-            });
-          }
-        } else {
-          settled = true;
-        }
-        if (!timer && !settled) timer = setTimeout(publishPartial, 120);
-      }, controller.signal);
-      settled = true;
-      if (generation !== refreshGeneration.current) return;
-      setScan(next);
-      setPullEvidence({});
-      setSelectedId((current) => current && next.worktrees.some((item) => item.id === current)
-        ? current
-        : null);
-      setChecked((current) => new Set(
-        next.worktrees.filter((item) => current.has(item.id) && isRemovable(item)).map((item) => item.id),
-      ));
+      const result = await inspectWorkspace(machineId, { repositoryPaths: paths, worktreePaths: null, workingCopy: null }, controller.signal);
+      if (generation !== refreshGeneration.current || activeMachineId.current !== machineId) return;
+      setScan((current) => mergeRefresh(current, result, paths));
     } catch (cause) {
       if (generation === refreshGeneration.current && !controller.signal.aborted) setError(toMessage(cause));
     } finally {
-      settled = true;
-      if (timer) clearTimeout(timer);
       if (generation === refreshGeneration.current) setLoading(false);
       if (refreshController.current === controller) refreshController.current = null;
     }
   }, []);
 
-  const refreshWorkspace = useCallback(
-    () => refresh(selectedMachineId, repositoryPaths),
-    [refresh, repositoryPaths, selectedMachineId],
-  );
   const showChanges = useCallback(() => setWorkspaceView("changes"), []);
 
   useEffect(() => () => refreshController.current?.abort(), []);
+  useEffect(() => onWorkspaceMutation((event) => {
+    if (event.phase !== "start" || event.machineId !== activeMachineId.current) return;
+    // Bootstrap/configuration reads use the same synchronous mutation fence as
+    // coordinated background reads, even before inventory has been published.
+    refreshGeneration.current += 1;
+    refreshController.current?.abort();
+    refreshController.current = null;
+    setLoading(false);
+  }), []);
 
   useEffect(() => {
     let dispose: (() => void) | null = null;
@@ -387,17 +367,30 @@ function App() {
     }, now);
   }, [age, now, query, repository, scan?.worktrees, state]);
 
-  const currentRepository = scan?.repositories.find((item) => item.path === currentRepositoryPath)
-    ?? scan?.repositories[0]
-    ?? null;
+  const currentRepository = currentRepositoryPath
+    ? scan?.repositories.find((item) => item.path === currentRepositoryPath) ?? null
+    : scan?.repositories[0] ?? null;
   const repositoryWorktrees = useMemo(
     () => (scan?.worktrees ?? []).filter((item) => item.repositoryPath === currentRepository?.path && item.exists),
     [currentRepository?.path, scan?.worktrees],
   );
-  const currentWorktree = repositoryWorktrees.find((item) => item.path === currentWorktreePath)
-    ?? repositoryWorktrees.find((item) => item.isPrimary)
-    ?? repositoryWorktrees[0]
-    ?? null;
+  const currentWorktree = currentWorktreePath
+    ? repositoryWorktrees.find((item) => item.path === currentWorktreePath) ?? null
+    : repositoryWorktrees.find((item) => item.isPrimary) ?? repositoryWorktrees[0] ?? null;
+  const getRefreshEpoch = useCallback(() => refreshGeneration.current, []);
+  const workspaceRefresh = useWorkspaceRefresh({
+    machineId: selectedMachineId,
+    machineKind: selectedMachine?.kind ?? "local",
+    repositoryPaths,
+    scan,
+    setScan,
+    repositoryPath: currentRepository?.path ?? null,
+    worktreePath: currentWorktree?.path ?? null,
+    view: workspaceView,
+    enabled: !loading && registeredRepositories !== null,
+    getEpoch: getRefreshEpoch,
+  });
+  const { refreshWorkspace } = workspaceRefresh;
 
   const selectedMachineOs = selectedMachine?.kind === "ssh" ? selectedConnection?.agent?.operatingSystem ?? null : null;
   const repositoryContext = useMemo<RepositoryContextValue>(() => ({
@@ -406,9 +399,15 @@ function App() {
     machineOs: selectedMachineOs,
     repository: currentRepository,
     worktree: currentWorktree,
-    refreshWorkspace,
+    refreshWorkspace: workspaceRefresh.reconcileMutation,
     showChanges,
-  }), [currentRepository, currentWorktree, refreshWorkspace, selectedMachine?.kind, selectedMachineId, selectedMachineOs, showChanges]);
+    statusRevision: workspaceRefresh.statusRevision,
+    gitRevision: workspaceRefresh.gitRevision,
+    workingCopySnapshot: workspaceRefresh.workingCopySnapshot,
+    refreshPending: workspaceRefresh.refreshPending,
+    waitForRefresh: workspaceRefresh.waitForRefresh,
+    registerRefreshConsumer: workspaceRefresh.registerRefreshConsumer,
+  }), [workspaceRefresh.reconcileMutation, workspaceRefresh.statusRevision, workspaceRefresh.gitRevision, workspaceRefresh.workingCopySnapshot, workspaceRefresh.refreshPending, workspaceRefresh.waitForRefresh, workspaceRefresh.registerRefreshConsumer, currentRepository, currentWorktree, selectedMachine?.kind, selectedMachineId, selectedMachineOs, showChanges]);
 
   useEffect(() => {
     if (!workspaceContextHydrated) return;
@@ -636,19 +635,23 @@ function App() {
 
   const checkPullRequests = useCallback(async (worktree: WorktreeRecord) => {
     if (!worktree.branch) return;
-    setPullEvidence((current) => ({ ...current, [worktree.id]: "loading" }));
+    const binding = { machineId: selectedMachineId, branch: worktree.branch, head: worktree.head };
+    setPullEvidence((current) => ({ ...current, [worktree.id]: { ...binding, value: "loading" } }));
     try {
       const evidence = await fetchPullRequests(selectedMachineId, worktree.repositoryPath, worktree.branch);
-      setPullEvidence((current) => ({ ...current, [worktree.id]: evidence }));
+      setPullEvidence((current) => ({ ...current, [worktree.id]: { ...binding, value: evidence } }));
     } catch (cause) {
       setPullEvidence((current) => ({
         ...current,
         [worktree.id]: {
-          status: "cliError",
-          provider: "other",
-          branch: worktree.branch ?? "",
-          pulls: [],
-          detail: toMessage(cause),
+          ...binding,
+          value: {
+            status: "cliError",
+            provider: "other",
+            branch: worktree.branch ?? "",
+            pulls: [],
+            detail: toMessage(cause),
+          },
         },
       }));
     }
@@ -924,7 +927,7 @@ function App() {
         <Spinner className="size-6" />
         <strong className="text-base font-medium">{registeredRepositories === null ? "Loading repositories" : "Mapping worktrees"}</strong>
         <span className="max-w-md text-center text-sm text-muted-foreground">
-          {registeredRepositories === null ? "Loading repositories you added…" : "Inspecting Git registrations, local changes, and disk usage…"}
+          {registeredRepositories === null ? "Loading repositories you added…" : "Inspecting Git registrations and local changes…"}
         </span>
       </main>
     );
@@ -946,7 +949,19 @@ function App() {
           onViewChange={setWorkspaceView}
           onOpenSettings={() => setSettingsOpen(true)}
         />
-        <main id="main-content" className="flex min-w-0 flex-1 flex-col bg-background">{children}</main>
+        <main id="main-content" className="flex min-w-0 flex-1 flex-col bg-background">
+          {workspaceRefresh.refreshError && (
+            <div role="status" className="flex shrink-0 items-center gap-2 border-b bg-muted px-4 py-2 text-xs">
+              <AlertTriangleIcon className="size-3.5 shrink-0" aria-hidden="true" />
+              <Tooltip>
+                <TooltipTrigger render={<span className="truncate" />}>Updates may be delayed. Showing the last available information.</TooltipTrigger>
+                <TooltipContent className="max-w-lg whitespace-pre-line">{workspaceRefresh.refreshError}</TooltipContent>
+              </Tooltip>
+              <Button variant="ghost" size="sm" className="ml-auto" onClick={() => void refreshWorkspace()}>Retry</Button>
+            </div>
+          )}
+          {children}
+        </main>
         {repositoryDialog}
       </div>
     </RepositoryProvider>
@@ -959,7 +974,7 @@ function App() {
           <Spinner className="size-6" />
           <strong className="text-base font-medium">Mapping worktrees on {selectedMachine?.name}</strong>
           <span className="max-w-md text-center text-sm text-muted-foreground">
-            Inspecting Git registrations, local changes, and disk usage…
+            Inspecting Git registrations and local changes…
           </span>
         </div>
       </>,
@@ -1065,9 +1080,11 @@ function App() {
         {workspaceToolbar}
         {currentRepository && currentWorktree ? (
           <ErrorBoundary label="The changes view" resetKey={currentWorktree.id}>
-            <ChangesWorkbench key={currentWorktree.id} />
+            <Suspense fallback={<WorkbenchLoading label="changes" />}>
+              <ChangesWorkbench key={currentWorktree.id} />
+            </Suspense>
           </ErrorBoundary>
-        ) : noWorkingCopy("No working copy selected", "Add or select a repository with an available working copy.")}
+        ) : noWorkingCopy(currentWorktreePath ? "Working copy unavailable" : "No working copy selected", currentWorktreePath ? "The selected working copy is no longer available. Select another working copy to continue." : "Add or select a repository with an available working copy.")}
         {overlays}
       </>,
     );
@@ -1079,9 +1096,11 @@ function App() {
         {workspaceToolbar}
         {currentRepository && currentWorktree ? (
           <ErrorBoundary label="The history view" resetKey={currentWorktree.id}>
-            <HistoryWorkbench key={currentWorktree.id} />
+            <Suspense fallback={<WorkbenchLoading label="history" />}>
+              <HistoryWorkbench key={currentWorktree.id} />
+            </Suspense>
           </ErrorBoundary>
-        ) : noWorkingCopy("No history available", "Select an available working copy.")}
+        ) : noWorkingCopy(currentWorktreePath ? "Working copy unavailable" : "No history available", currentWorktreePath ? "The selected working copy is no longer available. Select another working copy to continue." : "Select an available working copy.")}
         {overlays}
       </>,
     );
@@ -1207,6 +1226,7 @@ function App() {
               <WorktreeRow
                 key={worktree.id}
                 worktree={worktree}
+                measurementPending={workspaceRefresh.measurementPending.has(worktree.id)}
                 selected={effectiveSelectedId === worktree.id}
                 checked={checked.has(worktree.id)}
                 onSelect={(id) => {
@@ -1240,15 +1260,16 @@ function App() {
           {selected ? (
             <WorktreeDetails
               worktree={selected}
+              measurementPending={workspaceRefresh.measurementPending.has(selected.id)}
               provider={selectedProvider}
-              pull={pullEvidence[selected.id] ?? null}
+              pull={pullEvidence[selected.id]?.machineId === selectedMachineId && pullEvidence[selected.id]?.branch === selected.branch && pullEvidence[selected.id]?.head === selected.head ? pullEvidence[selected.id].value : null}
               now={now}
               busy={actionBusy}
               actionError={actionPlan ? null : actionError}
               onReviewAction={reviewAction}
               onCheckPulls={checkPullRequests}
               onPullChanged={async (evidence, checkedOut) => {
-                setPullEvidence((current) => ({ ...current, [selected.id]: evidence }));
+                setPullEvidence((current) => ({ ...current, [selected.id]: { machineId: selectedMachineId, branch: selected.branch, head: selected.head, value: evidence } }));
                 if (checkedOut) await refreshWorkspace();
               }}
               onViewChanges={setDiffWorktree}

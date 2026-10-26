@@ -1,4 +1,4 @@
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import {
   AlertTriangleIcon,
   FileClockIcon,
@@ -33,7 +33,7 @@ import { LazyDialog } from "./LazyDialog";
 import { CommitFileDiffView, HistoryMutationDialog, ReflogDialog, TagsDialog } from "./lazy";
 
 export function HistoryWorkbench() {
-  const { machineId, repository, worktree, refreshWorkspace: onWorkingCopyChanged, showChanges: onNeedsResolution } = useWorkingCopy();
+  const { machineId, repository, worktree, gitRevision, registerRefreshConsumer, refreshWorkspace: onWorkingCopyChanged, showChanges: onNeedsResolution } = useWorkingCopy();
   const [commits, setCommits] = useState<CommitSummary[] | null>(null);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [selectedOid, setSelectedOid] = useState<string | null>(null);
@@ -45,9 +45,17 @@ export function HistoryWorkbench() {
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [comparisonBase, setComparisonBase] = useState<string | null>(null);
   const [historyBranches, setHistoryBranches] = useState<BranchInfo[] | null>(null);
-  const [pendingHistoryAction, setPendingHistoryAction] = useState<"cherryPick" | "revert" | "reset" | null>(null);
+  const [pendingHistoryAction, setPendingHistoryAction] = useState<{ kind: "cherryPick" | "revert" | "reset"; commit: CommitSummary; branch: string | null } | null>(null);
   const [tagTarget, setTagTarget] = useState<string | null>(null);
   const [reflogOpen, setReflogOpen] = useState(false);
+  const historyGeneration = useRef(0);
+  const historyReloading = useRef(false);
+  const moreController = useRef<AbortController | null>(null);
+  const loadedCount = useRef(0);
+  const historyScope = useRef("");
+  const pendingHistory = useRef<Promise<void> | null>(null);
+  const pendingBranches = useRef<Promise<void> | null>(null);
+  useEffect(() => registerRefreshConsumer?.(async () => { await Promise.all([pendingHistory.current, pendingBranches.current]); }), [registerRefreshConsumer]);
 
   useEffect(() => {
     const timeout = setTimeout(() => setDebouncedQuery(historyQuery.trim()), 250);
@@ -57,41 +65,63 @@ export function HistoryWorkbench() {
   useEffect(() => {
     const controller = new AbortController();
     setHistoryBranches(null);
-    void loadBranches(machineId, repository.path, worktree.path, controller.signal)
-      .then(setHistoryBranches)
+    pendingBranches.current = loadBranches(machineId, repository.path, worktree.path, controller.signal)
+      .then((next) => { if (!controller.signal.aborted) setHistoryBranches(next); })
       .catch((cause: unknown) => {
         if (!controller.signal.aborted) setError(toMessage(cause));
       });
     return () => controller.abort();
-  }, [machineId, repository.path, worktree.id, worktree.path]);
+  }, [gitRevision, machineId, repository.path, worktree.id, worktree.path]);
 
   useEffect(() => {
     const controller = new AbortController();
-    setCommits(null);
+    const generation = ++historyGeneration.current;
+    historyReloading.current = true;
+    moreController.current?.abort();
+    moreController.current = null;
+    setLoadingMore(false);
     setNextCursor(null);
+    const scope = JSON.stringify([machineId, repository.path, worktree.path, debouncedQuery, comparisonBase]);
+    const sameScope = historyScope.current === scope;
+    historyScope.current = scope;
+    const targetCount = sameScope ? loadedCount.current : 0;
+    if (!sameScope) {
+      setCommits(null);
+      setNextCursor(null);
+      loadedCount.current = 0;
+    }
     setError(null);
-    void loadHistory(
-      machineId,
-      repository.path,
-      worktree.path,
-      null,
-      debouncedQuery || null,
-      comparisonBase,
-      controller.signal,
-    )
+    pendingHistory.current = (async () => {
+      let page = await loadHistory(machineId, repository.path, worktree.path, null, debouncedQuery || null, comparisonBase, controller.signal);
+      const refreshed = [...page.commits];
+      const cursors = new Set<string>();
+      while (refreshed.length < targetCount && page.nextCursor && !controller.signal.aborted) {
+        if (cursors.has(page.nextCursor)) break;
+        cursors.add(page.nextCursor);
+        page = await loadHistory(machineId, repository.path, worktree.path, page.nextCursor, debouncedQuery || null, comparisonBase, controller.signal);
+        refreshed.push(...page.commits);
+      }
+      return { commits: refreshed, nextCursor: page.nextCursor };
+    })()
       .then((page) => {
+        if (controller.signal.aborted || generation !== historyGeneration.current) return;
+        loadedCount.current = page.commits.length;
         setCommits(page.commits);
         setNextCursor(page.nextCursor);
-        setSelectedOid(page.commits[0]?.oid ?? null);
+        setSelectedOid((current) => sameScope && page.commits.some((commit) => commit.oid === current) ? current : page.commits[0]?.oid ?? null);
       })
       .catch((cause: unknown) => {
         if (!controller.signal.aborted) setError(toMessage(cause));
-      });
-    return () => controller.abort();
-  }, [comparisonBase, debouncedQuery, machineId, repository.path, worktree.id, worktree.path]);
+      })
+      .finally(() => { if (generation === historyGeneration.current) historyReloading.current = false; });
+    return () => { controller.abort(); moreController.current?.abort(); };
+  }, [comparisonBase, debouncedQuery, gitRevision, machineId, repository.path, worktree.id, worktree.path]);
 
   const loadMore = async () => {
-    if (!nextCursor || loadingMore) return;
+    if (!nextCursor || loadingMore || historyReloading.current || moreController.current) return;
+    const generation = historyGeneration.current;
+    const controller = new AbortController();
+    moreController.current = controller;
     setLoadingMore(true);
     try {
       const page = await loadHistory(
@@ -101,13 +131,16 @@ export function HistoryWorkbench() {
         nextCursor,
         debouncedQuery || null,
         comparisonBase,
+        controller.signal,
       );
+      if (controller.signal.aborted || generation !== historyGeneration.current) return;
+      loadedCount.current += page.commits.length;
       setCommits((current) => [...(current ?? []), ...page.commits]);
       setNextCursor(page.nextCursor);
     } catch (cause) {
-      setError(toMessage(cause));
+      if (!controller.signal.aborted && generation === historyGeneration.current) setError(toMessage(cause));
     } finally {
-      setLoadingMore(false);
+      if (moreController.current === controller) { moreController.current = null; setLoadingMore(false); }
     }
   };
 
@@ -123,8 +156,9 @@ export function HistoryWorkbench() {
     setSelectedFileId(null);
     void loadCommitFiles(machineId, repository.path, worktree.path, selected.oid, controller.signal)
       .then((next) => {
+        if (controller.signal.aborted) return;
         setFiles(next);
-        setSelectedFileId(next[0]?.id ?? null);
+        setSelectedFileId((current) => next.some((file) => file.id === current) ? current : next[0]?.id ?? null);
       })
       .catch((cause: unknown) => { if (!controller.signal.aborted) setError(toMessage(cause)); });
     return () => controller.abort();
@@ -277,13 +311,13 @@ export function HistoryWorkbench() {
                 <DropdownMenuContent className="min-w-56" align="start">
                   <DropdownMenuGroup>
                     <DropdownMenuLabel>Apply commit</DropdownMenuLabel>
-                    <DropdownMenuItem onClick={() => setPendingHistoryAction("cherryPick")}><GitCommitIcon aria-hidden="true" />Cherry-pick commit…</DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => setPendingHistoryAction("revert")}><RotateCcwIcon aria-hidden="true" />Revert commit…</DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => setPendingHistoryAction({ kind: "cherryPick", commit: selected, branch: worktree.branch })}><GitCommitIcon aria-hidden="true" />Cherry-pick commit…</DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => setPendingHistoryAction({ kind: "revert", commit: selected, branch: worktree.branch })}><RotateCcwIcon aria-hidden="true" />Revert commit…</DropdownMenuItem>
                     <DropdownMenuItem onClick={() => setTagTarget(selected.oid)}><TagIcon aria-hidden="true" />Create tag here…</DropdownMenuItem>
                   </DropdownMenuGroup>
                   <DropdownMenuSeparator />
                   <DropdownMenuGroup>
-                    <DropdownMenuItem variant="destructive" onClick={() => setPendingHistoryAction("reset")}><AlertTriangleIcon aria-hidden="true" />Reset branch to commit…</DropdownMenuItem>
+                    <DropdownMenuItem variant="destructive" onClick={() => setPendingHistoryAction({ kind: "reset", commit: selected, branch: worktree.branch })}><AlertTriangleIcon aria-hidden="true" />Reset branch to commit…</DropdownMenuItem>
                   </DropdownMenuGroup>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -317,16 +351,16 @@ export function HistoryWorkbench() {
           ) : <div className="grid h-full place-items-center text-sm text-muted-foreground">Select a changed file.</div>}
         </div>
       </section>
-      {pendingHistoryAction && selected ? (
+      {pendingHistoryAction ? (
         <LazyDialog onClose={() => setPendingHistoryAction(null)}>
           <HistoryMutationDialog
             machineId={machineId}
             repository={repository}
             worktree={worktree}
-            kinds={pendingHistoryAction === "reset" ? ["resetSoft", "resetMixed", "resetHard"] : [pendingHistoryAction]}
-            targets={[{ id: selected.oid, oid: selected.oid, label: selected.subject || shortSha(selected.oid), detail: selected.oid }]}
-            initialKind={pendingHistoryAction === "reset" ? "resetMixed" : pendingHistoryAction}
-            title={pendingHistoryAction === "reset" ? `Reset ${worktree.branch ?? "current branch"}` : `${pendingHistoryAction === "revert" ? "Revert" : "Cherry-pick"} ${shortSha(selected.oid)}`}
+            kinds={pendingHistoryAction.kind === "reset" ? ["resetSoft", "resetMixed", "resetHard"] : [pendingHistoryAction.kind]}
+            targets={[{ id: pendingHistoryAction.commit.oid, oid: pendingHistoryAction.commit.oid, label: pendingHistoryAction.commit.subject || shortSha(pendingHistoryAction.commit.oid), detail: pendingHistoryAction.commit.oid }]}
+            initialKind={pendingHistoryAction.kind === "reset" ? "resetMixed" : pendingHistoryAction.kind}
+            title={pendingHistoryAction.kind === "reset" ? `Reset ${pendingHistoryAction.branch ?? "current branch"}` : `${pendingHistoryAction.kind === "revert" ? "Revert" : "Cherry-pick"} ${shortSha(pendingHistoryAction.commit.oid)}`}
             onClose={() => setPendingHistoryAction(null)}
             onCompleted={async (result, kind) => {
               await onWorkingCopyChanged();

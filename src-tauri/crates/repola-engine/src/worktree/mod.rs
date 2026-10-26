@@ -7,6 +7,7 @@ pub(crate) mod command;
 mod create_worktree;
 mod discovery;
 mod external_tools;
+mod git_metadata;
 mod history;
 mod history_mutations;
 mod identity;
@@ -16,6 +17,7 @@ mod model_catalog;
 mod models;
 mod operations;
 mod providers;
+mod refresh;
 mod repository;
 mod stash;
 mod sync;
@@ -54,14 +56,23 @@ pub use models::{
     TextGenerationStatus, TextGenerationStatusKind, UndoCommitRequest, UndoCommitResult,
     WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges,
 };
+pub use models::{
+    MeasureWorktreeRequest, RefreshError, RefreshRequest, RefreshResult, RepositoryGitSignature,
+    WorktreeMeasurement,
+};
 pub use operations::mutate_operation;
 pub use providers::{fetch_pull_requests, mutate_pull_request};
+pub use refresh::{measure_worktree_directory, refresh_worktrees};
 pub use repository::{clone_repository, create_repository};
 pub use stash::{list_stashes, mutate_stash};
 pub use sync::synchronize;
 pub use tags::{mutate_tag, tags};
 pub(crate) use text_generation::{commit_message_provider_timeout, text_generation_status_timeout};
 pub use text_generation::{generate_commit_message, text_generation_status};
+pub use watch::{
+    WatchCoverageError, WorkspaceChangeEvent, WorkspaceChangeKind, WorkspaceWatchTarget,
+    WorkspaceWatcher,
+};
 pub use watch::{WorktreeChangeEvent, WorktreeWatcher};
 pub use working_copy::{
     apply_patch_hunk, commit, conflict_file, discard_all, discard_file, file_diff,

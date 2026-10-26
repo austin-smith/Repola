@@ -7,16 +7,17 @@ use crate::worktree::{
     ConflictFile, ConflictFileRequest, CreateRepositoryRequest, CreateWorktreeRequest,
     CreateWorktreeResult, DiscardAllRequest, DiscardFileRequest, FileDiff, FileDiffRequest,
     GenerateCommitMessageRequest, GeneratedCommitMessage, HistoryMutationRequest,
-    HistoryMutationResult, HistoryPage, HistoryRequest, PullRequestEvidence,
-    PullRequestMutationRequest, PullRequestMutationResult, ReflogEntry, ReflogRequest,
-    RepositoryOperationMutationResult, RepositoryOperationRequest, RepositoryOperationResult,
-    ResolveConflictRequest, ScanEvent, ScanRequest, ScanResult, SetFileStagingRequest, StashEntry,
-    StashMutationRequest, StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo,
-    TagMutationRequest, TagMutationResult, TagRequest, TextGenerationStatus, UndoCommitRequest,
-    UndoCommitResult, WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges,
+    HistoryMutationResult, HistoryPage, HistoryRequest, MeasureWorktreeRequest,
+    PullRequestEvidence, PullRequestMutationRequest, PullRequestMutationResult, ReflogEntry,
+    ReflogRequest, RefreshRequest, RefreshResult, RepositoryOperationMutationResult,
+    RepositoryOperationRequest, RepositoryOperationResult, ResolveConflictRequest, ScanEvent,
+    ScanRequest, ScanResult, SetFileStagingRequest, StashEntry, StashMutationRequest,
+    StashMutationResult, StashRequest, SyncRequest, SyncResult, TagInfo, TagMutationRequest,
+    TagMutationResult, TagRequest, TextGenerationStatus, UndoCommitRequest, UndoCommitResult,
+    WorkingCopyRequest, WorkingCopySnapshot, WorktreeChanges, WorktreeMeasurement,
 };
 
-pub const PROTOCOL_VERSION: u16 = 19;
+pub const PROTOCOL_VERSION: u16 = 20;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +51,12 @@ pub enum AgentRequest {
     },
     ScanWorktrees {
         request: ScanRequest,
+    },
+    RefreshWorktrees {
+        request: RefreshRequest,
+    },
+    MeasureWorktree {
+        request: MeasureWorktreeRequest,
     },
     ResolveRepository {
         path: String,
@@ -203,6 +210,12 @@ pub enum AgentResult {
     ScanWorktrees {
         result: ScanResult,
     },
+    RefreshWorktrees {
+        result: Box<RefreshResult>,
+    },
+    WorktreeMeasurement {
+        measurement: WorktreeMeasurement,
+    },
     RepositoryResolved {
         repository_path: String,
     },
@@ -309,6 +322,8 @@ pub struct AgentInfo {
 pub enum AgentCapability {
     RepositoryDiscovery,
     WorktreeInventory,
+    WorkspaceRefresh,
+    WorktreeMeasurement,
     WorkingCopy,
     History,
     Synchronization,
@@ -414,7 +429,7 @@ mod tests {
         let json = serde_json::to_string(&request).expect("serialize request");
         assert_eq!(
             json,
-            r#"{"protocolVersion":19,"requestId":"golden-1","request":{"type":"handshake","clientVersion":"0.1.0","minimumProtocolVersion":19,"maximumProtocolVersion":19}}"#
+            r#"{"protocolVersion":20,"requestId":"golden-1","request":{"type":"handshake","clientVersion":"0.1.0","minimumProtocolVersion":20,"maximumProtocolVersion":20}}"#
         );
 
         let with_future_field = json.replace(

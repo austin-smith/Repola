@@ -63,7 +63,7 @@ fn working_copy_snapshot_with_options(
         // diff setting alone can still run filters inside a dirty submodule.
         status_args.push("--ignore-submodules=dirty");
     }
-    let output = command::git_at(&worktree, git_args(git_options, status_args))
+    let output = command::inspection_git_at(&worktree, git_args(git_options, status_args))
         .map_err(|error| error.to_string())?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
@@ -74,7 +74,7 @@ fn working_copy_snapshot_with_options(
     snapshot.worktree_path = worktree.to_string_lossy().into_owned();
     snapshot.remote = resolve_remote(&worktree, snapshot.branch.as_deref());
     snapshot.upstream_head = snapshot.upstream.as_deref().and_then(|upstream| {
-        command::git_at(
+        command::inspection_git_at(
             &worktree,
             [
                 "rev-parse",
@@ -2284,7 +2284,7 @@ fn resolve_remote(worktree: &Path, branch: Option<&str>) -> Option<String> {
         .map(|_| "origin".to_string())
 }
 
-fn parse_status(bytes: &[u8]) -> Result<WorkingCopySnapshot, String> {
+pub(crate) fn parse_status(bytes: &[u8]) -> Result<WorkingCopySnapshot, String> {
     let mut snapshot = WorkingCopySnapshot {
         repository_path: String::new(),
         worktree_path: String::new(),
@@ -2528,7 +2528,7 @@ static RACY_STAMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// that never repeats (Git calls this window "racy"): a coarse filesystem
 /// clock could hide a second same-size write there, so such entries always
 /// reload until their mtime settles behind the tick.
-fn stamp_worktree_entries(
+pub(crate) fn stamp_worktree_entries(
     worktree: &Path,
     snapshot_start: std::time::SystemTime,
     changes: &mut [FileChange],
@@ -2626,6 +2626,10 @@ fn detect_operation(worktree: &Path) -> Option<RepositoryOperation> {
     )
     .ok()?;
     let git_dir = PathBuf::from(git_dir);
+    detect_operation_at_git_dir(&git_dir)
+}
+
+pub(crate) fn detect_operation_at_git_dir(git_dir: &Path) -> Option<RepositoryOperation> {
     if git_dir.join("MERGE_HEAD").is_file() {
         Some(RepositoryOperation::Merge)
     } else if git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir() {

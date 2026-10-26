@@ -67,11 +67,8 @@ import {
   fetchWorkingCopy,
   generateCommitMessage,
   mutateRepositoryOperation,
-  onWorktreeChanged,
   synchronizeWorkingCopy,
   undoLatestCommit,
-  unwatchWorktree,
-  watchWorktree,
 } from "../ipc/worktrees";
 import type { CommitSigning, ConflictResolutionKind, DiscardScope, FileChange, FileDiff, RepositoryOperationAction, SyncKind, WorkingCopySnapshot } from "../ipc/types";
 import { parseCommitPeople, parseCommitTrailers } from "./commit-form";
@@ -90,12 +87,22 @@ function changeStatusIcon(change: FileChange) {
   return <FilePenLineIcon className="size-3.5 shrink-0 text-warning" role="img" aria-label="Modified" />;
 }
 
+function attributeChanges(snapshot: WorkingCopySnapshot, generation: number): string {
+  return JSON.stringify(snapshot.changes.filter((change) => change.path.display === ".gitattributes" || change.path.display.endsWith("/.gitattributes"))
+    .map((change) => changeDiffKey(change, generation)).sort());
+}
+
 export function ChangesWorkbench() {
-  const { machineId, machineKind, machineOs, repository, worktree } = useWorkingCopy();
+  const { machineId, machineKind, machineOs, repository, worktree, statusRevision, gitRevision, workingCopySnapshot, refreshPending, waitForRefresh, registerRefreshConsumer } = useWorkingCopy();
   const separator = usePathSeparator();
   // File diffs are only meaningful for the snapshot they were loaded against,
   // so the cache is stored with the snapshot and replaced whenever it is.
-  const [workingCopy, setWorkingCopy] = useState<{ snapshot: WorkingCopySnapshot | null; diffCache: Map<string, FileDiff>; generation: number }>(() => ({ snapshot: null, diffCache: new Map(), generation: 0 }));
+  const [workingCopy, setWorkingCopy] = useState<{ snapshot: WorkingCopySnapshot | null; diffCache: Map<string, FileDiff>; generation: number; gitRevision: number | undefined }>(() => ({ snapshot: null, diffCache: new Map(), generation: 0, gitRevision }));
+  // Change cache identity before committing a metadata refresh, including when
+  // its previous diff request is still in flight and the cache is empty.
+  if (workingCopy.gitRevision !== gitRevision) {
+    setWorkingCopy({ ...workingCopy, gitRevision, diffCache: new Map() });
+  }
   const { snapshot, diffCache, generation } = workingCopy;
   const [generateBusy, setGenerateBusy] = useState(false);
   const [generationCancelling, setGenerationCancelling] = useState(false);
@@ -119,9 +126,11 @@ export function ChangesWorkbench() {
     setWorkingCopy((current) => {
       if (next && current.snapshot && workingCopySnapshotsEqual(current.snapshot, next)) return current;
       const generation = current.generation + 1;
+      const attributesChanged = next && current.snapshot && attributeChanges(current.snapshot, current.generation) !== attributeChanges(next, generation);
       return {
+        ...current,
         snapshot: next,
-        diffCache: next ? retainDiffEntries(current.diffCache, next.changes, generation) : new Map(),
+        diffCache: next && !attributesChanged ? retainDiffEntries(current.diffCache, next.changes, generation) : new Map(),
         generation,
       };
     });
@@ -160,21 +169,10 @@ export function ChangesWorkbench() {
   const [pendingOperationAction, setPendingOperationAction] = useState<RepositoryOperationAction | null>(null);
 
   useEffect(() => {
-    const controller = new AbortController();
     setSnapshot(null);
     setChangeSelection(emptyChangeSelection);
     setCommitSelections(new Map());
     setError(null);
-    void fetchWorkingCopy(machineId, repository.path, worktree.path, controller.signal)
-      .then((next) => {
-        setSnapshot(next);
-        setChangeSelection(singleChangeSelection(next.changes.find((change) => !change.ignored)?.id ?? null));
-        setCommitSelections(createCommitSelection(next.changes));
-      })
-      .catch((cause: unknown) => {
-        if (!controller.signal.aborted) setError(toMessage(cause));
-      });
-    return () => controller.abort();
   }, [machineId, repository.path, setSnapshot, worktree.id, worktree.path]);
 
   useEffect(() => () => {
@@ -194,14 +192,18 @@ export function ChangesWorkbench() {
   useEffect(() => { mutatingRef.current = mutating; }, [mutating]);
   const reloadController = useRef<AbortController | null>(null);
   const pendingReload = useRef<Promise<void> | null>(null);
-  const reloadSnapshot = useCallback(() => {
-    if (mutatingRef.current) return;
+  useEffect(() => registerRefreshConsumer?.(() => pendingReload.current ?? Promise.resolve()), [registerRefreshConsumer]);
+  const externalRefresh = useRef({ pending: refreshPending, wait: waitForRefresh });
+  useEffect(() => { externalRefresh.current = { pending: refreshPending, wait: waitForRefresh }; }, [refreshPending, waitForRefresh]);
+  const reloadSnapshot = useCallback((batch?: WorkingCopySnapshot | null) => {
     reloadController.current?.abort();
     const controller = new AbortController();
     reloadController.current = controller;
-    pendingReload.current = fetchWorkingCopy(machineId, repository.path, worktree.path, controller.signal)
+    const matchingBatch = batch?.repositoryPath === repository.path && batch.worktreePath === worktree.path ? batch : null;
+    pendingReload.current = (matchingBatch ? Promise.resolve(matchingBatch) : fetchWorkingCopy(machineId, repository.path, worktree.path, controller.signal))
       .then((next) => {
         if (controller.signal.aborted || mutatingRef.current) return;
+        setError(null);
         setSnapshot(next);
         setChangeSelection((current) => {
           const ids = new Set(next.changes.map((change) => change.id));
@@ -229,27 +231,16 @@ export function ChangesWorkbench() {
   }, [machineId, repository.path, setSnapshot, worktree.path]);
   useEffect(() => () => reloadController.current?.abort(), []);
 
-  // Refresh when files change on disk (local machines) and whenever the window regains focus,
-  // so edits and Git commands made outside Repola show up without a manual refresh.
+  // App owns watch/focus lifetimes and supplies accepted snapshots. A revision
+  // change while mutating stays pending until the mutation releases its fence.
+  const appliedStatus = useRef<{ reload: typeof reloadSnapshot; revision: number | undefined; batch: WorkingCopySnapshot | null | undefined } | null>(null);
   useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | null = null;
-    void watchWorktree(machineId, worktree.path).catch(() => undefined);
-    void onWorktreeChanged((event) => {
-      if (!disposed && event.machineId === machineId) reloadSnapshot();
-    }).then((dispose) => {
-      if (disposed) dispose();
-      else unlisten = dispose;
-    });
-    const onFocus = () => reloadSnapshot();
-    window.addEventListener("focus", onFocus);
-    return () => {
-      disposed = true;
-      unlisten?.();
-      window.removeEventListener("focus", onFocus);
-      void unwatchWorktree().catch(() => undefined);
-    };
-  }, [machineId, reloadSnapshot, worktree.path]);
+    if (mutating || (refreshPending && !workingCopySnapshot)) return;
+    const applied = appliedStatus.current;
+    if (applied?.reload === reloadSnapshot && applied.revision === statusRevision && applied.batch === workingCopySnapshot) return;
+    appliedStatus.current = { reload: reloadSnapshot, revision: statusRevision, batch: workingCopySnapshot };
+    reloadSnapshot(workingCopySnapshot);
+  }, [mutating, refreshPending, reloadSnapshot, statusRevision, workingCopySnapshot]);
 
   const [editorLabel, setEditorLabel] = useState<string | null>(null);
   useEffect(() => {
@@ -343,6 +334,19 @@ export function ChangesWorkbench() {
         includedChanges: commitSelectionRequest(visibleChanges, commitSelections),
         amend,
       }, controller.signal);
+      const wait = externalRefresh.current.wait;
+      if (wait || externalRefresh.current.pending) {
+        if (!wait) {
+          controller.abort();
+          return;
+        }
+        await new Promise<void>((resolve, reject) => {
+          const cancel = () => resolve();
+          controller.signal.addEventListener("abort", cancel, { once: true });
+          void wait().then(resolve, reject).finally(() => controller.signal.removeEventListener("abort", cancel));
+        });
+        if (controller.signal.aborted) return;
+      }
       // A refresh started before the provider finished may still discover a
       // changed selection. Let it validate/cancel this result before applying it.
       while (pendingReload.current && !controller.signal.aborted) {
@@ -400,6 +404,7 @@ export function ChangesWorkbench() {
 
   const submitCommit = async (event: FormEvent) => {
     event.preventDefault();
+    mutatingRef.current = true;
     setCommitBusy(true);
     setError(null);
     try {
@@ -441,6 +446,7 @@ export function ChangesWorkbench() {
 
   const synchronize = async (kind: SyncKind = syncKind) => {
     if (!snapshot) return;
+    mutatingRef.current = true;
     setSyncBusy(true);
     setError(null);
     try {
@@ -468,6 +474,7 @@ export function ChangesWorkbench() {
 
   const undoCommit = async () => {
     if (!snapshot?.head) return;
+    mutatingRef.current = true;
     setCommitBusy(true);
     setError(null);
     try {
@@ -487,6 +494,7 @@ export function ChangesWorkbench() {
 
   const applyDiscard = async () => {
     if (!snapshot || !pendingDiscard) return;
+    mutatingRef.current = true;
     setBusyPath(pendingDiscard.change.id);
     setError(null);
     try {
@@ -510,6 +518,7 @@ export function ChangesWorkbench() {
 
   const applyDiscardAll = async () => {
     if (!snapshot) return;
+    mutatingRef.current = true;
     setCommitBusy(true);
     setError(null);
     try {
@@ -530,6 +539,7 @@ export function ChangesWorkbench() {
 
   const runOperationAction = async (action: RepositoryOperationAction) => {
     if (!snapshot?.operation) return;
+    mutatingRef.current = true;
     setOperationBusy(true);
     setError(null);
     try {
