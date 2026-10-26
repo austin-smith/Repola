@@ -44,7 +44,7 @@ export function useWorkspaceRefresh(options: Options) {
   const consumers = useRef(new Set<() => Promise<void>>());
   const acknowledged = useRef<Array<{ version: number; resolve: () => void }>>([]);
   const failure = useRef<string | null>(null);
-  const validationFailures = useRef(new Map<string, string>());
+  const validationFailures = useRef(new Map<string, { repositoryPath: string; message: string }>());
   const [publication, setPublication] = useState<Publication>({ version: 0, statuses: {}, git: {}, snapshot: null, pending: false, error: null });
   const [watchError, setWatchError] = useState<string | null>(null);
   const [watchTopology, setWatchTopology] = useState(0);
@@ -214,10 +214,16 @@ export function useWorkspaceRefresh(options: Options) {
         for (const record of result.worktrees) {
           if (!previousRecords.has(record.id) || previousRecords.get(record.id)?.sizeBytes === null || intent.measurements.has(record.path)) dirtyMeasurements.add(record.id);
         }
+        const registered = new Set(current.repositoryPaths);
+        const memberPaths = new Set(result.memberships.map((record) => record.path));
+        for (const [key, error] of validationFailures.current) {
+          if (!registered.has(error.repositoryPath)
+            || (key.startsWith("tree:") && enumerated.has(error.repositoryPath) && !memberPaths.has(key.slice(5)))) validationFailures.current.delete(key);
+        }
         for (const path of result.successfulRepositoryPaths) validationFailures.current.delete(`repo:${path}`);
         for (const record of result.worktrees) validationFailures.current.delete(`tree:${record.path}`);
-        for (const error of result.errors) validationFailures.current.set(`${error.worktreePath ? "tree" : "repo"}:${error.worktreePath ?? error.repositoryPath}`, `${error.worktreePath ?? error.repositoryPath}: ${error.message}`);
-        const message = [...validationFailures.current.values()].join("\n") || null;
+        for (const error of result.errors) validationFailures.current.set(`${error.worktreePath ? "tree" : "repo"}:${error.worktreePath ?? error.repositoryPath}`, { repositoryPath: error.repositoryPath, message: `${error.worktreePath ?? error.repositoryPath}: ${error.message}` });
+        const message = [...validationFailures.current.values()].map((error) => error.message).join("\n") || null;
         failure.current = message;
         failures = result.errors.length ? failures + 1 : 0;
         current.setScan((scan) => isCurrent() && latest.current.getEpoch() === epoch ? mergeRefresh(scan, result, current.repositoryPaths) : scan);
@@ -242,7 +248,7 @@ export function useWorkspaceRefresh(options: Options) {
       } catch (cause) {
         if (isCurrent() && !controller.signal.aborted && latest.current.getEpoch() === epoch) {
           failure.current = toMessage(cause);
-          for (const path of paths) validationFailures.current.set(`repo:${path}`, failure.current);
+          for (const path of paths) validationFailures.current.set(`repo:${path}`, { repositoryPath: path, message: failure.current });
           failures += 1;
           await publish((state) => ({ ...state, error: failure.current }));
         }
@@ -312,6 +318,21 @@ export function useWorkspaceRefresh(options: Options) {
     };
   }, [options.machineId]);
 
+  useEffect(() => {
+    const registered = new Set(options.repositoryPaths);
+    let removed = false;
+    for (const [key, error] of validationFailures.current) {
+      if (!registered.has(error.repositoryPath)) {
+        validationFailures.current.delete(key);
+        removed = true;
+      }
+    }
+    if (removed) {
+      failure.current = [...validationFailures.current.values()].map((error) => error.message).join("\n") || null;
+      setPublication((state) => ({ ...state, error: failure.current }));
+    }
+  }, [options.repositoryPaths]);
+
   const targetKey = JSON.stringify(options.scan?.worktrees.filter((record) => record.exists).map((record) => ({ repositoryPath: record.repositoryPath, worktreePath: record.path })) ?? []);
   useEffect(() => {
     if (!options.enabled || options.machineKind !== "local") return;
@@ -365,7 +386,7 @@ export function useWorkspaceRefresh(options: Options) {
     const current = latest.current;
     const selectedFailure = validationFailures.current.get(`tree:${current.worktreePath}`)
       ?? validationFailures.current.get(`repo:${current.repositoryPath}`);
-    if (selectedFailure) throw new Error(selectedFailure);
+    if (selectedFailure) throw new Error(selectedFailure.message);
   }, []);
   const refreshWorkspace = useCallback(async () => {
     if (watchError) setWatchTopology((revision) => revision + 1);

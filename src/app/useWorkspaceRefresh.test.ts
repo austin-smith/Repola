@@ -61,11 +61,12 @@ function mockInventory(fixture: ScanResult) {
   });
 }
 function mount(kind: "local" | "ssh" = "local", view: WorkspaceView = "changes", fixture = initialScan()) {
-  return renderHook(() => {
+  return renderHook(({ repositoryPaths }: { repositoryPaths: string[] }) => {
     const [scan, setScan] = useState<ScanResult | null>(fixture);
-    const refresh = useWorkspaceRefresh({ machineId: kind === "local" ? "local" : "remote", machineKind: kind, repositoryPaths: fixture.repositoryPaths, scan, setScan, repositoryPath: "/repo", worktreePath: "/repo", view, enabled: true, getEpoch: () => 0 });
+    const selected = repositoryPaths.includes("/repo") ? "/repo" : null;
+    const refresh = useWorkspaceRefresh({ machineId: kind === "local" ? "local" : "remote", machineKind: kind, repositoryPaths, scan, setScan, repositoryPath: selected, worktreePath: selected, view, enabled: true, getEpoch: () => 0 });
     return { ...refresh, scan };
-  });
+  }, { initialProps: { repositoryPaths: fixture.repositoryPaths } });
 }
 
 describe("app-owned workspace refresh", () => {
@@ -193,6 +194,61 @@ describe("app-owned workspace refresh", () => {
     expect(ipc.refreshWorkspace).toHaveBeenCalledTimes(2);
     await advance(2_000);
     expect(ipc.measureWorktree).not.toHaveBeenCalled();
+  });
+
+  it("clears a removed worktree's failure only after authoritative membership confirms removal", async () => {
+    const hook = mount();
+    await flush();
+    ipc.refreshWorkspace.mockImplementationOnce(async (_machine: string, request: RefreshRequest) => result(request, {
+      worktrees: [], workingCopy: null,
+      errors: [{ repositoryPath: "/repo", worktreePath: "/sibling", message: "unreadable tree" }],
+    }));
+    await act(async () => fileEvent("/sibling"));
+    await flush();
+    expect(hook.result.current.refreshError).toBe("/sibling: unreadable tree");
+
+    ipc.refreshWorkspace.mockImplementationOnce(async (_machine: string, request: RefreshRequest) => result(request, {
+      repositories: [], memberships: [], successfulRepositoryPaths: [], gitSignatures: [],
+    }));
+    await act(async () => fileEvent("/repo"));
+    await flush();
+    expect(hook.result.current.refreshError).toBe("/sibling: unreadable tree");
+
+    ipc.refreshWorkspace.mockImplementationOnce(async (_machine: string, request: RefreshRequest) => result(request, {
+      repositories: [], memberships: [], worktrees: [], successfulRepositoryPaths: [], gitSignatures: [], workingCopy: null,
+      errors: [{ repositoryPath: "/repo", worktreePath: null, message: "enumeration failed" }],
+    }));
+    await act(async () => { void hook.result.current.refreshWorkspace(); });
+    await flush();
+    expect(hook.result.current.refreshError).toContain("/sibling: unreadable tree");
+    expect(hook.result.current.refreshError).toContain("/repo: enumeration failed");
+
+    ipc.refreshWorkspace.mockImplementationOnce(async (_machine: string, request: RefreshRequest) => result(request, {
+      memberships: [members[0]], worktrees: [members[0]],
+    }));
+    await act(async () => { void hook.result.current.refreshWorkspace(); });
+    await flush();
+    expect(hook.result.current.scan?.worktrees.map((record) => record.path)).toEqual(["/repo"]);
+    expect(hook.result.current.refreshError).toBeNull();
+  });
+
+  it.each([{ repositoryPaths: [] }, { repositoryPaths: ["/second"] }])("clears unregistered repository and tree failures with remaining registrations $repositoryPaths", async ({ repositoryPaths }) => {
+    const fixture = manyRepositories(2);
+    mockInventory(fixture);
+    ipc.refreshWorkspace.mockImplementationOnce(async (_machine: string, request: RefreshRequest) => result(request, {
+      repositories: [], memberships: [], worktrees: [], successfulRepositoryPaths: [], gitSignatures: [], workingCopy: null,
+      errors: [
+        { repositoryPath: "/repo", worktreePath: null, message: "repository unavailable" },
+        { repositoryPath: "/repo", worktreePath: "/repo-topic", message: "tree unavailable" },
+      ],
+    }));
+    const hook = mount("local", "changes", fixture);
+    await flush();
+    expect(hook.result.current.refreshError).toContain("/repo: repository unavailable");
+    expect(hook.result.current.refreshError).toContain("/repo-topic: tree unavailable");
+    hook.rerender({ repositoryPaths });
+    await flush();
+    expect(hook.result.current.refreshError).toBeNull();
   });
 
   it("keeps selected status and snapshot identity through quiet reconciliation", async () => {
