@@ -27,7 +27,7 @@ tempfile = "3.23"
 minisign-verify = "0.3.0"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"] }
 sha2 = "0.11"
-notify = "8"
+notify = "9"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 unicode-normalization = "0.1.25"
 caseless = "0.2.2"
